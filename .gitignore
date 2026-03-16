@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+.pyHistory/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-wheel-metadata/
+.installed.cfg
+*.egg-info/
+
+# ArcGIS auxiliary files
+EGMTrans_Explorer.gdb/
+.backups/
+ImportLog/
+Index/
+GpMessages/
+RasterFunctionTemplates/
+
+# Temporary files and folders
+temp_*/
+tmp/
+*.log
+
+# Editor / tool config
+.vscode/
+
+
+# Build artifacts
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Data files
+grids/
+*.aux.xml
+
+# Backup files
+EGMTrans_backup.py

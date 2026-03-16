@@ -1,0 +1,19 @@
+name: egmtrans
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - gdal
+  - numba
+  - tqdm
+  - pip
+  - pip:
+    - pytest>=7.0
+    - pytest-cov>=4.0
+    - ruff>=0.4
+
+# Note: optional module 'arcpy' is not available via Conda.
+# It will be available when running this as an ArcGIS Pro toolbox.

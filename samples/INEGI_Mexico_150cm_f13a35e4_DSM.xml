@@ -1,0 +1,313 @@
+<?xml version = "1.0" encoding = "ISO-8859-1"?>
+<Metadata>
+<MD_DataIdentification>
+<title>Modelo Digital de Elevación Tipo Superficie con resolución de 1.5 metros generado a partir de datos de altimetría del relieve, con clave F13A35E4</title>
+<purpose>El producto fue generado por el Instituto Nacional de Estadística y Geografía (INEGI) principalmente para proveer de datos de elevación de las formas del relieve terrestre y los elementos presentes en el mismo; y ser el insumo principal para derivar información altimétrica, elemento que constituye la información topográfica, así como, para la ortorrectificación de imágenes; y coadyuvar en la prevención de desastres naturales y en diversas áreas como cartografía, geodesia, fotogrametría, geología, topografía, ingeniería civil, geomática, urbanismo, medio ambiente, ciencias de la tierra, telecomunicaciones y energía, aplicaciones militares, entre otras.</purpose>
+<abstract>El MDE es una representación continua del relieve, constituida por la distribución espacial y regular de valores de altura de las formas del relieve terrestre y los elementos presentes sobre el mismo con respecto a un nivel de referencia o nivel medio del mar.
+Este producto es derivado de nubes de puntos fotogramétricas que son el resultado de la aplicación de procesos de orientación y correlación fotogramétrica a las imágenes de satélite de alta resolución captadas en modo estereoscópico, a estas nubes de puntos se les aplica un proceso de clasificación, el cual permite filtrar los puntos de acuerdo al elemento que representan (terreno, vegetación, construcciones, etcétera) para posteriormente generar los modelos.
+Los Modelos Digitales de Elevación de tipo Superficie (MDS) son la representación continua en forma digital del terreno, los elementos de vegetación y antrópicos presentes sobre el mismo terreno. Derivado del proceso fotogramétrico algunas áreas podrán presentar interpolaciones correspondientes a discontinuidades generalmente visualizadas por triangulaciones que no corresponden con del terreno, causadas por efectos de la correlación fotogramétrica en áreas de sombra, pendientes de terreno muy pronunciadas (cercanas a los 90°), zonas con vegetación densa y zonas de cultivo, principalmente. También pueden existir huecos por nubosidad densa en los datos fuente (imágenes de satélite). En el mismo sentido y debido a la diferencia de temporalidad de los datos fuente se pueden presentar diferencias en la representación de los elementos entre modelos adyacentes sobre todo en cuerpos de agua, zonas de inundación, corrientes intermitentes, entre. Sin embargo, estas anomalías han sido procesadas y en algunos casos se incluyó información auxiliar para disminuir sus efectos en la representación del relieve. 
+La cobertura espacial de los modelos es conforme la división y nomenclatura de los conjuntos de datos espaciales en escala 1:10 000, considerando una faja o área de excedencia con el fin de garantizar la continuidad lógica entre modelos adyacentes.
+Los archivos digitales correspondientes a los modelos tienen una estructura de tipo ráster, la cual permite representar mejor las variables continuas de forma gradual de la elevación de las formas del relieve y los elementos presentes sobre el mismo.
+Este producto podría emplearse para coadyuvar en diversos usos y aplicaciones o bien generar otros subproductos entre los cuales se pueden mencionar, obtención de desniveles, cálculo de volúmenes de tierra, obtención de pendientes su aspecto u orientación, índices de rugosidad del terreno, delimitar cuencas hidrográficas, secciones o perfiles, identificar áreas sujetas a inundación, etc. Además que, pueden ser empleados para mapeo digital, verificación de redes geodésicas, análisis del paisaje, estudios de erosión y transporte de sedimentos, estudios geotérmicos, estudios geomorfológicos y de estructuras geológicas, estudios hidráulicos e hidrológicos, gestión de zonas de costa, visualización del relieve sombreado, trazos de infraestructura vial, planeación de políticas ambientales, manejo de los recursos naturales, estudios de la vegetación, procesos de análisis espacial, prevención de desastres naturales, animación en 3D para simuladores, estudios de insolación, análisis de inter visibilidad y otros de acuerdo a la aptitud de usos que determine el usuario.</abstract>
+<MD_DataIdentification_language>ES - Español.</MD_DataIdentification_language>
+<topicCategory>
+<principalTopic></principalTopic>
+<groupCategory>4. Grupo de datos topográficos: Subdivisión de la Infraestructura de Datos Espaciales de México que contiene elementos que caracterizan parte o toda la superficie  terrestre, constituidos por datos referidos a los componentes físicos del paisaje y de los correspondientes a objetos de infraestructura humana. Particularizan un terreno en su configuración superficial, permitiendo la identificación de la disposición y forma de sus partes y lo distinguen de otros semejantes.</groupCategory>
+<groupCategory>5. Grupo de datos de relieve continental, insular y submarino: Subdivisión de la Infraestructura de Datos Espaciales de México que a través de valores de distancias verticales con respecto a una superficie de referencia, representan la distribución de alturas y profundidades características de las formas del terreno. </groupCategory>
+</topicCategory>
+<keyword>Altimetría</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Altura</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Modelo Digital de Elevación (MDE)</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Modelo Digital de Superficie (MDS)</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Modelo Digital de Terreno (MDT)</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Relieve</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Superficie</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Terreno</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Elevación</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>GRID</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Fotogrametría</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<keyword>Percepción remota pasiva</keyword>
+<type>5. Tema: La palabra clave que identifica un tema o materia particular.</type>
+<thesaurusName>Norma Técnica para la Generación de Modelos Digitales de Elevación con fines geográficos</thesaurusName>
+<edition> </edition>
+<presentationForm>  3. Imagen digital: Imagen semejante a cosas construidas por el hombre, objetos y actividades adquiridas por medio de la percepción visual o por medio de sensores en cualquier segmento del espectro electromagnético (infrarrojo térmico, radar de alta resolución) y almacenados en formato digital.</presentationForm>
+<presentationForm>  5. Mapa digital: Mapa representado en formato raster o vector.</presentationForm>
+<presentationForm>  7. Modelo digital: Representación digital multi-dimensional de un objeto, proceso, etc. </presentationForm>
+<CI_OnlineResource>
+<CI_OnlineResource_linkage>http://www.inegi.org.mx/</CI_OnlineResource_linkage>
+<CI_OnlineResource_description>Página oficial del INEGI donde se puede obtener el conjunto de datos espaciales o producto con base en las políticas</CI_OnlineResource_description>
+</CI_OnlineResource>
+<maintenanceAndUpdateFrequency>11. La frecuencia de mantenimiento de los datos no se conoce.</maintenanceAndUpdateFrequency>
+<MD_DataIdentification_characterSet>  6. 8859parte1: ISO/IEC 8859-1, Tecnologías de la Información - Conjuntos de caracteres gráficos codificados de 8-bit por byte - Parte 1: Alfabeto Latino No.1.</MD_DataIdentification_characterSet>
+<graphfilename> </graphfilename>
+<specuse>USO INTERNO 1: La Dirección General de Geografía y Medio Ambiente del INEGI utiliza los Modelos Digitales para generar el continuo de Modelos Digitales de Elevación a diferentes resoluciones.
+
+USO EXTERNO 1: El Centro Nacional Para la Prevención de Desastres (CENAPRED) usa los Modelos Digitales para el Diseño del Subsistema de Información Geográfica del Sistema Integral de Información Sobre Riesgo de Desastres; en estudios para el análisis de peligro por la inestabilidad de laderas a nivel regional; para la infraestructura y contenidos mínimos para los atlas estatales y municipales de peligros; entre otros.
+
+USO EXTERNO 2: La Comisión Nacional del Agua (CONAGUA), Investigadores y académicos de la Universidad Nacional Autónoma de México (UNAM) utilizan los Modelos Digitales para estudios hidrológicos para proteger a la población de inundaciones y aprovechamiento del agua.
+
+USO EXTERNO 3: La Comisión Estatal del Agua de Jalisco usa los Modelos Digitales para modelar la zona conurbada de Guadalajara.</specuse>
+</MD_DataIdentification>
+<CI_Date>
+<Dates_Events>
+<date>2020-02-19</date>
+<dateType>1. Creación: Indicador  de la fecha que especifica cuando fue creado el recurso.</dateType>
+</Dates_Events>
+<Ad_Date>
+<date_creation>2018-01-12</date_creation>
+<date_begin></date_begin>
+<date_end></date_end>
+<inpname>Imagen de satélite estereoscópica</inpname>
+<date_creation>2019-11-07</date_creation>
+<date_begin></date_begin>
+<date_end></date_end>
+<inpname>Nube de Puntos Fotogramétrica</inpname>
+</Ad_Date>
+</CI_Date>
+<CI_ResponsibleParty>
+<CI_ResponsibleParty_individualName>Mtro. J. Armando Aguiar Rodríguez.</CI_ResponsibleParty_individualName>
+<CI_ResponsibleParty_organisationName>Instituto Nacional de Estadística y Geografía - INEGI.</CI_ResponsibleParty_organisationName>
+<CI_ResponsibleParty_positionName>Director de Servicios de Información.</CI_ResponsibleParty_positionName>
+<CI_ResponsibleParty_voice>(449)9105300 Ext. 5301. Lada 800 111 46 34 (sin costo).</CI_ResponsibleParty_voice>
+<CI_ResponsibleParty_facsimile></CI_ResponsibleParty_facsimile>
+<CI_ResponsibleParty_deliveryPoint>Avenida Héroe de Nacozari Sur 2301. Fraccionamiento Jardines del Parque, entre Calle INEGI, Avenida del Lago y Avenida Paseo de las Garzas.</CI_ResponsibleParty_deliveryPoint>
+<CI_ResponsibleParty_city>Aguascalientes.</CI_ResponsibleParty_city>
+<CI_ResponsibleParty_administrativeArea>Aguascalientes.</CI_ResponsibleParty_administrativeArea>
+<CI_ResponsibleParty_postalCode>20276.</CI_ResponsibleParty_postalCode>
+<CI_ResponsibleParty_country>México.</CI_ResponsibleParty_country>
+<CI_ResponsibleParty_electronicMailAddress>atencion.usuarios@inegi.org.mx</CI_ResponsibleParty_electronicMailAddress>
+<CI_ResponsibleParty_linkage>http://www.inegi.org.mx/</CI_ResponsibleParty_linkage>
+<CI_ResponsibleParty_role>  5. Distribuidor: Parte que distribuye el recurso.</CI_ResponsibleParty_role>
+</CI_ResponsibleParty>
+<geographicElement>
+<EX_GeographicBoundingBox>
+<westBoundLongitude>-106.500988</westBoundLongitude>
+<eastBoundLongitude>-106.443472</eastBoundLongitude>
+<southBoundLatitude>23.249215</southBoundLatitude>
+<northBoundLatitude>23.313288</northBoundLatitude>
+</EX_GeographicBoundingBox>
+<spatialRepresentationType>2. Raster: Los datos malla o cuadrícula se utilizan también para representar datos espaciales.</spatialRepresentationType>
+<spatialRepresentationType>3. Tabla del texto: Datos de texto o tabulares que se utilizan para representar datos espaciales.</spatialRepresentationType>
+</geographicElement>
+<MD_ReferenceSystem>
+<ReferenceHorizontalSystem>
+<geograph>
+<latres></latres>
+<longres></longres>
+<geogunit></geogunit>
+</geograph>
+<planar>
+<mapprojn>
+<lambertc>
+<lambertc_stdparll></lambertc_stdparll>
+<lambertc_longcm></lambertc_longcm>
+<lambertc_latprjo></lambertc_latprjo>
+<lambertc_feast></lambertc_feast>
+<lambertc_fnorth></lambertc_fnorth>
+</lambertc>
+<mercatort>
+<mercatort_sfctrmer></mercatort_sfctrmer>
+<mercatort_longcm></mercatort_longcm>
+<mercatort_latprjo></mercatort_latprjo>
+<mercatort_feast></mercatort_feast>
+<mercatort_fnorth></mercatort_fnorth>
+</mercatort>
+<mercator>
+<mercator_stdparll></mercator_stdparll>
+<mercator_sfec></mercator_sfec>
+<mercator_longcm></mercator_longcm>
+<mercator_feast></mercator_feast>
+<mercator_fnorth></mercator_fnorth>
+</mercator>
+<tme>
+<tme_sfctrmer></tme_sfctrmer>
+<tme_longcm></tme_longcm>
+<tme_latprjo></tme_latprjo>
+<tme_feast></tme_feast>
+<tme_fnorth></tme_fnorth>
+</tme>
+<anoth_proj_def></anoth_proj_def>
+</mapprojn>
+<gridcoordinatessystem>
+<utm>
+<utm_zone>13</utm_zone>
+<utm_sfctrmer>0.9996</utm_sfctrmer>
+<utm_longcm>-105.0</utm_longcm>
+<utm_latprjo>0.0</utm_latprjo>
+<utm_feast>500000.0</utm_feast>
+<utm_fnorth>0.0</utm_fnorth>
+</utm>
+</gridcoordinatessystem>
+<local_planar>
+<local_planar_desc></local_planar_desc>
+<local_planar_geo_inf></local_planar_geo_inf>
+</local_planar>
+<planci>
+<plance>Líneas y columnas.</plance>
+<coord_repres>
+<absres>1.5</absres>
+<ordres>1.5</ordres>
+</coord_repres>
+<distance_and_bearing_repres>
+<distance_res></distance_res>
+<bearing_res></bearing_res>
+<bearing_uni></bearing_uni>
+<ref_bearing_dir></ref_bearing_dir>
+<ref_bearing_mer></ref_bearing_mer>
+</distance_and_bearing_repres>
+<plandu>Metros.</plandu>
+</planci>
+</planar>
+<local_coordinates>
+<local_desc></local_desc>
+<local_geo_inf></local_geo_inf>
+</local_coordinates>
+<geodetic>
+<horizdn>ITRF08 época 2010.0.</horizdn>
+<ellips>Sistema Geodésico de Referencia de 1980 (GRS80).</ellips>
+<semiaxis>6378137.0</semiaxis>
+<denflat>298.2572221</denflat>
+</geodetic>
+</ReferenceHorizontalSystem>
+<ReferenceVerticalSystem>
+<altsys>
+<altdatum>Alturas ortométricas referidas al Geoide Gravimétrico Mexicano 2010</altdatum>
+<altres>0.01</altres>
+<altunits>Metros.</altunits>
+<altenc>Coordenada de elevación explícita incluida con coordenadas horizontales.</altenc>
+</altsys>
+<depthsys>
+<depthdn></depthdn>
+<depthres></depthres>
+<depthdu></depthdu>
+<depthem> </depthem>
+</depthsys>
+</ReferenceVerticalSystem>
+</MD_ReferenceSystem>
+<DQ_DataQuality>
+<DQ_Scope>
+<level>  5. Conjunto de datos espaciales: Información aplicada al conjunto de datos espaciales.</level>
+</DQ_Scope>
+<report>
+<DQ_Completeness>
+<DQ_Completeness_evalqualsubname>
+<DQ_Completeness_nameOfMeasure></DQ_Completeness_nameOfMeasure>
+<DQ_Completeness_measureDescription></DQ_Completeness_measureDescription>
+<DQ_Completeness_result>
+<DQ_Completeness_DQ_QuantitativeResult>
+<DQ_Completeness_valueUnit></DQ_Completeness_valueUnit>
+<DQ_Completeness_value></DQ_Completeness_value></DQ_Completeness_DQ_QuantitativeResult>
+</DQ_Completeness_result>
+</DQ_Completeness_evalqualsubname>
+</DQ_Completeness>
+<DQ_LogicConsistency>
+<DQ_LogicConsistency_evalqualsubname>
+<DQ_LogicConsistency_nameOfMeasure></DQ_LogicConsistency_nameOfMeasure>
+<DQ_LogicConsistency_measureDescription></DQ_LogicConsistency_measureDescription>
+<DQ_LogicConsistency_result>
+<DQ_LogicConsistency_DQ_QuantitativeResult>
+<DQ_LogicConsistency_valueUnit></DQ_LogicConsistency_valueUnit>
+<DQ_LogicConsistency_value></DQ_LogicConsistency_value></DQ_LogicConsistency_DQ_QuantitativeResult>
+</DQ_LogicConsistency_result>
+</DQ_LogicConsistency_evalqualsubname>
+</DQ_LogicConsistency>
+<PositionalAccuracy>
+<PositionalAccuracy_evalqualsubname>
+<PositionalAccuracy_nameOfMeasure></PositionalAccuracy_nameOfMeasure>
+<PositionalAccuracy_measureDescription></PositionalAccuracy_measureDescription>
+<PositionalAccuracy_result>
+<PositionalAccuracy_DQ_QuantitativeResult>
+<PositionalAccuracy_valueUnit></PositionalAccuracy_valueUnit>
+<PositionalAccuracy_value></PositionalAccuracy_value></PositionalAccuracy_DQ_QuantitativeResult>
+</PositionalAccuracy_result>
+</PositionalAccuracy_evalqualsubname>
+</PositionalAccuracy>
+<TemporalAccuracy>
+<TemporalAccuracy_evalqualsubname>
+<TemporalAccuracy_nameOfMeasure></TemporalAccuracy_nameOfMeasure>
+<TemporalAccuracy_measureDescription></TemporalAccuracy_measureDescription>
+<TemporalAccuracy_result>
+<TemporalAccuracy_DQ_QuantitativeResult>
+<TemporalAccuracy_valueUnit></TemporalAccuracy_valueUnit>
+<TemporalAccuracy_value></TemporalAccuracy_value></TemporalAccuracy_DQ_QuantitativeResult>
+</TemporalAccuracy_result>
+</TemporalAccuracy_evalqualsubname>
+</TemporalAccuracy>
+<ThematicAccuracy>
+<ThematicAccuracy_evalqualsubname>
+<ThematicAccuracy_nameOfMeasure></ThematicAccuracy_nameOfMeasure>
+<ThematicAccuracy_measureDescription></ThematicAccuracy_measureDescription>
+<ThematicAccuracy_result>
+<ThematicAccuracy_DQ_QuantitativeResult>
+<ThematicAccuracy_valueUnit></ThematicAccuracy_valueUnit>
+<ThematicAccuracy_value></ThematicAccuracy_value></ThematicAccuracy_DQ_QuantitativeResult>
+</ThematicAccuracy_result>
+</ThematicAccuracy_evalqualsubname>
+</ThematicAccuracy>
+</report>
+<LI_Lineage>
+<statement>La nube de puntos fotogramétrica es derivada de procesos fotogramétricos realizados a imágenes de satélite en modo estereoscópico. De manera general el procedimiento consiste en orientar las imágenes de satélite, se densifica el control terrestre y se obtienen los parámetros de orientación. Posteriormente se aplican procesos fotogramétricos de correlación cruzada para obtener la nube de puntos. El modelo digital de elevación se generó con una resolución o espaciamiento horizontal regular en metros, en función de la densidad (entendiendo por densidad, los puntos existentes dentro de un área determinada) de la nube de puntos y se almacena en formatos de interoperabilidad de tipo ráster.</statement>
+<LI_ProcessStep>
+<LI_ProcessStep_description>1. AEROTRINGULACIÓN DE IMÁGENES DE SATÉLITE. Mediante proceso, software y estación fotogramétricos se realiza la orientación de imágenes de satélite, se densifica el control terrestre y se obtienen los parámetros de orientación para la correcta orientación del par estereoscópico.</LI_ProcessStep_description>
+<LI_ProcessStep_description>2. GENERACIÓN DE LA NUBE DE PUNTOS. A través de software fotogramétrico se genera automáticamente la nube de puntos mediante procesos de correlación automática para obtener una representación de los elementos del terreno y sobre el mismo. Una vez generada la nube de puntos, se realiza una revisión a través de una visualización estereoscópica con el fin de corregir, si es el caso, de manera interactiva las áreas donde se presentan inconsistencias fuera de la tolerancia establecida al interior de cada formato cartográfico; para ello, en donde el software no correlaciona correctamente se complementan los datos agregando líneas de ruptura o se realiza el ajuste de los datos erróneos. Durante el proceso fotogramétrico se consideran los alcances y limitaciones del mismo asociado a la localización automática de puntos homólogos derivadas de la vastedad de la búsqueda y ambigüedad de los datos (la cual se produce si la entidad de correspondencia no es única). En el mismo sentido, se consideran los alcances de cada imagen de acuerdo a sus características geométrica y radiométrica en la búsqueda automática de puntos homólogos, ya que, se pueden obtener distintas soluciones derivadas de, una solución inexistente, pudiendo no haber puntos homólogos debido principalmente a ocultaciones, desplazamientos por relieve o diferencias radiométricas. Puede darse el caso de que se presenten soluciones múltiples o se puede dar el caso de existir más de una solución (aparente) en el caso de patrones repetitivos asociados a cultivos, edificaciones, entre otros. También se presentan soluciones inestables derivadas de las condiciones geométricas o radiométricas de manera que en diversas imágenes pueden detectarse puntos homólogos distintos (para un mismo punto de referencia). Por lo anterior, durante el proceso por correlación se pueden presentar algunas áreas con falta de información, que serán subsanadas por el software mediante interpolación al generar la malla equidistante de puntos. Es importante considerar que, la exactitud y completes de los datos obtenidos están en función del ajuste geométrico que se realiza a la imagen y por la calidad radiométrica de las mismas.</LI_ProcessStep_description>
+<LI_ProcessStep_description>3. CUMPLIMIENTO DE LAS ESPECIFICACIONES. Se verifican el cumplimiento de las especificaciones técnicas establecidas para la nube de puntos, como: cobertura espacial de la nube de puntos, sobreposición o faja de excedencia, equidistancia, densidad, representación de los elementos de superficie asociada a la resolución en concordancia con los alcances de los procesos fotogramétricos, puntos consistentes con el terreno y/o con los elementos de superficie, continuidad del relieve entre bloques adyacentes.</LI_ProcessStep_description>
+<LI_ProcessStep_description>4. CLASIFICACIÓN SEMIAUTOMÁTICA. La clasificación consiste en asignar una clase a cada punto, por ejemplo, terreno, vegetación, construcciones, etc. lo anterior permitirá filtrar la clase de puntos de interés que se quieran representar en el modelo digital. En este caso particular se clasificarán únicamente los puntos correspondientes al terreno los cuales darán origen al Modelo Digital de Terreno y los demás puntos correspondientes a la vegetación y elementos antrópicos incluyendo los del propio terreno darán origen al Modelo Digital de Superficie. Originalmente la nube de puntos mantiene un valor de clasificación por defecto; para asignar una clasificación a cada punto en el Instituto se emplea software especializado para el procesamiento y clasificación de nubes de puntos, el cual emplea algoritmos y métodos de clasificación que permiten asignar una clasificación a cada punto.</LI_ProcessStep_description>
+<LI_ProcessStep_description>5. CLASIFICACIÓN INTERACTIVA. Es importante acotar que, durante el proceso de clasificación semiautomática (aunque este proceso es capaz de clasificar de manera confiable los puntos) es indispensable evaluar por parte del especialista clasificador los resultados de la aplicación de los algoritmos, sobre todo cuando el relieve es abrupto y en áreas con alta densidad de vegetación. Para garantizar la correcta clasificación de los puntos es necesario que el especialista realicé una reclasificación interactiva de puntos que no se ajustaron a las características de los elementos que representan, por ejemplo, se debe clasificar aquellos puntos que corresponden al terreno y que los algoritmos no identificaron como tal (regularmente las cimas de los cerros) o bien reclasificar aquellos puntos catalogados como de terreno y que corresponden a elementos de vegetación y/o antrópicos. Estas fallas son comunes en los algoritmos de clasificación de nubes de puntos y son subsanadas por parte de los especialistas en clasificación.</LI_ProcessStep_description>
+<LI_ProcessStep_description>6. TRATAMIENTO DE RASGOS HIDROGRÁFICOS. Para los formatos que cuenten con rasgos hidrográficos como por ejemplo mar, ríos, lagos, o cualquier otro elemento de cuerpo de agua, se llevará a cabo su respectivo tratamiento mediante una serie de procesos o pasos que se tienen ya definidos para cada uno de estos rasgos, con el fin de realizar una representación del relieve de manera continua y regular.</LI_ProcessStep_description>
+<LI_ProcessStep_description>7. VALIDACIÓN DE LA CLASIFICACIÓN Y CONTROL DE CALIDAD. Una vez concluida la clasificación semiautomática e interactiva por parte del especialista clasificador, el especialista validador verifica que la clasificación de los puntos sea correcta, es decir, verifica que los elementos de tipo superficie (vegetación y antrópicos) no estén clasificados incorrectamente como de tipo terreno; y que los elementos del relieve (terreno) no estén clasificados indebidamente como elementos de tipo superficie, una vez identificados estos errores se envían al especialista clasificador como retroalimentación y realiza la respectiva reclasificación.</LI_ProcessStep_description>
+<LI_ProcessStep_description>8. PRODUCTOS FINALES E INFORMACIÓN ASOCIADA. Una vez concluida de manera satisfactoria la verificación de la clasificación y con el fin de poner a disposición el producto en formato de interoperabilidad, se realiza la exportación a formato de tipo ráster el cual asocia las coordenadas horizontales con el valor de elevación de manera regular sobre toda la cobertura de los modelos, de la misma manera, se generan los metadatos en donde se encuentra la caracterización e identificación del modelo, indispensable para que el usuario determine la aptitud de uso de acuerdo a la información contenida en el metadato.</LI_ProcessStep_description>
+</LI_ProcessStep>
+<LI_Source>
+<LI_Source_description>
+</LI_Source_description>
+</LI_Source>
+</LI_Lineage>
+</DQ_DataQuality>
+<Attributes>
+<schemaAscii>
+</schemaAscii>
+<entity_detail>
+</entity_detail>
+</Attributes>
+<MD_Distribution>
+<accessConstraints>8. Acceso al público a través de internet y los Centros de Información del Instituto Nacional de Estadística, Geografía - INEGI.</accessConstraints>
+<useConstraints></useConstraints>
+<otherConstraints>El Instituto Nacional de Estadística y Geografía - INEGI no se hace responsable por el uso que se les dé a los datos.</otherConstraints>
+<MD_Format>
+<name>BIL (Band Interleaved by Line); TIFF (Tagged Image File Format)</name>
+<version>No aplica</version>
+</MD_Format>
+</MD_Distribution>
+<Inf_Metadata>
+<metadataStandardName>ISO 19115 Información Geográfica - Metadatos (Norma Técnica para Metadatos).</metadataStandardName>
+<metadataStandardVersion>2003 (1.0).</metadataStandardVersion>
+<Inf_Metadata_language>ES - Español.</Inf_Metadata_language>
+<CI_ResponsibleParty>
+<Inf_Metadata_CI_ResponsibleParty_individualName>Lic. Rafael Arrioja Urzúa.</Inf_Metadata_CI_ResponsibleParty_individualName>
+<Inf_Metadata_CI_ResponsibleParty_organisationName>Instituto Nacional de Estadística y Geografía - INEGI.</Inf_Metadata_CI_ResponsibleParty_organisationName>
+<Inf_Metadata_CI_ResponsibleParty_positionName>Jefe del Departamento de Administración de Metadatos.</Inf_Metadata_CI_ResponsibleParty_positionName>
+<Inf_Metadata_CI_ResponsibleParty_voice>(449)9105300 Ext. 1750 y 5631.</Inf_Metadata_CI_ResponsibleParty_voice>
+<Inf_Metadata_CI_ResponsibleParty_facsimile></Inf_Metadata_CI_ResponsibleParty_facsimile>
+<Inf_Metadata_CI_ResponsibleParty_deliveryPoint>Avenida Héroe de Nacozari Sur 2301. Fraccionamiento Jardines del Parque, entre Calle INEGI, Avenida del Lago y Avenida Paseo de las Garzas.</Inf_Metadata_CI_ResponsibleParty_deliveryPoint>
+<Inf_Metadata_CI_ResponsibleParty_city>Aguascalientes.</Inf_Metadata_CI_ResponsibleParty_city>
+<Inf_Metadata_CI_ResponsibleParty_administrativeArea>Aguascalientes.</Inf_Metadata_CI_ResponsibleParty_administrativeArea>
+<Inf_Metadata_CI_ResponsibleParty_postalCode>20276</Inf_Metadata_CI_ResponsibleParty_postalCode>
+<Inf_Metadata_CI_ResponsibleParty_country>México.</Inf_Metadata_CI_ResponsibleParty_country>
+<Inf_Metadata_CI_ResponsibleParty_electronicMailAddress>rafael.arrioja@inegi.org.mx</Inf_Metadata_CI_ResponsibleParty_electronicMailAddress>
+<Inf_Metadata_CI_ResponsibleParty_role>  7. Punto de contacto: Parte que puede ser contactada para informarse sobre el recurso o adquisición del mismo.</Inf_Metadata_CI_ResponsibleParty_role>
+</CI_ResponsibleParty>
+<dateStamp>2020-02-19</dateStamp>
+<Inf_Metadata_characterSet>  6. 8859parte1: ISO/IEC 8859-1, Tecnologías de la Información - Conjuntos de caracteres gráficos codificados de 8-bit por byte - Parte 1: Alfabeto Latino No.1.</Inf_Metadata_characterSet>
+</Inf_Metadata>
+</Metadata>
