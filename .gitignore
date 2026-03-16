@@ -12,7 +12,6 @@ pip-wheel-metadata/
 *.egg-info/
 
 # ArcGIS auxiliary files
-EGMTrans_Explorer.gdb/
 .backups/
 ImportLog/
 Index/
