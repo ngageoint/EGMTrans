@@ -64,7 +64,7 @@ This project is licensed under the MIT License - see the [`LICENSE`](LICENSE) fi
 ## Prerequisites
 
 - Python 3.11+
-- GDAL 3.8.0+ (with Python bindings)
+- GDAL 3.11.0+ (with Python bindings)
 - NumPy 1.22.0+
 - SciPy 1.7.0+
 - Numba 0.60+ (recommended but optional)
@@ -408,7 +408,7 @@ For further assistance, please contact the tool developer (see below) or refer t
 If you have questions about this program or would like to know more about NGA's geodetic and elevation products, please contact us!  
 
 **National Geospatial-Intelligence Agency (NGA)**  
-_Office of Geomatics, Elevation Division_  
+_Office of Geomatics & Targeting, Elevation Division_  
 3838 Vogel Road  
 Mail Stop L-041  
 Arnold, MO 63010  

@@ -5,7 +5,7 @@
 # Author: Eric Robeck
 #
 # Copyright (c) 2025, National Geospatial-Intelligence Agency
-# Licensed under the Apache License 2.0
+# Licensed under the MIT License
 # ******************************************************************************
 
 """Backward-compatibility shim. Re-exports the public API from the egmtrans package."""
