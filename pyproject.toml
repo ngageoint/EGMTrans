@@ -17,10 +17,10 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: GIS",
 ]
-dependencies = ["numpy>=1.22", "scipy>=1.7", "GDAL>=3.8", "numba>=0.60", "tqdm>=4.60"]
+dependencies = ["numpy>=1.22", "scipy>=1.7", "GDAL>=3.11", "numba>=0.60", "tqdm>=4.60"]
 
 [project.optional-dependencies]
-core = ["numpy>=1.22", "scipy>=1.7", "GDAL>=3.8"]
+core = ["numpy>=1.22", "scipy>=1.7", "GDAL>=3.11"]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4"]
 
 [project.scripts]
