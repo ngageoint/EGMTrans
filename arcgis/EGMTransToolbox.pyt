@@ -138,13 +138,13 @@ class Tool:
         save_log.value = True
         params.append(save_log)
 
-        # output_layer = arcpy.Parameter(
-        #     displayName="Output Raster Layer",
-        #     name="output_layer",
-        #     datatype="GPRasterLayer",
-        #     parameterType="Derived",  # This makes it hidden from the user
-        #     direction="Output")
-        # params.append(output_layer)
+        output_layer = arcpy.Parameter(
+            displayName="Output Raster Layer",
+            name="output_layer",
+            datatype="GPRasterLayer",
+            parameterType="Derived",
+            direction="Output")
+        params.append(output_layer)
 
         return params
 
@@ -240,16 +240,19 @@ class Tool:
         # If so, calculate stats and create a layer to add to the map.
         if os.path.isfile(output_path):
             try:
-                messages.addMessage(f"Calculating statistics before loading to map...")
+                messages.addMessage("Calculating statistics before loading to map...")
                 arcpy.management.CalculateStatistics(output_path)
                 messages.addMessage("Statistics calculated successfully.")
+            except Exception:
+                pass  # ArcGIS Pro will calculate stats on-the-fly for display
 
-                # Create a raster layer object from the file on disk
-                result_layer = arcpy.management.MakeRasterLayer(output_path, os.path.basename(output_path))
+            try:
+                result_layer = arcpy.management.MakeRasterLayer(
+                    output_path, os.path.basename(output_path))
                 arcpy.SetParameter(10, result_layer)
-            
             except Exception as e:
-                messages.addWarning(f"Could not create output layer for map display: {e}")
+                messages.addWarningMessage(
+                    f"Could not create output layer for map display: {e}")
         elif not hasattr(input_param.value, 'dataSource'):
             messages.addMessage("Output is a folder. Skipping automatic layer addition to map.")
 
