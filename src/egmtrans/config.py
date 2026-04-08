@@ -70,6 +70,27 @@ def get_crs_dir() -> str:
     return os.path.join(BASE_PATH, 'crs')
 
 
+def verify_grids(src_datum: str, tgt_datum: str) -> None:
+    """Check that the geoid grid files needed for a transformation exist.
+
+    Raises:
+        FileNotFoundError: If a required grid file is missing, with
+            instructions on how to download it.
+    """
+    for datum in (src_datum, tgt_datum):
+        grid = DATUM_MAPPING.get(datum, {}).get('grid')
+        if grid is None:
+            continue
+        path = os.path.join(get_datums_dir(), grid)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Required geoid grid file not found: datums/{grid}\n\n"
+                f"Download the grid files by running:  python download_grids.py\n"
+                f"Or download manually from: "
+                f"https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1"
+            )
+
+
 def configure_gdal() -> None:
     """Set GDAL/PROJ configuration options. Must run before any GDAL operations.
 

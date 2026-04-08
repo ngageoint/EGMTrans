@@ -22,7 +22,9 @@ from osgeo import gdal
 
 from egmtrans import _state
 from egmtrans.arcpy_compat import init_arcpy
-from egmtrans.config import DATUM_MAPPING, DTED_EXTENSIONS, SUPPORTED_EXTENSIONS
+from egmtrans.config import (
+    DATUM_MAPPING, DTED_EXTENSIONS, SUPPORTED_EXTENSIONS, verify_grids,
+)
 from egmtrans.crs import standardize_srs
 from egmtrans.file_utils import copy_folder_structure, is_valid_dem, is_valid_filename
 from egmtrans.logging_setup import end_logger, setup_logger
@@ -156,6 +158,8 @@ def process_file(
 
     if arc_mode:
         log_numba_availability()
+
+    verify_grids(source_datum, target_datum)
 
     if not is_valid_dem(input_file):
         logger.error(f"Skipping {os.path.basename(input_file)} as it's not a DEM.\n")
