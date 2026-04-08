@@ -214,6 +214,21 @@ class Tool:
         arcpy.AddMessage(f"Save Log File: {save_log}")
         arcpy.AddMessage(f'{"="*80}\n')
 
+        # Download geoid grid files on first run if they are missing.
+        from egmtrans.download import ensure_grids
+        try:
+            downloaded = ensure_grids(message_func=arcpy.AddMessage)
+            if downloaded:
+                arcpy.AddMessage(f"Downloaded {len(downloaded)} geoid grid file(s).\n")
+        except Exception as e:
+            arcpy.AddError(
+                f"Failed to download geoid grid files: {e}\n"
+                f"Download manually from: "
+                f"https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1\n"
+                f"Place the .tif files in the datums/ folder."
+            )
+            return
+
         try:
             if os.path.isfile(input_path):
                 EGMTrans.process_file(input_path, output_path, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)

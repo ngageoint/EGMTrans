@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-04-08
+
+### Changed
+
+- Moved geoid grid GeoTIFF files (~1.3 GB) from Git LFS to a dedicated GitHub Release ([datum-grids-v1](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1)) to fix ZIP download issues and remove the Git LFS dependency.
+- The `datums/` directory no longer contains `.tif` files in the repository. Grid files must be downloaded separately.
+
+### Added
+
+- `src/egmtrans/download.py` module for downloading grid files from GitHub Releases with SHA-256 checksum verification.
+- `download_grids.py` CLI script to download all geoid grid files with a single command.
+- ArcGIS Pro toolbox auto-downloads grid files on first run -- no terminal required.
+- Runtime validation in `config.verify_grids()` checks for required grid files before processing and provides clear download instructions if they are missing.
+- `datums/README.md` with download instructions and checksums.
+
+### Removed
+
+- `.gitattributes` (Git LFS tracking no longer needed).
+- Grid `.tif` files from Git LFS tracking.
+
 ## [1.1.0] - 2026-03-16
 
 ### Changed

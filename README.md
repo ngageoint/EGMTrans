@@ -6,7 +6,7 @@
 # EGMTrans Tool and Explorer
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.1.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.2.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -79,7 +79,13 @@ pip install -e ".[core]"       # without numba/tqdm (restricted environments)
 pip install -e ".[dev]"        # with test/lint tools
 ```
 
-After installation, the `egmtrans` command is available:
+After installation, download the required geoid grid files:
+
+```bash
+python download_grids.py
+```
+
+Then the `egmtrans` command is available:
 
 ```bash
 egmtrans -i input.tif -o output.tif -s WGS84 -t EGM2008
@@ -88,6 +94,7 @@ egmtrans -i input.tif -o output.tif -s WGS84 -t EGM2008
 ### Option B: Run directly (no install)
 
 ```bash
+python download_grids.py
 python EGMTrans.py -i input.tif -o output.tif -s WGS84 -t EGM2008
 ```
 
@@ -99,6 +106,7 @@ The root-level `EGMTrans.py` is a backward-compatibility shim that re-exports fr
 conda env create -f environment.yml
 conda activate egm_trans
 pip install -e .
+python download_grids.py
 ```
 
 Note: GDAL installation can be complex. Consider using Anaconda for a smoother installation process.
@@ -123,13 +131,21 @@ For restricted environments without access to Anaconda or custom ArcGIS Pro envi
 
 ## Geoid Grid Files
 
-Ensure you have the required geoid grid files in the `datums/` directory:
+The geoid grid GeoTIFFs (~1.3 GB total) are hosted as [GitHub Release assets](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1), not stored in the repository itself. Download them by running:
+
+```bash
+python download_grids.py
+```
+
+The ArcGIS Pro toolbox downloads the grid files automatically on first run -- no terminal required.
+
+The required files for transformation are:
 - EGM96: `us_nga_egm96_1.tif`
 - EGM2008: `us_nga_egm08_1.tif`
 
 These are the one-arc-minute geoid models in Cloud Optimized GeoTIFF (COG) format prepared by the U.S. National Geospatial-Intelligence Agency (<https://earth-info.nga.mil/>).
 
-Lower-resolution versions of EGM2008 (2.5 arc minutes) and EGM96 (15 arc minutes) are also included in the `datums/` directory and can be obtained from the PROJ.org CDN: <https://cdn.proj.org/>. However, NGA does not recommend using them for transformation. Errors of >0.5 m have been observed between the sparse 15 arc minute (~27 km) EGM96 posts, where it becomes decoupled from the denser 2.5 arc minute (~4.5 km) EGM2008 posts. In contrast, the 1 arc minute grids have a post spacing of ~1.8 km.
+Three additional grids are downloaded for the EGMTrans Explorer map: the EGM96-to-EGM2008 difference grid, and lower-resolution versions of EGM2008 (2.5 arc minutes) and EGM96 (15 arc minutes). The lower-resolution grids can also be obtained from the PROJ.org CDN: <https://cdn.proj.org/>. However, NGA does not recommend using them for transformation. Errors of >0.5 m have been observed between the sparse 15 arc minute (~27 km) EGM96 posts, where it becomes decoupled from the denser 2.5 arc minute (~4.5 km) EGM2008 posts. In contrast, the 1 arc minute grids have a post spacing of ~1.8 km.
 
 | Grid | Resolution | Post Spacing |
 |------|-----------|--------------|
@@ -171,7 +187,7 @@ EGMTrans/
 │   ├── execution.py
 │   └── ...
 ├── crs/                     # PROJ data
-├── datums/                  # Geoid grids
+├── datums/                  # Geoid grids (downloaded separately)
 ├── samples/                 # Sample elevation data
 ├── img/
 ├── EGMTrans.py              # Backward-compat shim
@@ -182,13 +198,15 @@ EGMTrans/
 └── README.md
 ```
 
-4. Open ArcGIS Pro and create a new project or open an existing one.
+4. Geoid grid files will be downloaded automatically the first time you run the EGMTrans Tool. Alternatively, run `python download_grids.py` from the EGMTrans directory, or download the grid files manually from the [GitHub Releases page](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1) and place them in the `datums/` folder.
 
-5. In the Catalog pane, right-click on Toolboxes and select "Add Toolbox".
+5. Open ArcGIS Pro and create a new project or open an existing one.
 
-6. Navigate to the `EGMTrans/arcgis` folder and select the `EGMTransToolbox.pyt` file.
+6. In the Catalog pane, right-click on Toolboxes and select "Add Toolbox".
 
-7. The "EGMTransToolbox" toolbox should now appear in your Toolboxes list.
+7. Navigate to the `EGMTrans/arcgis` folder and select the `EGMTransToolbox.pyt` file.
+
+8. The "EGMTransToolbox" toolbox should now appear in your Toolboxes list.
 
 ## ArcGIS Pro Python Environment
 
