@@ -32,7 +32,7 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - [DTED Header Handling](#dted-header-handling)
 - [Notes](#notes)
 - [Constraints](#constraints)
-- [Troubleshooting](#troubleshooting-the-egmtrans-toolbox-in-arcgis-pro)
+- [Troubleshooting](#troubleshooting)
 - [Contact](#contact)
 
 ## Features
@@ -71,6 +71,8 @@ This project is licensed under the MIT License - see the [`LICENSE`](LICENSE) fi
 
 ## Installation
 
+> **Windows users:** GDAL cannot be reliably installed via `pip` on Windows. Use [Option C (conda)](#option-c-conda-environment) for the smoothest setup experience.
+
 ### Option A: Install as a Python package (recommended)
 
 ```bash
@@ -78,6 +80,8 @@ pip install -e .               # includes numba + tqdm for best performance
 pip install -e ".[core]"       # without numba/tqdm (restricted environments)
 pip install -e ".[dev]"        # with test/lint tools
 ```
+
+> **Note:** On Windows, `pip install` will fail if a pre-built GDAL wheel is not available for your Python version (common with newer Python releases). If you see an error about Microsoft Visual C++ Build Tools, use [Option C (conda)](#option-c-conda-environment) instead, or install GDAL separately via [OSGeo4W](https://trac.osgeo.org/osgeo4w/) before running `pip install`.
 
 After installation, download the required geoid grid files:
 
@@ -406,7 +410,15 @@ In addition, users will be warned in the following circumstances and asked if th
 - The source datum and target datum are the same. If the source is a GeoTIFF file and the user chooses to proceed, the output GeoTIFF will be assigned the correct vertical datum (which is often missing in GeoTIFF files) with values rounded to 1 cm and optimized DEFLATE compression. If the source is a DTED file, the operation will abort.
 - The source datum does not match the datum in the source file header. If the user chooses to proceed, the source file metadata will be ignored. This may be necessary if the source file is in error, but it is important to check the sources to be sure.
 
-## Troubleshooting the EGMTrans Toolbox in ArcGIS Pro
+## Troubleshooting
+
+### GDAL build failure on Windows (`Microsoft Visual C++ 14.0 or greater is required`)
+
+This error occurs when `pip` cannot find a pre-built GDAL wheel for your Python version and falls back to compiling from source. Building GDAL from source requires both the Microsoft Visual C++ Build Tools and the GDAL C library headers, which most users will not have installed. This is especially common with newer Python releases (e.g., 3.13+) that GDAL has not yet published wheels for.
+
+**Fix:** Use the [conda installation method](#option-c-conda-environment), which provides pre-compiled GDAL binaries from conda-forge. Alternatively, install GDAL via [OSGeo4W](https://trac.osgeo.org/osgeo4w/) before running `pip install`.
+
+### EGMTrans Toolbox in ArcGIS Pro
 
 - If you encounter any issues with the toolbox, check the ArcGIS Pro Python window for error messages.
 - Ensure that the `EGMTrans.py` file is correctly located in the `EGMTrans` directory.
