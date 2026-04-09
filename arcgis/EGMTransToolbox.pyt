@@ -231,6 +231,8 @@ class Tool:
 
         try:
             if os.path.isfile(input_path):
+                if os.path.isdir(output_path):
+                    output_path = os.path.join(output_path, os.path.basename(input_path))
                 EGMTrans.process_file(input_path, output_path, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)
             elif os.path.isdir(input_path):
                 EGMTrans.copy_folder_structure(input_path, output_path)

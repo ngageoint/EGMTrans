@@ -356,6 +356,14 @@ def main() -> None:
             args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
             args.abs_horiz_accuracy, args.log_file,
         )
+    elif input_is_file and output_is_folder:
+        output_file = os.path.join(args.output, os.path.basename(args.input))
+        logger.info(f"Processing file: {output_file}")
+        process_file(
+            args.input, output_file, args.source_datum, args.target_datum,
+            args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
+            args.abs_horiz_accuracy, args.log_file,
+        )
     elif input_is_folder and output_is_folder:
         copy_folder_structure(args.input, args.output)
         ignore_wrong_datum = False
