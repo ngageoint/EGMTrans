@@ -149,7 +149,8 @@ The required files for transformation are:
 
 These are the one-arc-minute geoid models in Cloud Optimized GeoTIFF (COG) format prepared by the U.S. National Geospatial-Intelligence Agency (<https://earth-info.nga.mil/>).
 
-Three additional grids are downloaded for the EGMTrans Explorer map: the EGM96-to-EGM2008 difference grid, and lower-resolution versions of EGM2008 (2.5 arc minutes) and EGM96 (15 arc minutes). The lower-resolution grids can also be obtained from the PROJ.org CDN: <https://cdn.proj.org/>. However, NGA does not recommend using them for transformation. Errors of >0.5 m have been observed between the sparse 15 arc minute (~27 km) EGM96 posts, where it becomes decoupled from the denser 2.5 arc minute (~4.5 km) EGM2008 posts. In contrast, the 1 arc minute grids have a post spacing of ~1.8 km.
+Three additional grids are downloaded for the EGMTrans Explorer map: the EGM96-to-EGM2008 difference grid, and lower-resolution versions of EGM2008 (2.5 arc minutes) and EGM96 (15 arc minutes). The lower-resolution grids can also be obtained from the PROJ.org CDN: <https://cdn.proj.org/>. The lower-resolution EGM96 grid is less precise; errors of >0.5 m have been observed between the sparse 15 arc minute (~27 km) EGM96 posts. In contrast, the 1 arc minute grids have a post spacing of ~1.8 km, and the difference between the EGM96 and EGM2008 spherical harmonics formulas and their one-minute grid representations is negligible.
+
 
 | Grid | Resolution | Post Spacing |
 |------|-----------|--------------|
