@@ -266,10 +266,9 @@ class Tool:
             try:
                 result_layer = arcpy.management.MakeRasterLayer(
                     output_path, os.path.basename(output_path))
-                arcpy.SetParameter(10, result_layer)
+                arcpy.SetParameter(10, result_layer.getOutput(0))
             except Exception as e:
-                messages.addWarningMessage(
-                    f"Could not create output layer for map display: {e}")
+                arcpy.AddWarning(f"Could not create output layer for map display: {e}")
         elif not hasattr(input_param.value, 'dataSource'):
             messages.addMessage("Output is a folder. Skipping automatic layer addition to map.")
 
