@@ -23,7 +23,10 @@ from osgeo import gdal
 from egmtrans import _state
 from egmtrans.arcpy_compat import init_arcpy
 from egmtrans.config import (
-    DATUM_MAPPING, DTED_EXTENSIONS, SUPPORTED_EXTENSIONS, verify_grids,
+    DATUM_MAPPING,
+    DTED_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+    verify_grids,
 )
 from egmtrans.crs import standardize_srs
 from egmtrans.download import ensure_grids

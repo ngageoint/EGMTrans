@@ -2,8 +2,6 @@
 
 import os
 
-import pytest
-
 from egmtrans.file_utils import copy_folder_structure, is_valid_dem, is_valid_filename
 
 

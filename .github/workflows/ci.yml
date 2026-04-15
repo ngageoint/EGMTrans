@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up micromamba + GDAL
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-name: egmtrans-ci
+          create-args: >-
+            python=${{ matrix.python-version }}
+            gdal>=3.11
+            numpy>=1.22
+            scipy>=1.7
+            numba>=0.60
+            tqdm>=4.60
+          cache-environment: true
+          init-shell: bash
+
+      - name: Install package and dev tools
+        run: pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check src tests
+
+      - name: Cache geoid grid files
+        id: cache-grids
+        uses: actions/cache@v4
+        with:
+          path: datums
+          key: datum-grids-v1-${{ hashFiles('src/egmtrans/download.py') }}
+
+      - name: Download geoid grids (test subset)
+        if: steps.cache-grids.outputs.cache-hit != 'true'
+        run: |
+          python - <<'PY'
+          import os
+          from egmtrans.download import (
+              GRID_FILES, RELEASE_URL, _default_datums_dir,
+              download_file, verify_checksum,
+          )
+          d = _default_datums_dir()
+          os.makedirs(d, exist_ok=True)
+          for fn in ("us_nga_egm96_1.tif", "us_nga_egm08_1.tif"):
+              info = GRID_FILES[fn]
+              dest = os.path.join(d, fn)
+              if verify_checksum(dest, info["sha256"]):
+                  continue
+              download_file(f"{RELEASE_URL}/{fn}", dest, info["sha256"])
+          PY
+
+      - name: Run tests
+        run: pytest

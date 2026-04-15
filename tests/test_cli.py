@@ -1,6 +1,7 @@
 """Tests for egmtrans.cli — str2bool, process_file signature, etc."""
 
 import argparse
+
 import pytest
 
 from egmtrans.cli import delete_output_directory, process_file, str2bool

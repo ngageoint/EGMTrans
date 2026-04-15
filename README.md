@@ -23,6 +23,7 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - [Installation](#installation)
 - [Performance Considerations](#performance-considerations)
 - [Geoid Grid Files](#geoid-grid-files)
+  - [Grid provenance](#grid-provenance)
 - [ArcGIS Pro Setup Instructions](#arcgis-pro-setup-instructions)
 - [ArcGIS Pro Python Environment](#arcgis-pro-python-environment)
 - [Using the Transformation Tool in ArcGIS Pro](#using-the-transformation-tool-in-arcgis-pro)
@@ -51,9 +52,7 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 
 ## Versioning
 
-This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The current version is `1.1.0`.
-
-The version is defined in [`src/egmtrans/_version.py`](src/egmtrans/_version.py) as the single source of truth.
+This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The version is defined in [`src/egmtrans/_version.py`](src/egmtrans/_version.py) as the single source of truth.
 
 For a detailed list of changes for each version, please see the [`CHANGELOG.md`](CHANGELOG.md) file.
 
@@ -151,7 +150,15 @@ The required files for transformation are:
 
 These are the one-arc-minute geoid models in Cloud Optimized GeoTIFF (COG) format prepared by the U.S. National Geospatial-Intelligence Agency (<https://earth-info.nga.mil/>).
 
-Three additional grids are downloaded for the EGMTrans Explorer map: the EGM96-to-EGM2008 difference grid, and lower-resolution versions of EGM2008 (2.5 arc minutes) and EGM96 (15 arc minutes). The lower-resolution grids can also be obtained from the PROJ.org CDN: <https://cdn.proj.org/>. The lower-resolution EGM96 grid is less precise; errors of >0.5 m have been observed between the sparse 15 arc minute (~27 km) EGM96 posts. In contrast, the 1 arc minute grids have a post spacing of ~1.8 km, and the difference between the EGM96 and EGM2008 spherical harmonics formulas and their one-minute grid representations is negligible.
+### Grid provenance
+
+The 1-arc-minute EGM96 and EGM2008 grids shipped with EGMTrans were computed *directly from the published spherical harmonic coefficients*, not interpolated up from the lower-resolution published grids. Evaluation was performed using NGA's own Fortran executables (`hsynth_WGS84`, `f477_bin`, and `clenqt_bin`), which are distributed by NGA's Office of Geomatics & Targeting at <https://earth-info.nga.mil>. Python wrappers around those executables were used to generate the global grids, which were then written out as Cloud Optimized GeoTIFFs. Geoid undulations are rounded to the nearest millimeter (3 decimal places).
+
+The EGM2008 grid was validated against the independent 1-arc-minute binary file `Und_min1x1_egm2008_isw=82_WGS84_TideFree_SE` provided by Nikolaos Pavlis (a lead author of EGM2008) to NGA. The two grids agree to within millimeters globally.
+
+Each grid file is pinned to a SHA-256 hash in [`src/egmtrans/download.py`](src/egmtrans/download.py); the download routine verifies the hash after fetching and deletes any file that fails the check. See [`SECURITY.md`](SECURITY.md) for details.
+
+Three additional grids are downloaded for the EGMTrans Explorer map: the EGM96-to-EGM2008 difference grid, and lower-resolution versions of EGM2008 (2.5 arc minutes) and EGM96 (15 arc minutes). The lower-resolution grids can also be obtained from the PROJ.org Content Delivery Network: <https://cdn.proj.org/>. The lower-resolution EGM96 grid is less precise; errors of >0.5 m have been observed between the sparse 15 arc minute (~27 km) EGM96 posts. In contrast, the 1 arc minute grids have a post spacing of ~1.8 km, and the difference between the EGM96 and EGM2008 spherical harmonics formulas and their one-minute grid representations is negligible.
 
 
 | Grid | Resolution | Post Spacing |
@@ -173,7 +180,7 @@ Note that the PROJ engine relies on the lower-resolution versions, so the `proj`
 ```
 EGMTrans/
 ├── src/
-│   └── egmtrans/           # Python package (core logic)
+│   └── egmtrans/            # Python package (core logic)
 │       ├── __init__.py
 │       ├── _version.py
 │       ├── _state.py

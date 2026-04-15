@@ -1,9 +1,9 @@
 """Shared test fixtures."""
 
 import os
+import shutil
 import sys
 import tempfile
-import shutil
 
 import numpy as np
 import pytest

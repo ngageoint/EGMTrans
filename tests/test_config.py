@@ -26,7 +26,7 @@ def test_dted_extensions_subset_of_supported():
 
 
 def test_datum_mapping_has_required_keys():
-    for name, details in DATUM_MAPPING.items():
+    for _name, details in DATUM_MAPPING.items():
         assert 'epsg' in details
         assert 'grid' in details
         assert 'dted_code' in details

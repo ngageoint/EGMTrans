@@ -1,6 +1,5 @@
 """Tests for egmtrans.transform — basic structural tests."""
 
-import pytest
 
 from egmtrans.transform import (
     create_datum_array,

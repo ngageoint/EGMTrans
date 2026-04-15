@@ -3,7 +3,6 @@
 import os
 
 import numpy as np
-import pytest
 from osgeo import gdal, osr
 
 from egmtrans.io import apply_scale_factor, write_array_to_geotiff, write_points_to_geojson
