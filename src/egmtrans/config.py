@@ -91,12 +91,49 @@ def verify_grids(src_datum: str, tgt_datum: str) -> None:
             )
 
 
+def _bundled_proj_db_is_compatible() -> bool:
+    """Return True iff the bundled ``crs/proj.db`` is usable by the installed PROJ.
+
+    The bundled database has a ``DATABASE.LAYOUT.VERSION`` that was current at
+    the time it was generated (PROJ 9.6.2, layout 1.5). If the installed PROJ
+    library has moved past that layout version, any EPSG lookup using the
+    bundled db will raise ``RuntimeError: DATABASE.LAYOUT.VERSION.MINOR = N
+    whereas a number >= M is expected``. We compare the bundled and installed
+    PROJ major.minor versions and only consider the bundled db usable when it
+    is at least as new as the installed library.
+    """
+    import sqlite3
+
+    from osgeo import osr
+
+    db_path = os.path.join(get_crs_dir(), 'proj.db')
+    if not os.path.isfile(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'PROJ.VERSION'"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return False
+        bundled = tuple(int(p) for p in row[0].split('.')[:2])
+    except (sqlite3.Error, ValueError):
+        return False
+
+    installed = (osr.GetPROJVersionMajor(), osr.GetPROJVersionMinor())
+    return bundled >= installed
+
+
 def configure_gdal() -> None:
     """Set GDAL/PROJ configuration options. Must run before any GDAL operations.
 
     - Forces PROJ to work offline with the local datum grids (``PROJ_NETWORK=OFF``).
     - Points ``PROJ_DATA`` at the project's ``crs/`` directory so the bundled
-      ``proj.db`` is used instead of the system default.
+      ``proj.db`` is used instead of the system default — but only when the
+      bundled database is compatible with the installed PROJ library. On
+      newer systems the bundled db is silently skipped and the system
+      ``proj.db`` is used instead.
     - Sets ``GDAL_CACHEMAX`` to 512 MB for faster I/O with temporary files.
     - Suppresses GDAL FutureWarnings and enables GDAL exceptions.
     - Prevents ArcPy from creating ``.aux.xml`` sidecar files.
@@ -104,7 +141,8 @@ def configure_gdal() -> None:
     from osgeo import gdal
 
     gdal.SetConfigOption('PROJ_NETWORK', 'OFF')
-    gdal.SetConfigOption('PROJ_DATA', get_crs_dir())
+    if _bundled_proj_db_is_compatible():
+        gdal.SetConfigOption('PROJ_DATA', get_crs_dir())
     gdal.SetConfigOption('GDAL_CACHEMAX', '512')
 
     warnings.filterwarnings("ignore", category=FutureWarning, module="osgeo.gdal")
