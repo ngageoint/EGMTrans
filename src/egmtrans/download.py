@@ -89,6 +89,7 @@ def download_file(
             total = int(response.headers.get("Content-Length", 0))
             total_mb = total / (1024 * 1024) if total else 0
             downloaded = 0
+            last_reported_mb = 0
             sha = hashlib.sha256()
 
             with open(tmp_path, "wb") as out:
@@ -100,12 +101,15 @@ def download_file(
                     sha.update(chunk)
                     downloaded += len(chunk)
                     dl_mb = downloaded / (1024 * 1024)
-                    if total:
-                        message_func(
-                            f"  {filename}  {dl_mb:.0f} / {total_mb:.0f} MB"
-                        )
-                    else:
-                        message_func(f"  {filename}  {dl_mb:.0f} MB")
+                    is_final = total and downloaded >= total
+                    if dl_mb - last_reported_mb >= 10 or is_final:
+                        last_reported_mb = int(dl_mb)
+                        if total:
+                            message_func(
+                                f"  {filename}  {dl_mb:.0f} / {total_mb:.0f} MB"
+                            )
+                        else:
+                            message_func(f"  {filename}  {dl_mb:.0f} MB")
 
         if sha.hexdigest() != expected_sha256:
             os.remove(tmp_path)

@@ -135,13 +135,15 @@ For restricted environments without access to Anaconda or custom ArcGIS Pro envi
 
 ## Geoid Grid Files
 
-The geoid grid GeoTIFFs (~1.3 GB total) are hosted as [GitHub Release assets](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1), not stored in the repository itself. Download them by running:
+The geoid grid GeoTIFFs (~1.3 GB total) are hosted as [GitHub Release assets](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1), not stored in the repository itself.
+
+Both the command-line tool and the ArcGIS Pro toolbox download any missing grid files automatically on first run -- no manual step required. If you prefer to pre-populate the `datums/` folder up front (e.g. on an offline machine, or to avoid the download delay inside ArcGIS Pro), you can run:
 
 ```bash
 python download_grids.py
 ```
 
-The ArcGIS Pro toolbox downloads the grid files automatically on first run -- no terminal required.
+Or download the files manually from the [GitHub Releases page](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1) and drop them into `datums/`.
 
 The required files for transformation are:
 - EGM96: `us_nga_egm96_1.tif`
@@ -426,6 +428,12 @@ This error occurs when `pip` cannot find a pre-built GDAL wheel for your Python 
 - Make sure you have the necessary permissions to read the input files and write to the output location.
 - For Explorer-specific issues, ensure that your transformed files are in the correct location and properly referenced in the ArcGIS Pro project.
 - If you encounter performance issues, check if Numba is installed and properly configured in your Python environment.
+
+### Red "!" icons next to geoid layers in ArcGIS Pro
+
+If ArcGIS Pro (especially the EGMTrans Explorer project) is opened *before* the geoid grid files have been downloaded, the map layers that reference those `.tif` files will appear with red "!" broken-reference icons next to their checkboxes in the Contents pane. This is expected: the toolbox downloads the grids on its first run, but a project opened earlier has already cached the "missing file" state for the session.
+
+**Fix:** Run the EGMTrans tool once (on any sample input) to trigger the grid download. Then close and reopen the ArcGIS Pro project. On the next load, the layers will resolve against the now-present `.tif` files and render correctly without any manual repath or symbology changes.
 
 ## Additional Resources
 

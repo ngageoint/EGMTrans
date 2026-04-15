@@ -26,6 +26,7 @@ from egmtrans.config import (
     DATUM_MAPPING, DTED_EXTENSIONS, SUPPORTED_EXTENSIONS, verify_grids,
 )
 from egmtrans.crs import standardize_srs
+from egmtrans.download import ensure_grids
 from egmtrans.file_utils import copy_folder_structure, is_valid_dem, is_valid_filename
 from egmtrans.logging_setup import end_logger, setup_logger
 from egmtrans.numba_utils import NUMBA_AVAILABLE
@@ -348,6 +349,20 @@ def main() -> None:
             logger.info(f"Argument - {arg}: {value}\n\n")
         else:
             logger.info(f"Argument - {arg}: {value}")
+
+    try:
+        downloaded = ensure_grids(message_func=logger.info)
+        if downloaded:
+            logger.info(f"Downloaded {len(downloaded)} geoid grid file(s).\n")
+    except Exception as e:
+        logger.error(
+            f"Failed to download geoid grid files: {e}\n"
+            f"Download manually from: "
+            f"https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1\n"
+            f"Place the .tif files in the datums/ folder."
+        )
+        end_logger()
+        sys.exit(1)
 
     if input_is_file and output_is_file:
         logger.info(f"Processing file: {args.output}")
