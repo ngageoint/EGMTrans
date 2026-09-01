@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] - 2026-08-31
 
 ### Fixed
 
@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ArcGIS Pro: for a file input written to a folder output, the log is now named after the output file (`<folder>/<input name>_transform.log`) rather than after the folder, matching the file→file case.
 - Batch mode clears the read-only attribute on every copied file, so re-runs and output-directory cleanup work on Windows.
 - Removed a redundant full-size intermediate raster from the GeoTIFF path: `<base>_warp.tif` was created and fully populated but never read.
+- The `proj` algorithm is no longer discouraged in the README: it was documented as unreliable because "the PROJ engine relies on the lower-resolution versions", which was the `get_proj4` substitution failing rather than a PROJ limitation. It now resamples the same 1 arc minute grids as the other algorithms and agrees with `bilinear` to within the 1 cm output rounding.
 
 ### Added
 

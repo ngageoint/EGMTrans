@@ -6,7 +6,7 @@
 # EGMTrans Tool and Explorer
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.3.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.4.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -167,7 +167,7 @@ Three additional grids are downloaded for the EGMTrans Explorer map: the EGM96-t
 | EGM2008 (2.5') | 2.5 arc minutes | ~4.5 km |
 | **EGM96 / EGM2008 (1')** | **1 arc minute** | **~1.8 km** |
 
-Note that the PROJ engine relies on the lower-resolution versions, so the `proj` interpolation option is not recommended. These grids are included for reference only.
+PROJ registers the lower-resolution grids for EPSG:5773 and EPSG:3855, so left to itself the `proj` interpolation option would resample those rather than the 1 arc minute grids. EGMTrans overrides the `+geoidgrids=` value to force the 1 arc minute grid, and `proj` now agrees with `bilinear` to within the 1 cm output rounding. The lower-resolution grids are retained for the EGMTrans Explorer map.
 
 ## ArcGIS Pro Setup Instructions
 
@@ -382,7 +382,7 @@ EGMTrans supports multiple interpolation algorithms for vertical datum transform
 - **bilinear** (default): Fast and memory-efficient interpolation suitable for most applications. Provides a good balance between speed and accuracy.
 - **spline**: Uses thin plate spline interpolation for highest accuracy, especially in areas with complex geoid variations. Significantly slower than other methods.
 - **delaunay**: Uses triangulation-based linear interpolation. More accurate than bilinear for irregular point distributions (not an issue with datum grids) but slower.
-- **proj**: Uses GDAL's built-in vertical datum transformation capabilities. Fastest option but may produce artifacts at edges. Not available in ArcGIS Pro.
+- **proj**: Uses GDAL's built-in vertical datum transformation capabilities, forced onto the same 1 arc minute grids the other algorithms use. Fastest option but may produce artifacts at edges. Not available in ArcGIS Pro.
 
 The choice of algorithm depends on your specific requirements:
 - For most applications, the default **bilinear** algorithm provides the best balance of speed and accuracy
