@@ -23,14 +23,19 @@ from osgeo import gdal
 from egmtrans import _state
 from egmtrans.arcpy_compat import init_arcpy
 from egmtrans.config import (
-    DATUM_MAPPING,
     DTED_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    normalize_datum,
     verify_grids,
 )
 from egmtrans.crs import standardize_srs
 from egmtrans.download import ensure_grids
-from egmtrans.file_utils import copy_folder_structure, is_valid_dem, is_valid_filename
+from egmtrans.file_utils import (
+    copy_folder_structure,
+    is_valid_dem,
+    prepare_output_target,
+    resolve_io_paths,
+)
 from egmtrans.logging_setup import end_logger, setup_logger
 from egmtrans.numba_utils import NUMBA_AVAILABLE
 from egmtrans.transform import transform_vertical_datum
@@ -73,6 +78,14 @@ def str2bool(v: str | bool | None) -> bool:
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def datum_arg(value: str) -> str:
+    """argparse ``type`` for the ``-s`` / ``-t`` datum options."""
+    try:
+        return normalize_datum(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
 
 
 def delete_output_directory(output_dir: str, max_retries: int = 3, retry_delay: float = 1.0) -> bool:
@@ -195,13 +208,20 @@ def process_file(
         )
         return False
 
-    input_ds = gdal.Open(input_file, gdal.GA_ReadOnly)
-    if input_ds is None:
-        logger.error(f'Failed to open input file: {input_file}')
+    if os.path.isdir(output_file):
+        logger.error(
+            f'Output path is a directory, not a file: {output_file}\nAborting transformation.'
+        )
         return False
 
-    metadata = input_ds.GetMetadata()
-    projection = input_ds.GetProjection()
+    # gdal.UseExceptions() is on, so a failed open raises rather than returning None.
+    try:
+        with gdal.Open(input_file, gdal.GA_ReadOnly) as input_ds:
+            metadata = input_ds.GetMetadata()
+            projection = input_ds.GetProjection()
+    except RuntimeError as e:
+        logger.error(f'Failed to open input file {input_file}: {e}')
+        return False
     logger.debug(f"Input file's projection: {projection}")
     src_srs = standardize_srs(projection)
     logger.debug(f"Input file's SRS: {src_srs}")
@@ -289,8 +309,14 @@ def main() -> None:
     )
     parser.add_argument("-i", "--input", required=True, help="Input file or folder containing DTED files")
     parser.add_argument("-o", "--output", required=True, help="Output file or folder for transformed DTED files")
-    parser.add_argument("-s", "--source_datum", required=True, help="Source vertical datum")
-    parser.add_argument("-t", "--target_datum", required=True, help="Target vertical datum")
+    parser.add_argument(
+        "-s", "--source_datum", required=True, type=datum_arg,
+        help="Source vertical datum (WGS84, EGM96, or EGM2008)",
+    )
+    parser.add_argument(
+        "-t", "--target_datum", required=True, type=datum_arg,
+        help="Target vertical datum (WGS84, EGM96, or EGM2008)",
+    )
     parser.add_argument(
         "-f", "--flatten", required=False, type=str2bool, nargs='?', const=True, default=True,
         help="Retain flat areas (default: True)",
@@ -319,30 +345,18 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    for item in list(DATUM_MAPPING.keys()):
-        if args.source_datum.upper() in item:
-            args.source_datum = item
-        if args.target_datum.upper() in item:
-            args.target_datum = item
+    try:
+        paths = resolve_io_paths(args.input, args.output)
+    except ValueError as e:
+        parser.error(str(e))
 
-    input_is_file = os.path.isfile(args.input)
-    output_is_file = (
-        any(args.output.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS)
-        and is_valid_filename(os.path.basename(args.output))
-    )
-    input_is_folder = os.path.isdir(args.input)
-    output_is_folder = os.path.isdir(args.output) or is_valid_filename(os.path.basename(args.output))
+    try:
+        prepare_output_target(paths)
+    except OSError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    log_path = None
-    if args.log_file:
-        if output_is_folder:
-            log_name = f"{os.path.basename(os.path.normpath(args.output))}_transform.log"
-            log_path = os.path.join(args.output, log_name)
-        elif output_is_file:
-            base, _ = os.path.splitext(args.output)
-            log_path = f"{base}_transform.log"
-
-    logger = setup_logger(log_path, args.log_file, False)
+    logger = setup_logger(paths.log_path if args.log_file else None, args.log_file, False)
 
     args_list = list(vars(args).items())
     for i, (arg, value) in enumerate(args_list):
@@ -367,58 +381,52 @@ def main() -> None:
         end_logger()
         sys.exit(1)
 
-    if input_is_file and output_is_file:
-        logger.info(f"Processing file: {args.output}")
-        process_file(
-            args.input, args.output, args.source_datum, args.target_datum,
+    exit_code = 0
+
+    if paths.mode == 'file':
+        logger.info(f"Processing file: {paths.output_path}")
+        if process_file(
+            paths.input_path, paths.output_path, args.source_datum, args.target_datum,
             args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
             args.abs_horiz_accuracy, args.log_file,
-        )
-    elif input_is_file and output_is_folder:
-        output_file = os.path.join(args.output, os.path.basename(args.input))
-        logger.info(f"Processing file: {output_file}")
-        process_file(
-            args.input, output_file, args.source_datum, args.target_datum,
-            args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
-            args.abs_horiz_accuracy, args.log_file,
-        )
-    elif input_is_folder and output_is_folder:
-        copy_folder_structure(args.input, args.output)
+        ) is False:
+            exit_code = 1
+    else:
+        copy_folder_structure(paths.input_path, paths.output_path)
         ignore_wrong_datum = False
         files_processed = False
         process_complete = True
 
-        for root, _, files in os.walk(args.input):
+        for root, _, files in os.walk(paths.input_path):
             for file in files:
-                if file.lower().endswith(SUPPORTED_EXTENSIONS):
-                    input_file = os.path.join(root, file)
-                    relative_path = os.path.relpath(input_file, args.input)
-                    output_file = os.path.join(args.output, relative_path)
-                    logger.info(f"Processing file: {output_file}")
-                    try:
-                        if not ignore_wrong_datum:
-                            result = process_file(
-                                input_file, output_file, args.source_datum, args.target_datum,
-                                args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
-                                args.abs_horiz_accuracy, args.log_file, not ignore_wrong_datum,
-                            )
-                            if result is True:
-                                ignore_wrong_datum = True
-                                files_processed = True
-                            elif result is False:
-                                files_processed = False
-                                process_complete = False
-                                break
-                        else:
-                            process_file(
-                                input_file, output_file, args.source_datum, args.target_datum,
-                                args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
-                                args.abs_horiz_accuracy, args.log_file,
-                                check_for_wrong_datum=False,
-                            )
-                            files_processed = True
-                    except Exception as e:
-                        logger.info(f"Error processing {input_file}: {str(e)}")
+                if not file.lower().endswith(SUPPORTED_EXTENSIONS):
+                    continue
+                input_file = os.path.join(root, file)
+                if not is_valid_dem(input_file):
+                    # Not a DEM (mask, ortho, TanDEM-X auxiliary). Skip it rather
+                    # than aborting the batch; the plain copy stays in the output.
+                    logger.info(f"Skipping {file} as it's not a DEM.")
+                    continue
+                relative_path = os.path.relpath(input_file, paths.input_path)
+                output_file = os.path.join(paths.output_path, relative_path)
+                logger.info(f"Processing file: {output_file}")
+                try:
+                    result = process_file(
+                        input_file, output_file, args.source_datum, args.target_datum,
+                        args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
+                        args.abs_horiz_accuracy, args.log_file,
+                        check_for_wrong_datum=not ignore_wrong_datum,
+                    )
+                except Exception as e:
+                    logger.error(f"Error processing {input_file}: {str(e)}")
+                    exit_code = 1
+                    continue
+                if result is False:
+                    exit_code = 1
+                    process_complete = False
+                    break
+                ignore_wrong_datum = True
+                files_processed = True
             if not process_complete:
                 break
 
@@ -448,10 +456,10 @@ def main() -> None:
                     logger.info(
                         "Output directory with copied files was retained, but files were not transformed."
                     )
-    else:
-        logger.error("Input and output must both be files or both be folders.")
-        end_logger()
-        sys.exit(1)
 
-    logger.info("Processing completed.")
+    if exit_code:
+        logger.error("Processing completed with errors.")
+    else:
+        logger.info("Processing completed.")
     end_logger(save_log=args.log_file)
+    sys.exit(exit_code)

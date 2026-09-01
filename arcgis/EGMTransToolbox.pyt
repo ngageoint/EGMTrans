@@ -183,17 +183,17 @@ class Tool:
         create_mask = parameters[8].value
         save_log = parameters[9].value
 
-        # Set up logging
-        log_path = None
-        if save_log:
-            if any(output_path.lower().endswith(ext) for ext in EGMTrans.SUPPORTED_EXTENSIONS):
-                base, _ = os.path.splitext(output_path)
-                log_path = f"{base}_transform.log"
-            else:
-                log_name = f"{os.path.basename(os.path.normpath(output_path))}_transform.log"
-                log_path = os.path.join(output_path, log_name)
-        
-        EGMTrans.setup_logger(log_path, save_log, is_arc_mode=True)
+        # Resolve input/output and derive the log path with the same helper the
+        # CLI uses, so the two entry points cannot disagree about file vs. folder.
+        try:
+            io_paths = EGMTrans.resolve_io_paths(input_path, output_path)
+            EGMTrans.prepare_output_target(io_paths)
+        except (ValueError, OSError) as e:
+            arcpy.AddError(str(e))
+            return
+        output_path = io_paths.output_path
+
+        EGMTrans.setup_logger(io_paths.log_path if save_log else None, save_log, is_arc_mode=True)
 
         algorithm_dict = {
             "Bilinear Interpolation": "bilinear",
@@ -230,22 +230,22 @@ class Tool:
             return
 
         try:
-            if os.path.isfile(input_path):
-                if os.path.isdir(output_path):
-                    output_path = os.path.join(output_path, os.path.basename(input_path))
-                EGMTrans.process_file(input_path, output_path, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)
-            elif os.path.isdir(input_path):
-                EGMTrans.copy_folder_structure(input_path, output_path)
-                for root, _, files in os.walk(input_path):
-                    for file in files:
-                        if file.lower().endswith(EGMTrans.SUPPORTED_EXTENSIONS):
-                            input_file = os.path.join(root, file)
-                            relative_path = os.path.relpath(input_file, input_path)
-                            output_file = os.path.join(output_path, relative_path)
-                            arcpy.AddMessage(f"Processing file: {output_file}")
-                            EGMTrans.process_file(input_file, output_file, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)
+            if io_paths.mode == 'file':
+                EGMTrans.process_file(io_paths.input_path, output_path, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)
             else:
-                arcpy.AddError("Input must be a file or a folder.")
+                EGMTrans.copy_folder_structure(io_paths.input_path, output_path)
+                for root, _, files in os.walk(io_paths.input_path):
+                    for file in files:
+                        if not file.lower().endswith(EGMTrans.SUPPORTED_EXTENSIONS):
+                            continue
+                        input_file = os.path.join(root, file)
+                        if not EGMTrans.is_valid_dem(input_file):
+                            arcpy.AddMessage(f"Skipping {file} as it's not a DEM.")
+                            continue
+                        relative_path = os.path.relpath(input_file, io_paths.input_path)
+                        output_file = os.path.join(output_path, relative_path)
+                        arcpy.AddMessage(f"Processing file: {output_file}")
+                        EGMTrans.process_file(input_file, output_file, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)
         except Exception as e:
             arcpy.AddError(f"An error occurred: {str(e)}")
 

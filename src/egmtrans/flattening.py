@@ -256,7 +256,7 @@ def create_flat_mask(labeled_array: np.ndarray, mask_file: str, template_ds: gda
         template_ds: GDAL dataset to copy geotransform and projection from.
 
     Raises:
-        RuntimeError: If the output file cannot be created.
+        RuntimeError: If GDAL cannot create the output file.
     """
     driver = gdal.GetDriverByName('GTiff')
     creation_options = ['COMPRESS=DEFLATE', 'PREDICTOR=2']
@@ -266,8 +266,6 @@ def create_flat_mask(labeled_array: np.ndarray, mask_file: str, template_ds: gda
         1, gdal.GDT_UInt32,
         options=creation_options,
     )
-    if mask_ds is None:
-        raise RuntimeError(f'Failed to create output file: {mask_file}')
 
     mask_ds.SetGeoTransform(template_ds.GetGeoTransform())
     mask_ds.SetProjection(template_ds.GetProjection())

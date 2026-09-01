@@ -1,6 +1,9 @@
 """Tests for egmtrans.file_utils."""
 
 import os
+import stat
+
+import pytest
 
 from egmtrans.file_utils import copy_folder_structure, is_valid_dem, is_valid_filename
 
@@ -65,3 +68,27 @@ class TestCopyFolderStructure:
         assert os.path.isfile(os.path.join(dst, "subdir", "nested.txt"))
         with open(os.path.join(dst, "file.txt")) as f:
             assert f.read() == "hello"
+
+
+class TestCopyFolderStructurePermissions:
+    """copy2 preserves mode bits, so a read-only source produced a read-only
+    copy that the transform then could not overwrite."""
+
+    @pytest.mark.skipif(
+        getattr(os, "geteuid", lambda: 1)() == 0,
+        reason="root bypasses the permission bits this test relies on",
+    )
+    def test_copies_of_read_only_files_are_writable(self, tmp_dir):
+        src_dir = os.path.join(tmp_dir, "in")
+        os.makedirs(src_dir)
+        src = os.path.join(src_dir, "locked.dt2")
+        with open(src, "wb") as f:
+            f.write(b"data")
+        os.chmod(src, 0o444)
+
+        out_dir = os.path.join(tmp_dir, "out")
+        copy_folder_structure(src_dir, out_dir)
+
+        copied = os.path.join(out_dir, "locked.dt2")
+        assert os.path.isfile(copied)
+        assert stat.S_IMODE(os.stat(copied).st_mode) & stat.S_IWUSR

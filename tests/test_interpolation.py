@@ -66,3 +66,43 @@ class TestSplineInterpolation:
         # Spline interpolation values should be in a reasonable range
         assert np.all(result > -5.0)
         assert np.all(result < 10.0)
+
+
+class TestBilinearEdgeHandling:
+    """At the source grid's edge, only the out-of-range axis may collapse.
+
+    The old code clamped both axes and returned the floor corner as soon as
+    *either* went out of range, silently degrading to nearest-neighbour along an
+    axis that was still perfectly interpolatable.
+    """
+
+    @pytest.fixture
+    def ramp(self):
+        """3x3 grid of z = x + y over x, y in {0, 1, 2}."""
+        from egmtrans.interpolation import _bilinear_interpolate_numba
+
+        grid = np.array([[0.0, 1.0, 2.0], [1.0, 2.0, 3.0], [2.0, 3.0, 4.0]], dtype=np.float32)
+
+        def sample(x, y):
+            out = _bilinear_interpolate_numba(
+                np.array([x], dtype=np.float64), np.array([y], dtype=np.float64),
+                grid, 0.0, 0.0, 1.0, 1.0, 3, 3,
+            )
+            return float(out[0])
+
+        return sample
+
+    def test_interior_point(self, ramp):
+        assert ramp(1.5, 1.5) == pytest.approx(3.0, abs=1e-5)
+
+    @pytest.mark.parametrize("x,y", [(2.0, 0.5), (0.5, 2.0), (1.75, 2.0), (2.0, 1.25), (0.0, 0.5)])
+    def test_edge_still_interpolates_the_in_range_axis(self, ramp, x, y):
+        # e.g. at (2.0, 0.5) the old code returned 2.0 instead of 2.5.
+        assert ramp(x, y) == pytest.approx(x + y, abs=1e-5)
+
+    def test_corner_is_the_corner_value(self, ramp):
+        assert ramp(2.0, 2.0) == pytest.approx(4.0, abs=1e-5)
+
+    def test_outside_the_grid_clamps_to_the_nearest_edge(self, ramp):
+        assert ramp(5.0, 5.0) == pytest.approx(4.0, abs=1e-5)
+        assert ramp(-3.0, -3.0) == pytest.approx(0.0, abs=1e-5)

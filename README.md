@@ -107,7 +107,7 @@ The root-level `EGMTrans.py` is a backward-compatibility shim that re-exports fr
 
 ```bash
 conda env create -f environment.yml
-conda activate egm_trans
+conda activate egmtrans
 pip install -e .
 python download_grids.py
 ```
@@ -198,7 +198,6 @@ EGMTrans/
 ├── tests/                   # Test suite
 ├── arcgis/                  # ArcGIS Pro toolbox
 │   ├── EGMTransToolbox.pyt
-│   ├── execution.py
 │   └── ...
 ├── crs/                     # PROJ data
 ├── datums/                  # Geoid grids (downloaded separately)
@@ -284,8 +283,14 @@ Arguments:
 - `-m`, `--create_mask`: Whether to create a flat mask file (optional, default: False)
 - `-p`, `--min_patch_size`: Minimum size in pixels for a flat area to be retained (optional; default: 16)
 - `-a`, `--algorithm`: Interpolation algorithm to use (optional; choices: 'bilinear', 'spline', 'delaunay', 'proj'; default: 'bilinear')
-- `-h`, `--abs_horiz_accuracy`: A default horizontal accuracy that will be added to the output DTED file only if it is missing from the input.
-- `-l`, `--log_file`: Whether to save the log messages to an external .log file in the output directory.
+- `--abs_horiz_accuracy`: A default horizontal accuracy that will be added to the output DTED file only if it is missing from the input. (Long form only — `-h` is `--help`.)
+- `-l`, `--log_file`: Whether to save the log messages to an external .log file (optional; default: True).
+
+The input and output must both be files or both be folders, except that a single input file may be
+written into an output folder, in which case it keeps its own filename. An output path ending in
+`.tif`, `.tiff`, `.dt0`, `.dt1`, or `.dt2` is treated as a file; anything else is treated as a folder.
+
+**Exit codes:** `0` success, `1` a transformation failed, `2` an argument or path error.
 
 ### Examples
 
@@ -403,7 +408,10 @@ The tool performs the following updates:
 - When batch processing, the tool preserves the input directory structure and auxiliary files in the output directory.
 - The minimum patch size parameter can be adjusted to control the granularity of flat area preservation.
 - Creating mask files can be useful for quality control and understanding the distribution of flat areas.
-- The script creates a detailed log file ending in `_transform.log` in the output directory.
+- The script creates a detailed log file ending in `_transform.log`: beside the output file when the
+  output is a single file (`out.dt2` → `out_transform.log`), or inside the output folder named after
+  it when the output is a folder (`results/` → `results/results_transform.log`). Pass `-l False` to
+  skip it.
 - Performance is significantly improved (by 20-50x) when Numba is available, especially for large datasets.
 
 ## Constraints

@@ -53,6 +53,26 @@ def apply_scale_factor(
     return scaled_file
 
 
+def restore_nodata(array: np.ndarray, nodata: float) -> np.ndarray:
+    """Replace NaN with *nodata* before writing to an integer band.
+
+    Upstream processing converts the input's nodata to NaN so that arithmetic
+    propagates voids correctly.  GDAL, however, maps NaN to 0 when writing a
+    float array into an integer band — which would turn DTED voids into sea
+    level.  Integer arrays are passed through untouched.
+
+    Args:
+        array: The transformed elevation array, possibly containing NaN.
+        nodata: The value voids should be written as (-32767 for DTED).
+
+    Returns:
+        An array with NaN replaced by *nodata*.
+    """
+    if not np.issubdtype(array.dtype, np.floating):
+        return array
+    return np.where(np.isnan(array), nodata, array)
+
+
 def write_array_to_geotiff(
     array: np.ndarray,
     output_file: str,

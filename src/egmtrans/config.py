@@ -8,11 +8,13 @@ configuration that must run before any geospatial operation.
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from typing import TypedDict
 
 SUPPORTED_EXTENSIONS = ('.tif', '.tiff', '.dt0', '.dt1', '.dt2')
 DTED_EXTENSIONS = ('.dt0', '.dt1', '.dt2')
+DTED_NODATA = -32767  # MIL-PRF-89020B void value; DTED bands are Int16
 INVALID_CHARACTERS = '<>:"/\\|?*'
 INVALID_FILENAMES = (
     'ortho',
@@ -51,6 +53,34 @@ DATUM_MAPPING: dict[str, DatumDetails] = {
         'dted_code': 'E08',
     },
 }
+
+DATUM_ALIASES = {
+    'WGS84': 'WGS84',
+    'WGS': 'WGS84',
+    'EGM96': 'EGM96',
+    'EGM08': 'EGM2008',
+    'EGM2008': 'EGM2008',
+}
+
+
+def normalize_datum(value: str) -> str:
+    """Resolve a user-supplied datum name to a :data:`DATUM_MAPPING` key.
+
+    Accepts the usual spellings — ``WGS 84``, ``wgs-84``, ``EGM-96``, ``egm08``
+    — but rejects anything that is not an exact alias.  The previous substring
+    match silently resolved ambiguous input (a bare ``EGM`` matched both EGM96
+    and EGM2008) and let a typo through to a ``KeyError`` deep in the transform.
+
+    Raises:
+        ValueError: If *value* is not a recognised datum.
+    """
+    key = re.sub(r'[\s_-]', '', str(value)).upper()
+    if key not in DATUM_ALIASES:
+        raise ValueError(
+            f"Invalid datum {value!r}. Choose one of: {', '.join(DATUM_MAPPING)}"
+        )
+    return DATUM_ALIASES[key]
+
 
 # Resolve project root: env-var override, or walk up from this file.
 # This file lives at src/egmtrans/config.py — three levels up is the project root.
@@ -146,6 +176,10 @@ def configure_gdal() -> None:
     gdal.SetConfigOption('GDAL_CACHEMAX', '512')
 
     warnings.filterwarnings("ignore", category=FutureWarning, module="osgeo.gdal")
+    # Enabled process-wide (and inherited by osr), so gdal.Open/Create raise on
+    # failure rather than returning None. That is why no caller in this package
+    # guards with `if ds is None` — such a check would be unreachable, and the
+    # GDAL exception message is more informative than anything we could raise.
     gdal.UseExceptions()
 
     os.environ["ARCPY_NO_AUX_XML"] = "TRUE"

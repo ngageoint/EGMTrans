@@ -59,14 +59,23 @@ def setup_logger(
         logger.addHandler(handler)
 
     if save_log and log_file:
-        _state.set_log_file_path(log_file)
-        log_dir = os.path.dirname(log_file)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, mode='w')
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        # Logging must never be able to damage the run. This block used to
+        # makedirs() unconditionally, which created a directory at the output
+        # file's path whenever the caller derived the log path incorrectly.
+        try:
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                if os.path.isfile(log_dir):
+                    raise NotADirectoryError(f'{log_dir} is a file, not a directory')
+                os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(log_file, mode='w')
+        except OSError as e:
+            logger.warning(f'Could not open log file {log_file}: {e}. Continuing without one.')
+        else:
+            _state.set_log_file_path(log_file)
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
     logging.getLogger('numba').setLevel(logging.WARNING)
     return logger

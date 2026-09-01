@@ -20,11 +20,15 @@ What this suite verifies for external reviewers:
    (EGM96 -> EGM2008 -> EGM96) preserves elevation values to within
    ``ROUND_TRIP_TOL_M``.
 
-The pinned values were captured from the output of
-``create_datum_array`` with the default bilinear algorithm on
-2026-04-15. If you intentionally change the interpolation code or the
-grid source files, re-capture them and update the PINNED_VALUES dict
-below.
+The pinned values are the output of ``create_datum_array`` with the
+default bilinear algorithm. Every control point sits exactly on a
+1-arc-minute geoid grid node, so each pinned value is also the raw grid
+value at that coordinate — ``test_exact_node_matches_grid`` asserts that
+independently, which is what makes these pins verifiable rather than
+merely historical. Re-captured 2026-08-31 after fixing a half-pixel
+registration offset (query points were built at cell corners while the
+geoid source points were at cell centres); the previous pins were off by
+0.3 cm to 7.0 cm, largest at high-gradient locations.
 """
 
 from __future__ import annotations
@@ -63,28 +67,28 @@ PLAUSIBLE_UNDULATION_BOUND_M = 120.0
 # (lat, lon). See _make_tiny_geotiff below.
 PINNED_VALUES: dict[tuple[float, float, str], dict[str, float]] = {
     (0.0, 10.0, "equatorial Atlantic, near Gulf of Guinea"): {
-        "EGM96": 9.0130,
-        "EGM2008": 9.4164,
+        "EGM96": 9.0000,
+        "EGM2008": 9.4000,
     },
     (38.7, -77.0, "mid-latitude continental, Washington DC"): {
-        "EGM96": -33.5600,
-        "EGM2008": -33.3799,
+        "EGM96": -33.5780,
+        "EGM2008": -33.3990,
     },
     (-33.9, 18.4, "southern mid-latitude, Cape Town"): {
-        "EGM96": 31.0550,
-        "EGM2008": 31.1159,
+        "EGM96": 31.0520,
+        "EGM2008": 31.1180,
     },
     (27.9, 86.9, "Himalayan high terrain, near Mt Everest"): {
-        "EGM96": -29.4689,
-        "EGM2008": -28.8427,
+        "EGM96": -29.5390,
+        "EGM2008": -28.8660,
     },
     (-6.0, 147.0, "tropical Pacific, near New Guinea geoid high"): {
-        "EGM96": 71.0824,
-        "EGM2008": 72.9239,
+        "EGM96": 71.1210,
+        "EGM2008": 73.0220,
     },
     (71.0, -42.0, "high-northern Arctic, central Greenland"): {
-        "EGM96": 41.8516,
-        "EGM2008": 41.3655,
+        "EGM96": 41.8630,
+        "EGM2008": 41.3730,
     },
 }
 
@@ -161,8 +165,8 @@ def test_undulation_finite_and_bounded(tmp_dir, lat, lon, label, datum):
 @pytest.mark.parametrize("datum", ["EGM96", "EGM2008"])
 def test_pinned_values(tmp_dir, lat, lon, label, datum):
     """``create_datum_array`` output matches the pinned reference value
-    within ``PINNED_TOL_M``. Pinned values were captured from the current
-    implementation on 2026-04-15 — see module docstring."""
+    within ``PINNED_TOL_M``. See the module docstring; the pins are cross-checked
+    against the raw grid by ``test_exact_node_matches_grid``."""
     tiny_tif = _make_tiny_geotiff(tmp_dir, lat, lon)
     undulation = create_datum_array(
         tiny_tif, datum, algorithm="bilinear", temp_dir=tmp_dir, output_dir=tmp_dir
@@ -173,6 +177,47 @@ def test_pinned_values(tmp_dir, lat, lon, label, datum):
     assert abs(actual - expected) < PINNED_TOL_M, (
         f"{datum} at {label}: expected {expected:.4f} m (pinned), "
         f"got {actual:.4f} m, drift {actual - expected:+.4f} m"
+    )
+
+
+@requires_grids
+@pytest.mark.parametrize("lat,lon,label", CONTROL_POINTS)
+@pytest.mark.parametrize("datum", ["EGM96", "EGM2008"])
+def test_exact_node_matches_grid(tmp_dir, lat, lon, label, datum):
+    """Interpolating at an exact grid node returns that node's value.
+
+    Every control point lies on a whole arc-minute in both axes, so it
+    coincides with a post of the 1-arc-minute geoid grid, and bilinear
+    interpolation there must reproduce the stored value exactly. This pins the
+    *registration* of the resampling rather than a historical output: a
+    half-pixel offset between the geoid source points (cell centres) and the
+    DEM query points shows up here immediately, whereas a pinned value only
+    records whatever the code did on the day it was captured.
+    """
+    from osgeo import gdal
+
+    with gdal.Open(_grid_path(datum)) as grid_ds:
+        gt = grid_ds.GetGeoTransform()
+        band = grid_ds.GetRasterBand(1)
+        scale = band.GetScale() or 1
+        col = (lon - gt[0]) / gt[1] - 0.5
+        row = (lat - gt[3]) / gt[5] - 0.5
+        assert abs(col - round(col)) < 1e-6 and abs(row - round(row)) < 1e-6, (
+            f"{label} is not on a grid node; this test assumes whole-arc-minute control points"
+        )
+        expected = float(band.ReadAsArray(int(round(col)), int(round(row)), 1, 1)[0][0]) * scale
+
+    tiny_tif = _make_tiny_geotiff(tmp_dir, lat, lon)
+    undulation = create_datum_array(
+        tiny_tif, datum, algorithm="bilinear", temp_dir=tmp_dir, output_dir=tmp_dir
+    )
+    actual = float(undulation[1, 1])
+
+    assert abs(actual - expected) < PINNED_TOL_M, (
+        f"{datum} at {label}: the query point coincides with a grid node holding "
+        f"{expected:.4f} m, but interpolation returned {actual:.4f} m "
+        f"(offset {actual - expected:+.4f} m) — the source and query grids are "
+        f"misregistered."
     )
 
 

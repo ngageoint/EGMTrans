@@ -8,6 +8,7 @@ geographic and projected systems, and EPSG identification.
 from __future__ import annotations
 
 import os
+import re
 
 from osgeo import osr
 
@@ -18,22 +19,40 @@ from egmtrans.config import DATUM_MAPPING
 def get_proj4(srs: osr.SpatialReference, grid: str | None = None) -> str:
     """Generate a PROJ.4 string for the given spatial reference system.
 
+    When *grid* is given, the ``+geoidgrids=`` value is rewritten to that
+    absolute path.  PROJ emits its own registered grid for a vertical CRS —
+    ``us_nga_egm96_15.tif`` for EPSG:5773, the 15-arc-minute model — which is
+    not the 1-arc-minute grid EGMTrans uses everywhere else, so the value is
+    replaced rather than matched on an assumed basename.  A plain
+    ``str.replace`` on the basename silently did nothing whenever the names
+    differed, leaving GDAL Warp to find some other grid or none at all.
+
     Args:
         srs: The input spatial reference system.
-        grid: Full path to the geoid grid file.  If provided, any
-            ``+geoidgrids=<basename>`` token in the PROJ string is replaced
-            with the full path so that GDAL can locate the grid.
+        grid: Full path to the geoid grid file EGMTrans intends to use.
 
     Returns:
         PROJ.4 string representation of the spatial reference system.
     """
+    logger = _state.get_logger()
     proj4 = srs.ExportToProj4()
-    if grid:
-        proj4 = proj4.replace(
-            f'+geoidgrids={os.path.basename(grid)}',
-            f'+geoidgrids={grid}',
+    if not grid:
+        return proj4
+
+    match = re.search(r'\+geoidgrids=(\S+)', proj4)
+    if not match:
+        logger.warning(
+            f"PROJ emitted no +geoidgrids token for this CRS, so {os.path.basename(grid)} "
+            f"cannot be applied and the vertical shift would be omitted: {proj4}"
         )
-    return proj4
+        return proj4
+
+    emitted = match.group(1)
+    if os.path.basename(emitted) != os.path.basename(grid):
+        logger.info(
+            f"PROJ selected geoid grid '{emitted}'; substituting {os.path.basename(grid)}."
+        )
+    return proj4[: match.start(1)] + grid + proj4[match.end(1) :]
 
 
 def get_horizontal_srs(srs: osr.SpatialReference) -> osr.SpatialReference:

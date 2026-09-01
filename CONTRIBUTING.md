@@ -11,7 +11,7 @@ to install via pip on Windows; conda is the path of least resistance.
 
 ```bash
 conda env create -f environment.yml
-conda activate egm_trans
+conda activate egmtrans
 pip install -e ".[dev]"
 python download_grids.py
 ```

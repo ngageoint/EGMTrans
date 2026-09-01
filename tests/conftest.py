@@ -14,6 +14,27 @@ if _src not in sys.path:
     sys.path.insert(0, _src)
 
 
+@pytest.fixture(autouse=True)
+def _reset_logging():
+    """Detach handlers between tests.
+
+    The ``egmtrans`` logger and ``_state``'s log-file path are process-global, so
+    a FileHandler opened by one test otherwise survives into the next — pointing
+    at a tmp_dir that has already been removed.
+    """
+    import logging
+
+    from egmtrans import _state
+
+    yield
+    logger = logging.getLogger("egmtrans")
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
+    logger.addHandler(logging.NullHandler())
+    _state.set_log_file_path(None)
+
+
 @pytest.fixture
 def tmp_dir():
     """Provide a temporary directory that is cleaned up after each test."""

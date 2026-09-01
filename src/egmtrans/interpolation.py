@@ -103,17 +103,21 @@ def _bilinear_interpolate_numba(x_vals, y_vals, grid, x_min, y_min, x_step, y_st
         x1 = x0 + 1
         y1 = y0 + 1
 
+        wx = x_idx - x0
+        wy = y_idx - y0
+
         if x0 < 0 or x1 >= nx or y0 < 0 or y1 >= ny:
+            # Clamp each axis independently and zero only that axis's weight.
+            # Collapsing both axes here would discard interpolation along an
+            # axis that is still perfectly in range.
             x0 = max(0, min(nx - 1, x0))
             x1 = max(0, min(nx - 1, x1))
             y0 = max(0, min(ny - 1, y0))
             y1 = max(0, min(ny - 1, y1))
-            if x0 == x1 or y0 == y1:
-                result[i] = grid[y0, x0]
-                continue
-
-        wx = x_idx - x0
-        wy = y_idx - y0
+            if x0 == x1:
+                wx = 0.0
+            if y0 == y1:
+                wy = 0.0
 
         v00 = grid[y0, x0]
         v01 = grid[y1, x0]

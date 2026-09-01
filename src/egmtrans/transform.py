@@ -17,8 +17,9 @@ from osgeo import gdal, osr
 
 from egmtrans import _state
 from egmtrans.arcpy_compat import batch_project_points_arcpy
-from egmtrans.config import BASE_PATH, DATUM_MAPPING, DTED_EXTENSIONS
+from egmtrans.config import BASE_PATH, DATUM_MAPPING, DTED_EXTENSIONS, DTED_NODATA
 from egmtrans.crs import create_compound_srs, get_proj4
+from egmtrans.file_utils import copy_as_writable
 from egmtrans.flattening import (
     create_flat_mask,
     create_labeled_array_flt,
@@ -27,7 +28,7 @@ from egmtrans.flattening import (
     process_patches_arcpy,
 )
 from egmtrans.interpolation import bilinear_interpolation, delaunay_triangulation, spline_interpolation
-from egmtrans.io import apply_scale_factor, update_dted_header
+from egmtrans.io import apply_scale_factor, restore_nodata, update_dted_header
 
 
 def create_gdal_warp_array(
@@ -84,22 +85,21 @@ def create_gdal_warp_array(
             dstSRS=tgt_proj,
             resampleAlg=gdal.GRA_NearestNeighbour,
             multithread=True,
-            dstNodata=-32767 if data_type == gdal.GDT_Int16 else np.nan,
+            dstNodata=DTED_NODATA if data_type == gdal.GDT_Int16 else np.nan,
             transformerOptions=['VERIFY_GRID=TRUE', 'GRID_CHECK_WITH_PROJ4=TRUE'],
         )
         warp_file = os.path.join(temp_dir, f'{base_name}_warp.tif')
-        result = gdal.Warp(warp_file, input_file, options=warp_options)
-        if result is None:
-            raise RuntimeError("GDAL's Warp function returned None.")
+        warp_result = gdal.Warp(warp_file, input_file, options=warp_options)
+        # Flush and close before reopening from disk below, or the reopen races
+        # an unflushed write.
+        warp_result.Close()
         logger.info("Transformed vertical datum with GDAL's Warp function.")
     except Exception as e:
         logger.error(f"Unexpected error during GDAL's Warp function: {str(e)}")
         raise
 
-    warp_ds = gdal.Open(warp_file, gdal.GA_ReadOnly)
-    warp_array = warp_ds.GetRasterBand(1).ReadAsArray()
-    warp_ds = None
-    return warp_array
+    with gdal.Open(warp_file, gdal.GA_ReadOnly) as warp_ds:
+        return warp_ds.GetRasterBand(1).ReadAsArray()
 
 
 def create_interp_array(
@@ -197,12 +197,12 @@ def create_datum_array(
     arc_mode = _state.get_arc_mode()
 
     try:
-        input_ds = gdal.Open(input_file)
-        input_gt = input_ds.GetGeoTransform()
-        input_proj = input_ds.GetProjection()
+        with gdal.Open(input_file, gdal.GA_ReadOnly) as input_ds:
+            input_gt = input_ds.GetGeoTransform()
+            input_proj = input_ds.GetProjection()
+            input_cols = input_ds.RasterXSize
+            input_rows = input_ds.RasterYSize
         input_srs = osr.SpatialReference()
-        input_cols = input_ds.RasterXSize
-        input_rows = input_ds.RasterYSize
         input_col_width = input_gt[1]
         input_row_height = input_gt[5]
         datum_grid_filename = DATUM_MAPPING[datum]['grid']
@@ -245,9 +245,9 @@ def create_datum_array(
                 input_gt[0] + input_col_width * input_cols,
                 input_gt[3],
             )
-            datum_ds = gdal.Open(datum_file)
-            datum_gt = datum_ds.GetGeoTransform()
-            datum_proj = datum_ds.GetProjection()
+            with gdal.Open(datum_file, gdal.GA_ReadOnly) as datum_ds:
+                datum_gt = datum_ds.GetGeoTransform()
+                datum_proj = datum_ds.GetProjection()
             datum_srs = osr.SpatialReference(wkt=datum_proj)
             datum_col_width = datum_gt[1]
             datum_row_height = abs(datum_gt[5])
@@ -263,11 +263,13 @@ def create_datum_array(
                 min_lon, min_lat = input_extent[0], input_extent[1]
                 max_lon, max_lat = input_extent[2], input_extent[3]
 
+        # Symmetric: bilinear needs one source cell beyond every query point, and
+        # the query points are now centre-registered, so no side is a special case.
         buffered_extent = (
-            min_lon - 1.0 * datum_col_width,
+            min_lon - 1.5 * datum_col_width,
             min_lat - 1.5 * datum_row_height,
             max_lon + 1.5 * datum_col_width,
-            max_lat + 1.0 * datum_row_height,
+            max_lat + 1.5 * datum_row_height,
         )
 
         projwin = (
@@ -327,8 +329,10 @@ def create_datum_array(
         if len(points['x']) < 4:
             raise ValueError(f"Not enough valid points for interpolation: {len(points['x'])} points found")
 
-        x = input_extent[0] + np.arange(input_cols) * input_col_width
-        y = input_extent[3] + np.arange(input_rows) * input_row_height
+        # Cell centres, matching the geoid source points built above. Using the
+        # extent corner offset every sample by half a DEM pixel.
+        x = input_extent[0] + (np.arange(input_cols) + 0.5) * input_col_width
+        y = input_extent[3] + (np.arange(input_rows) + 0.5) * input_row_height
         xx, yy = np.meshgrid(x, y)
 
         if len(points['x']) < 4:
@@ -394,12 +398,14 @@ def transform_vertical_datum(
     logger = _state.get_logger()
     arc_mode = _state.get_arc_mode()
     base_name = os.path.splitext(os.path.basename(input_file))[0]
-    result = None
+    input_ds = None
+    input_band = None
+    temp_dir = None
 
     start_time = time.time()
 
     try:
-        input_ds = gdal.Open(input_file)
+        input_ds = gdal.Open(input_file, gdal.GA_ReadOnly)
         data_type = input_ds.GetRasterBand(1).DataType
         if data_type not in (gdal.GDT_Int16, gdal.GDT_Int32, gdal.GDT_Float32, gdal.GDT_Float64):
             raise ValueError(f'Unsupported data type: {data_type}')
@@ -413,7 +419,7 @@ def transform_vertical_datum(
         nodata_value = input_band.GetNoDataValue()
         metadata = input_ds.GetMetadata()
 
-        output_dir = os.path.dirname(output_file)
+        output_dir = os.path.dirname(os.path.abspath(output_file))
         temp_dir = os.path.join(output_dir, f'temp_{token_hex(8)}')
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
@@ -423,8 +429,8 @@ def transform_vertical_datum(
         if src_srs is None:
             raise ValueError('Could not retrieve spatial reference from the input file')
 
-        result = src_srs.AutoIdentifyEPSG()
-        if result == 0:
+        epsg_result = src_srs.AutoIdentifyEPSG()
+        if epsg_result == 0:
             logger.info("Successfully identified EPSG code from input CRS.")
         else:
             logger.warning(
@@ -441,6 +447,17 @@ def transform_vertical_datum(
             if scale != 1 or offset != 0:
                 scaled_file = os.path.join(temp_dir, f'{base_name}_scaled.tif')
                 input_file = apply_scale_factor(input_file, scaled_file, scale, offset, nodata_value)
+                # Re-read: input_array still holds the raw, unscaled values, and the
+                # interpolation algorithms work from the array rather than the file.
+                with gdal.Open(input_file) as scaled_ds:
+                    scaled_band = scaled_ds.GetRasterBand(1)
+                    scaled_nodata = scaled_band.GetNoDataValue()
+                    input_array = scaled_band.ReadAsArray()
+                    scaled_band = None
+                if scaled_nodata is None:
+                    scaled_nodata = nodata_value
+                if scaled_nodata is not None:
+                    input_array = np.where(input_array == scaled_nodata, np.nan, input_array)
                 logger.info(f'Preprocessed the input DEM with scale factor {scale} and offset {offset}.')
             else:
                 logger.info('No scale factor or offset applied; using original elevation values.')
@@ -494,17 +511,18 @@ def transform_vertical_datum(
 
         if output_file.lower().endswith(DTED_EXTENSIONS):
             logger.info(f'Updating vertical datum to {tgt_datum}...')
-            shutil.copy(input_file, output_file)
+            # copy_as_writable, not shutil.copy: the latter carries the source's
+            # read-only bit onto the copy and silently redirects into a directory.
+            copy_as_writable(input_file, output_file)
 
-            final_ds = gdal.Open(output_file, gdal.GA_Update)
-            if final_ds is None:
-                raise RuntimeError(f"Failed to open final output file for writing: {output_file}")
-            band = final_ds.GetRasterBand(1)
-            band.WriteArray(warp_array)
-            band.FlushCache()
-            band = None
-            final_ds = None
-            input_ds = None
+            # DTED bands are Int16 and GDAL writes NaN as 0, so voids must be
+            # restored to -32767 or they come out of the transform at sea level.
+            dted_nodata = input_nodata if input_nodata is not None else DTED_NODATA
+            with gdal.Open(output_file, gdal.GA_Update) as final_ds:
+                band = final_ds.GetRasterBand(1)
+                band.WriteArray(restore_nodata(warp_array, dted_nodata))
+                band.FlushCache()
+                band = None
 
             update_dted_header(output_file, tgt_datum, abs_horiz_accuracy)
         else:
@@ -512,22 +530,6 @@ def transform_vertical_datum(
             warp_array = np.round(warp_array, 2)
 
             metadata['AREA_OR_POINT'] = 'Point'
-
-            driver = gdal.GetDriverByName('GTiff')
-            warp_file = os.path.join(temp_dir, f'{base_name}_warp.tif')
-            warp_ds = driver.CreateCopy(warp_file, input_ds, 0)
-
-            warp_ds = gdal.Open(warp_file, gdal.GA_Update)
-            warp_ds.SetMetadata(metadata)
-            warp_ds.SetGeoTransform(gt)
-            warp_ds.SetProjection(tgt_srs.ExportToWkt(['FORMAT=WKT2_2019']))
-
-            warp_band = warp_ds.GetRasterBand(1)
-            warp_band.WriteArray(warp_array)
-            warp_band.SetNoDataValue(np.nan)
-            warp_band.FlushCache()
-            warp_band = None
-            warp_ds = None
 
             final_temp_file = os.path.join(temp_dir, f'{base_name}_final_temp.tif')
             driver = gdal.GetDriverByName('GTiff')
@@ -554,9 +556,8 @@ def transform_vertical_datum(
                     'NUM_THREADS=ALL_CPUS',
                 ],
             )
-            result = gdal.Translate(output_file, final_temp_file, options=translate_options)
-            if result is None:
-                raise RuntimeError("GDAL's Translate function for COG creation returned None")
+            cog_ds = gdal.Translate(output_file, final_temp_file, options=translate_options)
+            cog_ds.Close()
 
         elapsed_time = time.time() - start_time
         if elapsed_time < 60:
@@ -566,18 +567,22 @@ def transform_vertical_datum(
             time_str = f"{minutes:.1f} minutes"
         logger.info(f'Total processing time: {time_str}')
 
-        if 'result' in locals() and result is not None:
-            result = None
-
         aux_file = output_file + '.aux.xml'
         if os.path.exists(aux_file):
             os.remove(aux_file)
-
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
 
         logger.info(f'Transformed file: {output_file}')
         logger.info(f'\n{"=" * 80}\n')
     except Exception as e:
         logger.error(f'An error occurred: {str(e)}')
         raise
+    finally:
+        # input_band holds a reference to input_ds, so both must go for the
+        # dataset to actually close. Clean the scratch directory here too, or a
+        # failed run leaves temp_<hex>/ behind in the user's output folder.
+        input_band = None
+        input_ds = None
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if os.path.exists(temp_dir):
+                logger.warning(f'Could not remove temporary directory: {temp_dir}')

@@ -5,7 +5,12 @@ import os
 import numpy as np
 from osgeo import gdal, osr
 
-from egmtrans.io import apply_scale_factor, write_array_to_geotiff, write_points_to_geojson
+from egmtrans.io import (
+    apply_scale_factor,
+    restore_nodata,
+    write_array_to_geotiff,
+    write_points_to_geojson,
+)
 
 
 class TestWriteArrayToGeotiff:
@@ -71,3 +76,40 @@ class TestWritePointsToGeojson:
             data = json.load(f)
         assert data["type"] == "FeatureCollection"
         assert len(data["features"]) == 3
+
+
+class TestRestoreNodata:
+    """GDAL writes NaN as 0 into an integer band, which turned DTED voids
+    (-32767) into sea level. restore_nodata puts the void value back first."""
+
+    def test_replaces_nan_with_nodata(self):
+        arr = np.array([[1.5, np.nan], [np.nan, -3.25]])
+        out = restore_nodata(arr, -32767)
+        assert out[0, 1] == -32767
+        assert out[1, 0] == -32767
+
+    def test_preserves_finite_values(self):
+        arr = np.array([[1.5, np.nan], [0.0, -3.25]])
+        out = restore_nodata(arr, -32767)
+        assert out[0, 0] == 1.5
+        assert out[1, 0] == 0.0
+        assert out[1, 1] == -3.25
+
+    def test_integer_array_passes_through_untouched(self):
+        arr = np.array([[1, -32767], [3, 4]], dtype=np.int16)
+        out = restore_nodata(arr, -32767)
+        assert out is arr
+
+    def test_survives_the_round_trip_through_an_int16_band(self, tmp_dir):
+        """The end-to-end proof: without restore_nodata the void reads back as 0."""
+        path = os.path.join(tmp_dir, "voids.tif")
+        driver = gdal.GetDriverByName("GTiff")
+        ds = driver.Create(path, 3, 1, 1, gdal.GDT_Int16)
+        arr = np.array([[10.4, np.nan, -5.6]])
+        ds.GetRasterBand(1).WriteArray(restore_nodata(arr, -32767))
+        ds.FlushCache()
+        stored = ds.GetRasterBand(1).ReadAsArray()
+        ds = None
+
+        assert stored[0, 1] == -32767, "void was flattened to sea level"
+        assert stored[0, 0] == 10 and stored[0, 2] == -6, "GDAL rounds float to int"
