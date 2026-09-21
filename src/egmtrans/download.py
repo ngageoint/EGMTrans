@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import urllib.request
+from collections.abc import Iterable
 
 RELEASE_TAG = "datum-grids-v1"
 RELEASE_URL = (
@@ -129,28 +130,40 @@ def download_file(
 def ensure_grids(
     datums_dir: str | None = None,
     message_func: object = print,
+    filenames: Iterable[str] | None = None,
 ) -> list[str]:
-    """Ensure all geoid grid files are present, downloading any that are missing.
+    """Ensure geoid grid files are present, downloading any that are missing.
 
     Args:
         datums_dir: Path to the ``datums/`` directory.  Defaults to the
             standard location relative to the project root.
         message_func: Callable used for progress messages.  Pass
             ``arcpy.AddMessage`` when running inside ArcGIS Pro.
+        filenames: The grid files to ensure; every file in ``GRID_FILES`` by
+            default.  The CLI passes only the grids its datums need.
 
     Returns:
         List of filenames that were downloaded (empty if all were already
         present).
+
+    Raises:
+        ValueError: If *filenames* names a file not in ``GRID_FILES``.
     """
     if datums_dir is None:
         datums_dir = _default_datums_dir()
+    wanted = list(GRID_FILES) if filenames is None else list(filenames)
+    unknown = [f for f in wanted if f not in GRID_FILES]
+    if unknown:
+        raise ValueError(f"Unknown grid file(s): {', '.join(unknown)}")
+    if not wanted:
+        return []
     os.makedirs(datums_dir, exist_ok=True)
 
     # Determine which files need downloading.
     missing = []
-    for filename, info in GRID_FILES.items():
+    for filename in wanted:
         path = os.path.join(datums_dir, filename)
-        if not verify_checksum(path, info["sha256"]):
+        if not verify_checksum(path, GRID_FILES[filename]["sha256"]):
             missing.append(filename)
 
     if not missing:

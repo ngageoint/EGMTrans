@@ -18,9 +18,19 @@ occurs at any point during normal operation.
   `datums/`
 - No other hosts are contacted.
 
+The command line checks, and downloads if missing, only the grids its source
+and target datums need (`us_nga_egm96_1.tif`, `us_nga_egm08_1.tif`, or both).
+`download_grids.py` and the ArcGIS Pro toolbox fetch the full set, including the
+grids used only by the EGMTrans Explorer maps.
+
 Air-gapped deployments: download the grids manually from the release page
 above and place them in `datums/`. The tool will detect them on startup and
 skip the network call entirely.
+
+Containers: the `Dockerfile` downloads the two 1-arc-minute grids while the
+image is built, verifying each against its pinned hash, so a running container
+makes no network connection at all and can be started with `--network none`.
+The image runs as a non-root user.
 
 ## Grid integrity
 

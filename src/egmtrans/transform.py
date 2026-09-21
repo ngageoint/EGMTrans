@@ -19,7 +19,7 @@ from egmtrans import _state
 from egmtrans.arcpy_compat import batch_project_points_arcpy
 from egmtrans.config import BASE_PATH, DATUM_MAPPING, DTED_EXTENSIONS, DTED_NODATA
 from egmtrans.crs import create_compound_srs, get_proj4
-from egmtrans.file_utils import copy_as_writable
+from egmtrans.file_utils import ELEVATION_DATA_TYPES, copy_as_writable
 from egmtrans.flattening import (
     create_flat_mask,
     create_labeled_array_flt,
@@ -407,7 +407,7 @@ def transform_vertical_datum(
     try:
         input_ds = gdal.Open(input_file, gdal.GA_ReadOnly)
         data_type = input_ds.GetRasterBand(1).DataType
-        if data_type not in (gdal.GDT_Int16, gdal.GDT_Int32, gdal.GDT_Float32, gdal.GDT_Float64):
+        if data_type not in ELEVATION_DATA_TYPES:
             raise ValueError(f'Unsupported data type: {data_type}')
         input_band = input_ds.GetRasterBand(1)
         input_nodata = input_band.GetNoDataValue()
@@ -499,6 +499,11 @@ def transform_vertical_datum(
                     warp_array = process_patches_arcpy(warp_array, labeled_array)
                 else:
                     warp_array = process_patches(warp_array, labeled_array)
+                # Voids in, voids out. The labelling already skips NaN, but only
+                # while Numba compiles without the 'nnan' fastmath flag; restating
+                # it here keeps a regression from writing voids as sea level again.
+                if np.issubdtype(warp_array.dtype, np.floating):
+                    warp_array[np.isnan(input_array)] = np.nan
                 logger.info('Flattened ocean and preserved other flat areas.')
 
                 if create_mask:
@@ -539,11 +544,17 @@ def transform_vertical_datum(
             final_ds.SetGeoTransform(gt)
             final_ds.SetProjection(tgt_srs.ExportToWkt(['FORMAT=WKT2_2019']))
             final_band = final_ds.GetRasterBand(1)
-            final_band.WriteArray(warp_array)
+            # NoData first. A new GeoTIFF skips blocks that equal the NoData value
+            # current at write time (0 when none is set) and fills them with the
+            # NoData value on close, so writing first turned every all-ocean row
+            # of 0 m into NaN once NoData became NaN.
             final_band.SetNoDataValue(np.nan)
+            final_band.WriteArray(warp_array)
             final_ds.SetMetadata(metadata)
-            final_band.FlushCache()
-            final_ds = None
+            # A live band reference keeps the dataset open; close it before
+            # gdal.Translate reads the file.
+            final_band = None
+            final_ds.Close()
 
             translate_options = gdal.TranslateOptions(
                 format='COG',

@@ -1,0 +1,20 @@
+.git
+.github
+.vscode
+.pytest_cache
+.ruff_cache
+**/__pycache__
+.pyHistory
+*.log
+
+# Downloaded and SHA-256 checked during the build instead.
+datums
+
+# Desktop-only: ArcGIS Pro toolbox and the Explorer maps.
+arcgis
+EGMTrans_Explorer.*
+img
+
+tests
+docker
+samples/INEGI_*

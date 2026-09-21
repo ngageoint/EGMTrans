@@ -63,3 +63,12 @@ def test_invalid_characters_present():
 def test_invalid_filenames_is_tuple():
     assert isinstance(INVALID_FILENAMES, tuple)
     assert 'ortho' in INVALID_FILENAMES
+
+
+def test_required_grids():
+    from egmtrans.config import required_grids
+
+    assert required_grids('EGM2008', 'EGM96') == ['us_nga_egm08_1.tif', 'us_nga_egm96_1.tif']
+    assert required_grids('WGS84', 'EGM2008') == ['us_nga_egm08_1.tif']
+    assert required_grids('EGM96', 'EGM96') == ['us_nga_egm96_1.tif']
+    assert required_grids('WGS84', 'WGS84') == []

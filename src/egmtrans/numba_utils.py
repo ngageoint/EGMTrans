@@ -37,6 +37,12 @@ except ImportError:
 PARALLEL_ENABLED = True
 NUMBA_CACHE = True
 
+# Every fastmath flag except 'nnan' and 'ninf'. Those two let LLVM assume no
+# NaN or infinity exists, which deletes the np.isnan() tests that keep voids out
+# of the ocean and flat-patch masks: under fastmath=True every void was labeled
+# ocean and written as 0 m.
+FASTMATH_FLAGS = frozenset({'nsz', 'arcp', 'contract', 'afn', 'reassoc'})
+
 try:
     from numba import njit, prange
     NUMBA_AVAILABLE = True
@@ -48,11 +54,13 @@ try:
             parallel: Whether to enable parallel execution.
             arc_safe: If True, never uses parallel mode (prevents ArcGIS Pro crashes).
         """
+        # Numba accepts a set but not a frozenset, and keeps a reference to it.
+        fastmath = set(FASTMATH_FLAGS)
         if arc_safe and _state.get_arc_mode():
-            return njit(fastmath=True, cache=NUMBA_CACHE)
+            return njit(fastmath=fastmath, cache=NUMBA_CACHE)
         if parallel and PARALLEL_ENABLED:
-            return njit(parallel=True, fastmath=True, cache=NUMBA_CACHE)
-        return njit(fastmath=True, cache=NUMBA_CACHE)
+            return njit(parallel=True, fastmath=fastmath, cache=NUMBA_CACHE)
+        return njit(fastmath=fastmath, cache=NUMBA_CACHE)
 
 except ImportError:
     NUMBA_AVAILABLE = False

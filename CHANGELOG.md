@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Whole rows of ocean in GeoTIFF outputs were written as voids.** The output was assembled in a new GeoTIFF whose NoData value (NaN) was set only after the heights were written. A new GeoTIFF skips any block equal to the NoData value current at write time (0 when none is set) and fills skipped blocks with the NoData value when it closes, so every row that was entirely 0 m (open sea) came out as NaN. The sample Copernicus tile over Mindanao lost its southern 969 rows this way. NoData is now set before the heights are written, and the dataset is closed (not just dereferenced) before it is converted to the COG. DTED outputs were not affected. **GeoTIFF outputs of coastal tiles produced by earlier versions should be regenerated.** The new benchmark script found this by checking that ocean stays at 0 m.
+- **Voids in GeoTIFF inputs were written as 0 m when flattening was on (the default).** The Numba kernels were compiled with `fastmath=True`, which includes the `nnan` flag: LLVM may then assume no value is NaN and delete the `np.isnan()` tests, so every void was labeled ocean and set to 0. The kernels now use every fastmath flag except `nnan` and `ninf` (`numba_utils.FASTMATH_FLAGS`), and `transform_vertical_datum` restores input voids after flattening as a second line of defense. DTED inputs were not affected. **GeoTIFF outputs with voids produced by earlier versions should be regenerated.**
+- **TanDEM-X and DGED auxiliary layers were not skipped in batch mode.** `is_valid_dem` lower-cased the filename but compared it with upper-case codes (`HEM`, `WBM`, `EDM`, ...), so the check never matched. A Height Error Map was transformed as if it were a DEM, and a Byte Water Body Mask aborted the whole batch as an unsupported data type. The codes now match case-insensitively as whole filename tokens (so `Edmonton_DEM.tif` is still a DEM), the Copernicus Filling Mask (`FLM`) is recognized, and any GeoTIFF whose band cannot hold heights (Byte, UInt16) is skipped. The old test passed only because its file did not exist.
+- A confirmation prompt with no terminal to answer it (a container, a scheduler) crashed with `EOFError`. It now stops with exit code 2 and says to re-run with `--yes`.
+
+### Added
+
+- `-y` / `--yes`: proceed without asking when the input header's vertical datum disagrees with `-s`, or when `-s` equals `-t` for a GeoTIFF. It never answers the prompt to delete an output folder.
+- `Dockerfile`, `.dockerignore` and `docker/smoke_test.sh`: an image with the two 1-arc-minute grids (SHA-256 verified at build time) and precompiled Numba kernels that runs with `--network none` as a non-root user. See "Run in a Container" in the README.
+- `benchmarks/benchmark_tiles.py`: times real tiles cold, warm, single-threaded, without Numba and through the full CLI, checks every output (voids, ocean, DTED header), optionally cross-checks the bilinear transform against PROJ, and extrapolates to a global run in core-hours.
+- `config.required_grids()`, and a `filenames` argument to `download.ensure_grids()`.
+
+### Changed
+
+- The command line checks and downloads only the grids its source and target datums need. It used to fetch all five, including the three used only by the Explorer maps, so an installation with just the two transform grids reached for the network on every run. `download_grids.py` and the ArcGIS Pro toolbox still fetch the full set.
+- The command line resolves the grid folder through `EGMTRANS_BASE_PATH` when that is set, like the rest of the package.
+
 ## [1.4.0] - 2026-08-31
 
 ### Fixed

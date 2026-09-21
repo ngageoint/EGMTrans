@@ -36,12 +36,36 @@ class TestCreateLabeledArrayFlt:
     def test_nan_not_labeled_as_flat_patch(self):
         arr = np.array([[np.nan, 1.0], [1.0, 1.0]], dtype=np.float32)
         result = create_labeled_array_flt(arr, min_patch_size=1)
-        # NaN pixels should never be labeled as a flat land patch (label > 1)
-        assert result[0, 0] <= 1
+        # A void is neither ocean (1) nor a flat patch (>1). This used to assert
+        # <= 1, which passed while fastmath=True labeled every void as ocean.
+        assert result[0, 0] == 0
         # The three valid 1.0 pixels should be detected as a flat region
         assert result[0, 1] > 1
         assert result[1, 0] > 1
         assert result[1, 1] > 1
+
+    def test_voids_never_labeled_ocean(self):
+        # Voids next to ocean and inside a flat patch: none may join either mask.
+        arr = np.array(
+            [
+                [np.nan, 0.0, 0.0, 5.0],
+                [0.0, np.nan, 5.0, 5.0],
+                [7.0, 7.0, 7.0, np.nan],
+                [7.0, np.nan, 7.0, 7.0],
+            ],
+            dtype=np.float32,
+        )
+        result = create_labeled_array_flt(arr, min_patch_size=1)
+        assert np.all(result[np.isnan(arr)] == 0)
+        assert result[0, 1] == 1 and result[1, 0] == 1
+
+
+class TestFastmathFlags:
+    def test_nan_assumptions_excluded(self):
+        from egmtrans.numba_utils import FASTMATH_FLAGS
+
+        # 'nnan'/'ninf' let LLVM delete np.isnan() tests; 'fast' implies both.
+        assert not {'nnan', 'ninf', 'fast'} & set(FASTMATH_FLAGS)
 
 
 class TestProcessPatches:

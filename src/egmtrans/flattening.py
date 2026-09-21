@@ -71,9 +71,12 @@ def create_labeled_array_flt(input_array: np.ndarray, min_patch_size: int = 16) 
     discarded.
 
     Label semantics:
-    - ``0`` — uneven terrain (not masked)
+    - ``0`` — uneven terrain, or a void (NaN), which is never masked
     - ``1`` — ocean (elevation ≈ 0)
     - ``>1`` — distinct flat-area patches
+
+    The void test depends on Numba compiling without the ``nnan`` fastmath flag;
+    see :data:`egmtrans.numba_utils.FASTMATH_FLAGS`.
 
     Args:
         input_array: 2-D float elevation array (NaN = nodata).
@@ -273,5 +276,6 @@ def create_flat_mask(labeled_array: np.ndarray, mask_file: str, template_ds: gda
     mask_band = mask_ds.GetRasterBand(1)
     mask_band.WriteArray(labeled_array)
     mask_band.SetNoDataValue(0)
-    mask_band.FlushCache()
-    mask_ds = None
+    # A live band reference would keep the dataset, and the file, from closing.
+    mask_band = None
+    mask_ds.Close()

@@ -25,12 +25,15 @@ from egmtrans.arcpy_compat import init_arcpy
 from egmtrans.config import (
     DTED_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    get_datums_dir,
     normalize_datum,
+    required_grids,
     verify_grids,
 )
 from egmtrans.crs import standardize_srs
 from egmtrans.download import ensure_grids
 from egmtrans.file_utils import (
+    IOPaths,
     copy_folder_structure,
     is_valid_dem,
     prepare_output_target,
@@ -88,6 +91,28 @@ def datum_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(str(e)) from e
 
 
+class NonInteractiveError(RuntimeError):
+    """A confirmation prompt was needed but there is no one to answer it."""
+
+
+def confirm(question: str, assume_yes: bool = False) -> bool:
+    """Ask a yes/no question on the terminal, or answer it without asking.
+
+    Returns True at once when *assume_yes* is set.  A closed stdin (a container,
+    a scheduler, ``pythonw``) raises :class:`NonInteractiveError` instead of
+    crashing in ``input()``; piped answers such as ``echo yes |`` still work.
+    """
+    if assume_yes:
+        return True
+    if sys.stdin is None:
+        raise NonInteractiveError(question)
+    try:
+        answer = input(f"{question} (yes/no): ").strip()
+    except EOFError as e:
+        raise NonInteractiveError(question) from e
+    return str2bool(answer)
+
+
 def delete_output_directory(output_dir: str, max_retries: int = 3, retry_delay: float = 1.0) -> bool:
     """Safely delete an output directory with retry mechanism.
 
@@ -129,6 +154,7 @@ def process_file(
     save_log: bool = True,
     check_for_wrong_datum: bool = True,
     arc_mode: bool = False,
+    assume_yes: bool = False,
 ) -> bool | None:
     """Process a single file for vertical datum transformation.
 
@@ -155,11 +181,17 @@ def process_file(
         save_log: Whether to save the log file.
         check_for_wrong_datum: Whether to verify datum consistency with file header.
         arc_mode: Whether to use ArcPy processing path.
+        assume_yes: Answer yes to the confirmation prompts instead of asking
+            (CLI mode only), for unattended runs.
 
     Returns:
         ``True`` if a datum mismatch was acknowledged and processing continued,
         ``False`` if the transformation was aborted or failed, or ``None`` if
         processing completed normally.
+
+    Raises:
+        NonInteractiveError: If a prompt is needed, stdin is closed, and
+            *assume_yes* is False.
     """
     logger = _state.get_logger()
 
@@ -246,8 +278,7 @@ def process_file(
                 f"try again with the correct datum: {file_datum}."
             )
         else:
-            user_input = input("Do you wish to proceed and ignore the input file's vertical datum? (yes/no): ").strip()
-            if not str2bool(user_input):
+            if not confirm("Do you wish to proceed and ignore the input file's vertical datum?", assume_yes):
                 logger.error("Aborting transformation.")
                 return False
             logger.info(f"Ignoring the input file's vertical datum, using {source_datum} instead.")
@@ -273,8 +304,7 @@ def process_file(
             if arc_mode:
                 logger.info("Proceeding to create GeoTIFF copy with Compound CRS metadata and optimized compression.")
             else:
-                user_input = input("Do you wish to proceed? (yes/no): ").strip()
-                if not str2bool(user_input):
+                if not confirm("Do you wish to proceed?", assume_yes):
                     logger.error("Aborting transformation.")
                     return False
                 logger.info("Proceeding to create GeoTIFF copy with Compound CRS metadata and optimized compression.")
@@ -342,6 +372,11 @@ def main() -> None:
         "-l", "--log_file", required=False, type=str2bool, nargs='?', const=True, default=True,
         help="Save a log file (default: True)",
     )
+    parser.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Proceed without asking when the file's vertical datum disagrees with -s, or when "
+             "-s equals -t for a GeoTIFF. Needed for unattended runs such as a container.",
+    )
 
     args = parser.parse_args()
 
@@ -368,7 +403,13 @@ def main() -> None:
             logger.info(f"Argument - {arg}: {value}")
 
     try:
-        downloaded = ensure_grids(message_func=logger.info)
+        # Only the grids this transform reads. The Explorer grids come from
+        # download_grids.py, so a container holding two grids stays offline.
+        downloaded = ensure_grids(
+            datums_dir=get_datums_dir(),
+            filenames=required_grids(args.source_datum, args.target_datum),
+            message_func=logger.info,
+        )
         if downloaded:
             logger.info(f"Downloaded {len(downloaded)} geoid grid file(s).\n")
     except Exception as e:
@@ -381,6 +422,26 @@ def main() -> None:
         end_logger()
         sys.exit(1)
 
+    try:
+        exit_code = _dispatch(args, paths, logger)
+    except NonInteractiveError as e:
+        logger.error(
+            f"Cannot ask \"{e}\" because there is no terminal to answer it. "
+            f"Re-run with --yes to proceed without asking."
+        )
+        end_logger(save_log=args.log_file)
+        sys.exit(2)
+
+    if exit_code:
+        logger.error("Processing completed with errors.")
+    else:
+        logger.info("Processing completed.")
+    end_logger(save_log=args.log_file)
+    sys.exit(exit_code)
+
+
+def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) -> int:
+    """Transform one file or every DEM under a folder; return the exit code."""
     exit_code = 0
 
     if paths.mode == 'file':
@@ -388,7 +449,7 @@ def main() -> None:
         if process_file(
             paths.input_path, paths.output_path, args.source_datum, args.target_datum,
             args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
-            args.abs_horiz_accuracy, args.log_file,
+            args.abs_horiz_accuracy, args.log_file, assume_yes=args.yes,
         ) is False:
             exit_code = 1
     else:
@@ -416,7 +477,10 @@ def main() -> None:
                         args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
                         args.abs_horiz_accuracy, args.log_file,
                         check_for_wrong_datum=not ignore_wrong_datum,
+                        assume_yes=args.yes,
                     )
+                except NonInteractiveError:
+                    raise
                 except Exception as e:
                     logger.error(f"Error processing {input_file}: {str(e)}")
                     exit_code = 1
@@ -442,8 +506,12 @@ def main() -> None:
                 else:
                     logger.error("Failed to delete output directory.")
             else:
-                user_input = input("Do you wish to delete the output directory? (yes/no): ").strip()
-                if str2bool(user_input):
+                # --yes covers the datum prompts only: deleting a folder needs a human answer.
+                try:
+                    delete = confirm("Do you wish to delete the output directory?")
+                except NonInteractiveError:
+                    delete = False
+                if delete:
                     success = delete_output_directory(args.output, 3, 1.0)
                     if success:
                         print("Output directory deleted successfully.")
@@ -457,9 +525,4 @@ def main() -> None:
                         "Output directory with copied files was retained, but files were not transformed."
                     )
 
-    if exit_code:
-        logger.error("Processing completed with errors.")
-    else:
-        logger.info("Processing completed.")
-    end_logger(save_log=args.log_file)
-    sys.exit(exit_code)
+    return exit_code

@@ -141,6 +141,40 @@ class TestMainOutputPaths:
         assert stub_pipeline == []
 
 
+class TestBatchSkipsAuxiliaryLayers:
+    def test_delivery_folder_with_auxiliary_layers(self, tmp_dir, stub_pipeline, monkeypatch):
+        """A TanDEM-X style delivery folder holds mask and amplitude layers beside the DEM.
+
+        A Byte WBM used to reach the transform, fail as an unsupported data type,
+        and abort the whole batch.
+        """
+        from osgeo import gdal, osr
+
+        indir = os.path.join(tmp_dir, "N40E047_01")
+        os.makedirs(indir)
+        layers = {
+            "DEM": gdal.GDT_Float32,
+            "HEM": gdal.GDT_Float32,
+            "WBM": gdal.GDT_Byte,
+            "EDM": gdal.GDT_Byte,
+            "AMP": gdal.GDT_UInt16,
+        }
+        for code, gdal_type in layers.items():
+            ds = gdal.GetDriverByName("GTiff").Create(
+                os.path.join(indir, f"N40E047_01_{code}.tif"), 4, 4, 1, gdal_type
+            )
+            ds.SetGeoTransform((47.0, 0.25, 0.0, 41.0, 0.0, -0.25))
+            srs = osr.SpatialReference()
+            srs.ImportFromEPSG(4326)
+            ds.SetProjection(srs.ExportToWkt())
+            ds = None
+        outdir = os.path.join(tmp_dir, "out")
+
+        assert _run(monkeypatch, "-i", indir, "-o", outdir, "-s", "EGM2008", "-t", "EGM96") == 0
+        dispatched = [os.path.basename(call[0]) for call in stub_pipeline]
+        assert dispatched == ["N40E047_01_DEM.tif"]
+
+
 class TestMainExitCodes:
     """main() used to report success no matter what happened."""
 
@@ -177,3 +211,111 @@ class TestMainExitCodes:
             monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
             "-s", "EGM6", "-t", "EGM2008",
         ) == 2
+
+
+class TestConfirm:
+    def test_assume_yes_never_reads_stdin(self, monkeypatch):
+        def no_input(*_):
+            raise AssertionError("input() was called")
+
+        monkeypatch.setattr("builtins.input", no_input)
+        assert cli.confirm("Proceed?", assume_yes=True) is True
+
+    def test_piped_answer_still_works(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda *_: "no")
+        assert cli.confirm("Proceed?") is False
+
+    def test_closed_stdin_raises_instead_of_crashing(self, monkeypatch):
+        def eof(*_):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", eof)
+        with pytest.raises(cli.NonInteractiveError):
+            cli.confirm("Proceed?")
+
+
+class TestProcessFilePrompts:
+    """A container has no terminal: input() used to die with EOFError."""
+
+    @pytest.fixture
+    def no_transform(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(cli, "verify_grids", lambda *a: None)
+        monkeypatch.setattr(cli, "transform_vertical_datum", lambda *a, **k: calls.append(a))
+        return calls
+
+    def test_same_datum_prompt_without_terminal(self, synthetic_geotiff, tmp_dir, no_transform, monkeypatch):
+        def eof(*_):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", eof)
+        out = os.path.join(tmp_dir, "out.tif")
+        with pytest.raises(cli.NonInteractiveError):
+            process_file(synthetic_geotiff, out, "EGM96", "EGM96", False, False, 16, "bilinear")
+        assert no_transform == []
+
+    def test_same_datum_prompt_with_assume_yes(self, synthetic_geotiff, tmp_dir, no_transform):
+        out = os.path.join(tmp_dir, "out.tif")
+        process_file(synthetic_geotiff, out, "EGM96", "EGM96", False, False, 16, "bilinear", assume_yes=True)
+        assert len(no_transform) == 1
+
+
+class TestMainYes:
+    def test_yes_reaches_process_file(self, tmp_dir, monkeypatch):
+        seen = {}
+
+        def fake_process_file(*args, **kwargs):
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr(cli, "ensure_grids", lambda **kw: [])
+        monkeypatch.setattr(cli, "process_file", fake_process_file)
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        assert _run(
+            monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
+            "-s", "EGM2008", "-t", "EGM96", "--yes",
+        ) == 0
+        assert seen.get("assume_yes") is True
+
+    def test_unanswerable_prompt_is_exit_code_two(self, tmp_dir, monkeypatch):
+        def needs_an_answer(*args, **kwargs):
+            raise cli.NonInteractiveError("Do you wish to proceed?")
+
+        monkeypatch.setattr(cli, "ensure_grids", lambda **kw: [])
+        monkeypatch.setattr(cli, "process_file", needs_an_answer)
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        assert _run(
+            monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
+            "-s", "EGM2008", "-t", "EGM96",
+        ) == 2
+
+
+class TestMainGridScope:
+    """main() used to fetch all five grids, including the Explorer-only ones."""
+
+    def _grids_requested(self, tmp_dir, monkeypatch, source, target):
+        requested = {}
+
+        def fake_ensure_grids(**kwargs):
+            requested.update(kwargs)
+            return []
+
+        monkeypatch.setattr(cli, "ensure_grids", fake_ensure_grids)
+        monkeypatch.setattr(cli, "process_file", lambda *a, **k: True)
+        src = os.path.join(tmp_dir, "in.tif")
+        with open(src, "wb"):
+            pass
+        _run(monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.tif"), "-s", source, "-t", target)
+        return requested["filenames"]
+
+    def test_geoid_to_geoid_needs_both_one_minute_grids(self, tmp_dir, monkeypatch):
+        assert self._grids_requested(tmp_dir, monkeypatch, "EGM2008", "EGM96") == [
+            "us_nga_egm08_1.tif", "us_nga_egm96_1.tif",
+        ]
+
+    def test_ellipsoid_to_geoid_needs_one_grid(self, tmp_dir, monkeypatch):
+        assert self._grids_requested(tmp_dir, monkeypatch, "WGS84", "EGM96") == ["us_nga_egm96_1.tif"]

@@ -16,18 +16,25 @@ SUPPORTED_EXTENSIONS = ('.tif', '.tiff', '.dt0', '.dt1', '.dt2')
 DTED_EXTENSIONS = ('.dt0', '.dt1', '.dt2')
 DTED_NODATA = -32767  # MIL-PRF-89020B void value; DTED bands are Int16
 INVALID_CHARACTERS = '<>:"/\\|?*'
-INVALID_FILENAMES = (
+# Matched anywhere in the lower-cased filename.
+INVALID_FILENAME_SUBSTRINGS = (
     'ortho',
     'image',
     'mask',   # Generic mask file, like EGMTrans flat mask
+)
+# Matched case-insensitively as a whole filename token (N40E047_01_HEM.tif), so
+# that names such as Edmonton_DEM.tif or Hampton_DEM.tif are not mistaken for layers.
+AUXILIARY_LAYER_CODES = (
     'AMP',    # TanDEM-X Amplitude Mosaic
     'EDM',    # TanDEM-X Edit Data Mask
     'HEM',    # TanDEM-X Height Error Map
     'SDM',    # TanDEM-X Source Data Mask
     'WBM',    # TanDEM-X Water Body Mask
+    'FLM',    # Copernicus DEM Filling Mask
     'SPM',    # DGED Source Processing Mask
     'SLM',    # DGED Source Lineage Mask
 )
+INVALID_FILENAMES = INVALID_FILENAME_SUBSTRINGS + AUXILIARY_LAYER_CODES
 
 
 class DatumDetails(TypedDict):
@@ -100,6 +107,16 @@ def get_crs_dir() -> str:
     return os.path.join(BASE_PATH, 'crs')
 
 
+def required_grids(src_datum: str, tgt_datum: str) -> list[str]:
+    """Return the geoid grid filenames a transformation between two datums reads."""
+    grids = []
+    for datum in (src_datum, tgt_datum):
+        grid = DATUM_MAPPING.get(datum, {}).get('grid')
+        if grid and grid not in grids:
+            grids.append(grid)
+    return grids
+
+
 def verify_grids(src_datum: str, tgt_datum: str) -> None:
     """Check that the geoid grid files needed for a transformation exist.
 
@@ -107,10 +124,7 @@ def verify_grids(src_datum: str, tgt_datum: str) -> None:
         FileNotFoundError: If a required grid file is missing, with
             instructions on how to download it.
     """
-    for datum in (src_datum, tgt_datum):
-        grid = DATUM_MAPPING.get(datum, {}).get('grid')
-        if grid is None:
-            continue
+    for grid in required_grids(src_datum, tgt_datum):
         path = os.path.join(get_datums_dir(), grid)
         if not os.path.isfile(path):
             raise FileNotFoundError(

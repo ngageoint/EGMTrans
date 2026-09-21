@@ -11,6 +11,7 @@ single-band DEM rather than an ortho, mask, or multi-band image.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 from dataclasses import dataclass
@@ -18,7 +19,21 @@ from dataclasses import dataclass
 from osgeo import gdal
 
 from egmtrans import _state
-from egmtrans.config import INVALID_CHARACTERS, INVALID_FILENAMES, SUPPORTED_EXTENSIONS
+from egmtrans.config import (
+    AUXILIARY_LAYER_CODES,
+    INVALID_CHARACTERS,
+    INVALID_FILENAME_SUBSTRINGS,
+    SUPPORTED_EXTENSIONS,
+)
+
+# Band types that can hold heights. A Byte or UInt16 band is a mask or amplitude layer.
+ELEVATION_DATA_TYPES = (gdal.GDT_Int16, gdal.GDT_Int32, gdal.GDT_Float32, gdal.GDT_Float64)
+
+# An auxiliary-layer code standing alone between separators or at either end of the name.
+_AUXILIARY_LAYER_TOKEN = re.compile(
+    r'(?:^|[_\-. ])(?:' + '|'.join(AUXILIARY_LAYER_CODES) + r')(?=$|[_\-. ])',
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -253,19 +268,25 @@ def is_valid_filename(filename: str) -> bool:
 def is_valid_dem(input_file: str) -> bool:
     """Validate if a file is a valid single-band Digital Elevation Model.
 
-    Rejects files whose names contain reserved keywords (``INVALID_FILENAMES``)
-    such as TanDEM-X auxiliary products (AMP, EDM, HEM, etc.), orthophotos,
-    and mask files.  For GeoTIFF files, also verifies the file can be opened
-    by GDAL and has exactly one band (multi-band TIFFs are skipped).
+    Rejects orthophotos and mask files by name (``INVALID_FILENAME_SUBSTRINGS``)
+    and TanDEM-X/DGED auxiliary layers (AMP, EDM, HEM, WBM, ...) whose code
+    appears as a whole token in the name.  For GeoTIFF files, also verifies the
+    file can be opened by GDAL, has exactly one band, and stores heights: a
+    Byte or UInt16 band is a mask or amplitude layer whatever it is called.
     """
-    lower_filename = os.path.basename(input_file).lower()
+    filename = os.path.basename(input_file)
+    lower_filename = filename.lower()
 
-    if any(keyword in lower_filename for keyword in INVALID_FILENAMES):
+    if any(keyword in lower_filename for keyword in INVALID_FILENAME_SUBSTRINGS):
         return False
-    if input_file.lower().endswith(('.tif', '.tiff')):
+    if _AUXILIARY_LAYER_TOKEN.search(os.path.splitext(filename)[0]):
+        return False
+    if lower_filename.endswith(('.tif', '.tiff')):
         try:
             with gdal.Open(input_file, gdal.GA_ReadOnly) as ds:
                 if ds.RasterCount > 1:
+                    return False
+                if ds.GetRasterBand(1).DataType not in ELEVATION_DATA_TYPES:
                     return False
         except Exception:
             return False

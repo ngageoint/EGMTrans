@@ -28,6 +28,7 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - [ArcGIS Pro Python Environment](#arcgis-pro-python-environment)
 - [Using the Transformation Tool in ArcGIS Pro](#using-the-transformation-tool-in-arcgis-pro)
 - [Using EGMTrans on the Command Line](#using-egmtrans-on-the-command-line)
+- [Run in a Container](#run-in-a-container)
 - [EGMTrans Explorer](#egmtrans-explorer)
 - [Interpolation Algorithms](#interpolation-algorithms)
 - [DTED Header Handling](#dted-header-handling)
@@ -46,6 +47,7 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - Preserves ocean and flat areas during transformation with customizable patch size
 - Creates optional mask files of ocean and other flat regions for further analysis
 - Utilizes parallel processing for improved performance on multi-core systems
+- Runs unattended in a Docker container that carries its own geoid grids and needs no network access
 - Supports multiple interpolation algorithms (bilinear, thin plate spline, and Delaunay triangulation)
 - Supports NGA's most widely used coordinate reference systems, including geographic, UTM and polar stereographic projections
 - The EGMTrans Explorer in ArcGIS and QGIS formats permits visualization and comparison of the geoids with each other and elevation datasets
@@ -271,7 +273,7 @@ The basic syntax for using EGMTrans in a terminal or command prompt is:
 
 ```
 python EGMTrans.py -i INPUT -o OUTPUT -s SOURCE_DATUM -t TARGET_DATUM \
-  [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-a ALGORITHM]
+  [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-a ALGORITHM] [-y]
 ```
 
 Arguments:
@@ -285,12 +287,15 @@ Arguments:
 - `-a`, `--algorithm`: Interpolation algorithm to use (optional; choices: 'bilinear', 'spline', 'delaunay', 'proj'; default: 'bilinear')
 - `--abs_horiz_accuracy`: A default horizontal accuracy that will be added to the output DTED file only if it is missing from the input. (Long form only — `-h` is `--help`.)
 - `-l`, `--log_file`: Whether to save the log messages to an external .log file (optional; default: True).
+- `-y`, `--yes`: Proceed without asking when the input file's vertical datum disagrees with `-s`, or when `-s` equals `-t` for a GeoTIFF (optional). Use it for unattended runs: without a terminal to answer a prompt, EGMTrans stops with exit code `2` rather than guess.
 
 The input and output must both be files or both be folders, except that a single input file may be
 written into an output folder, in which case it keeps its own filename. An output path ending in
 `.tif`, `.tiff`, `.dt0`, `.dt1`, or `.dt2` is treated as a file; anything else is treated as a folder.
 
-**Exit codes:** `0` success, `1` a transformation failed, `2` an argument or path error.
+**Exit codes:** `0` success, `1` a transformation failed, `2` an argument or path error, or a prompt that could not be answered.
+
+The command line checks, and if necessary downloads, only the geoid grids its source and target datums need. `python download_grids.py` fetches the full set, including the grids used by the EGMTrans Explorer.
 
 ### Examples
 
@@ -333,6 +338,28 @@ python EGMTrans.py -i "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif" \
   -o "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM_EGM96.tif" \
   -s EGM2008 -t EGM96 -a spline
 ```
+
+## Run in a Container
+
+The `Dockerfile` builds an image with GDAL, NumPy, SciPy and Numba from conda-forge, the two 1-arc-minute geoid grids (downloaded during the build and checked against their pinned SHA-256 hashes), and precompiled Numba kernels. A container needs no network access at run time.
+
+```bash
+docker build -t egmtrans .
+
+# Transform one tile from EGM2008 to EGM96. The current directory is mounted at /data.
+docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/data" egmtrans \
+  -i N06E126_DEM.tif -o N06E126_DEM_EGM96.tif -s EGM2008 -t EGM96 -y
+
+# Batch: every DEM under a folder, keeping the folder structure.
+docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/data" egmtrans \
+  -i tiles_egm2008 -o tiles_egm96 -s EGM2008 -t EGM96 -y
+```
+
+- Pass `-y`: a container has no terminal to answer a confirmation prompt, so without it EGMTrans stops with exit code `2` instead.
+- `--user` makes the outputs belong to you rather than to the image's non-root `egmtrans` user (UID 10001).
+- For large batches, run one container per tile or per folder with `NUMBA_NUM_THREADS=1` and as many containers as cores; for single, on-demand tiles, leave Numba all cores.
+- `docker/smoke_test.sh` builds the image and checks a GeoTIFF and a DTED transform with the network disabled.
+- `benchmarks/benchmark_tiles.py` measures seconds and memory per tile on your own data; see [`benchmarks/README.md`](benchmarks/README.md).
 
 ## EGMTrans Explorer
 
