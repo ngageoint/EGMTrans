@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `-y` / `--yes`: proceed without asking when the input header's vertical datum disagrees with `-s`, or when `-s` equals `-t` for a GeoTIFF. It never answers the prompt to delete an output folder.
 - `Dockerfile`, `.dockerignore` and `docker/smoke_test.sh`: an image with the two 1-arc-minute grids (SHA-256 verified at build time) and precompiled Numba kernels that runs with `--network none` as a non-root user. See "Run in a Container" in the README.
-- `benchmarks/benchmark_tiles.py`: times real tiles cold, warm, single-threaded, without Numba and through the full CLI, checks every output (voids, ocean, DTED header), optionally cross-checks the bilinear transform against PROJ, and extrapolates to a global run in core-hours.
+- `benchmarks/benchmark_tiles.py`: times real tiles cold, warm, single-threaded, without Numba and through the full CLI, checks every output (voids, ocean, DTED header), optionally cross-checks the bilinear transform against PROJ, and extrapolates to a global run in core-hours. It runs from a plain clone as well as an installed package, and fetches or verifies the two grids it needs before timing anything.
 - `config.required_grids()`, and a `filenames` argument to `download.ensure_grids()`.
 
 ### Changed

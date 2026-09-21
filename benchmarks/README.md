@@ -18,17 +18,19 @@ a DTED output carries the target datum code (`E96`) in its header.
 
 ## Setup
 
-Use the conda environment from the main README, then fetch the grids:
+Use the conda environment from the main README:
 
 ```bat
 conda env create -f environment.yml
 conda activate egmtrans
 pip install -e .
-python download_grids.py
 ```
 
-On a machine without internet access, copy `us_nga_egm96_1.tif` and
-`us_nga_egm08_1.tif` into `datums\` instead; the benchmark reads only those two.
+`pip install -e .` is recommended, but the script also runs from a plain clone: it
+falls back to the repository's `src\` when EGMTrans is not installed, and prints
+which copy it is measuring. Before timing anything it downloads (or checks) the two
+grids it needs. On a machine without internet access, copy `us_nga_egm96_1.tif` and
+`us_nga_egm08_1.tif` into `datums\` first.
 
 ## Run
 

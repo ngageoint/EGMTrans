@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import os
 import platform
@@ -39,6 +40,15 @@ import subprocess
 import sys
 import tempfile
 import time
+
+# Run from a plain clone as well as from an installed package: like download_grids.py,
+# fall back to the repository's src/ when egmtrans is not installed. PYTHONPATH carries the
+# fallback to the child processes and to `python -m egmtrans`. find_spec only locates the
+# package, so the children still time its import.
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src')
+if importlib.util.find_spec('egmtrans') is None and os.path.isdir(os.path.join(_SRC, 'egmtrans')):
+    sys.path.insert(0, _SRC)
+    os.environ['PYTHONPATH'] = os.pathsep.join(p for p in (_SRC, os.environ.get('PYTHONPATH')) if p)
 
 DEM_EXTENSIONS = ('.tif', '.tiff', '.dt0', '.dt1', '.dt2')
 DTED_EXTENSIONS = ('.dt0', '.dt1', '.dt2')
@@ -148,7 +158,10 @@ def _crosscheck_proj(input_file: str, source: str, target: str, workdir: str) ->
 
 
 def child(spec: dict) -> None:
-    """Run one transform in this process and print a JSON result line."""
+    """Run one transform in this process and print a JSON result line.
+
+    *spec* arrives as JSON on stdin (see :func:`_run_child`).
+    """
     import logging
 
     t0 = time.perf_counter()
@@ -216,9 +229,10 @@ def _describe(path: str) -> dict:
 def _run_child(spec: dict, env: dict, timeout: float | None) -> dict:
     t0 = time.perf_counter()
     try:
+        # The spec goes through stdin: a JSON argument would be at the mercy of Windows quoting.
         proc = subprocess.run(
-            [sys.executable, os.path.abspath(__file__), '--child', json.dumps(spec)],
-            env=env, capture_output=True, text=True, timeout=timeout,
+            [sys.executable, os.path.abspath(__file__), '--child'],
+            input=json.dumps(spec), env=env, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return {'error': f'timed out after {timeout:.0f} s', 'wall_s': round(time.perf_counter() - t0, 1)}
@@ -323,9 +337,18 @@ def _environment() -> dict:
     import numba
     from osgeo import gdal
 
+    import egmtrans
     from egmtrans import __version__
 
     cpu = os.environ.get('PROCESSOR_IDENTIFIER') or platform.processor()
+    if sys.platform == 'win32':
+        try:  # the marketing name, not "Intel64 Family 6 Model ..."
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'HARDWARE\DESCRIPTION\System\CentralProcessor\0') as key:
+                cpu = winreg.QueryValueEx(key, 'ProcessorNameString')[0].strip()
+        except OSError:
+            pass
     if sys.platform.startswith('linux'):
         try:
             with open('/proc/cpuinfo') as f:
@@ -333,7 +356,8 @@ def _environment() -> dict:
         except (OSError, StopIteration):
             pass
     return {
-        'egmtrans': __version__, 'python': platform.python_version(), 'gdal': gdal.__version__,
+        'egmtrans': __version__, 'egmtrans_path': os.path.dirname(os.path.abspath(egmtrans.__file__)),
+        'python': platform.python_version(), 'gdal': gdal.__version__,
         'numba': numba.__version__, 'threads': numba.config.NUMBA_NUM_THREADS, 'cpu': cpu,
         'logical_cpus': os.cpu_count(), 'platform': platform.platform(),
     }
@@ -389,8 +413,8 @@ def _markdown(rows: list[dict], env: dict, args: argparse.Namespace) -> str:
 
 
 def main() -> None:
-    if len(sys.argv) >= 3 and sys.argv[1] == '--child':
-        child(json.loads(sys.argv[2]))
+    if len(sys.argv) == 2 and sys.argv[1] == '--child':
+        child(json.loads(sys.stdin.read()))
         return
 
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
@@ -415,11 +439,21 @@ def main() -> None:
     parser.add_argument('--keep', action='store_true', help='keep the transformed outputs')
     args = parser.parse_args()
 
-    from egmtrans.config import normalize_datum
+    from egmtrans.config import get_datums_dir, normalize_datum, required_grids
+    from egmtrans.download import ensure_grids
 
     args.source, args.target = normalize_datum(args.source), normalize_datum(args.target)
     env = _environment()
-    print(f"EGMTrans {env['egmtrans']} on {env['cpu']} ({env['threads']} Numba threads)", flush=True)
+    print(f"EGMTrans {env['egmtrans']} from {env['egmtrans_path']}", flush=True)
+    print(f"on {env['cpu']} ({env['threads']} Numba threads)", flush=True)
+
+    # Fetch or verify the grids now, so that no timed run includes a download.
+    grids = required_grids(args.source, args.target)
+    try:
+        ensure_grids(datums_dir=get_datums_dir(), filenames=grids, message_func=print)
+    except Exception as e:
+        sys.exit(f"error: the geoid grids are missing and could not be downloaded ({e}).\n"
+                 f"Copy {' and '.join(grids)} into {get_datums_dir()} and run again.")
     rows = benchmark(args)
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
