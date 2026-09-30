@@ -44,8 +44,8 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - Processes either individual files or entire directories
 - Applies scale factors and offsets automatically when needed
 - Outputs Cloud Optimized GeoTIFF (COG) format for non-DTED results
-- Preserves ocean and flat areas during transformation with customizable patch size
-- Creates optional mask files of ocean and other flat regions for further analysis
+- Keeps the ocean at 0 and every flat area (a lake, a reservoir, a hydro-flattened river reach) at one level, across the tiles of a batch run, with a customizable patch size
+- Creates optional mask files of the ocean and the water bodies for quality control
 - Utilizes parallel processing for improved performance on multi-core systems
 - Runs unattended in a Docker container that carries its own geoid grids and needs no network access
 - Supports multiple interpolation algorithms (bilinear, thin plate spline, and Delaunay triangulation)
@@ -193,6 +193,8 @@ EGMTrans/
 │       ├── flattening.py
 │       ├── io.py
 │       ├── transform.py
+│       ├── tiling.py
+│       ├── batch.py
 │       ├── file_utils.py
 │       ├── arcpy_compat.py
 │       ├── logging_setup.py
@@ -256,12 +258,15 @@ Note: While Numba is recommended for optimal performance, EGMTrans will still fu
    - **Target Datum**: Select the target vertical datum (EGM2008, EGM96, or WGS84).
 
 4. (Optional) Adjust the additional parameters if desired:
-   - **Interpolation Algorithm**: Choose the interpolation method (Bilinear Interpolation, Thin Plate Spline, Delaunay Triangulation); defaults to Bilinear Interpolation.
+   - **Interpolation Algorithm**: Choose the interpolation method (Bilinear Interpolation, Thin Plate Spline, Delaunay Triangulation); defaults to Bilinear Interpolation. DTED output accepts only Bilinear Interpolation (see [Interpolation Algorithms](#interpolation-algorithms)).
    - **Minimum Patch Size**: Specify the minimum size (in pixels) for flat areas to be retained; defaults to 16.
    - **Absolute Horizontal Accuracy**: Provide a default horizontal accuracy that will be added to the output DTED file if it is missing from the input.
-   - **Retain Flat Areas**: Check this box to preserve flat areas and keep ocean at 0 during transformation; checked by default.
-   - **Create Mask**: Check this box to create a mask of ocean and other flat areas; unchecked by default.
+   - **Retain Flat Areas**: Check this box to keep the ocean at 0 and every water body at one level during transformation; checked by default.
+   - **Create Mask**: Check this box to create a mask of the ocean (value 1) and the water bodies (one value each), DTED included; unchecked by default.
    - **Save Log File**: Check this box to save the log messages to an external .log file in the output directory.
+   - **Context Folder**: A folder of neighboring tiles that are analyzed but not transformed, so that a water body which continues into them gets the level a run including them would give it (see [Notes](#notes)).
+   - **Water Levels Table**: A CSV written by the command line's `--export-water-levels` in an earlier run over a larger area; a water body found in it takes the table's level when that is lower than the level found in this run.
+   - **Minimum Containment**: The share of a flat area's boundary that must lie above it for the area to count as a water body; defaults to 0.8 (see [Notes](#notes)).
 
 5. Click "Run" to execute the tool.
 
@@ -273,7 +278,8 @@ The basic syntax for using EGMTrans in a terminal or command prompt is:
 
 ```
 python EGMTrans.py -i INPUT -o OUTPUT -s SOURCE_DATUM -t TARGET_DATUM \
-  [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-a ALGORITHM] [-y]
+  [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-c CONTAINMENT] [-a ALGORITHM] [-y] \
+  [--context FOLDER] [--water-levels FILE] [--export-water-levels FILE]
 ```
 
 Arguments:
@@ -283,11 +289,15 @@ Arguments:
 - `-t`, `--target_datum`: Target vertical datum (EGM2008, EGM96, or WGS84)
 - `-f`, `--flatten`: Whether to retain flat areas (optional; default: True)
 - `-m`, `--create_mask`: Whether to create a flat mask file (optional, default: False)
-- `-p`, `--min_patch_size`: Minimum size in pixels for a flat area to be retained (optional; default: 16)
-- `-a`, `--algorithm`: Interpolation algorithm to use (optional; choices: 'bilinear', 'spline', 'delaunay', 'proj'; default: 'bilinear')
-- `--abs_horiz_accuracy`: A default horizontal accuracy that will be added to the output DTED file only if it is missing from the input. (Long form only — `-h` is `--help`.)
+- `-p`, `--min_patch_size`: Minimum size in pixels for a flat area to be retained, DTED included (optional; default: 16)
+- `-c`, `--containment`: Share of a flat area's boundary that must lie above it for the area to count as a water body and be flattened, 0 to 1 (optional; default: 0.8; 0 keeps every flat area). See [Notes](#notes).
+- `-a`, `--algorithm`: Interpolation algorithm to use (optional; choices: 'bilinear', 'spline', 'delaunay', 'proj'; default: 'bilinear'). DTED output accepts only 'bilinear' (see [Interpolation Algorithms](#interpolation-algorithms)).
+- `--abs_horiz_accuracy`: A default horizontal accuracy that will be added to the output DTED file only if it is missing from the input. (Long form only – `-h` is `--help`.)
 - `-l`, `--log_file`: Whether to save the log messages to an external .log file (optional; default: True).
 - `-y`, `--yes`: Proceed without asking when the input file's vertical datum disagrees with `-s`, or when `-s` equals `-t` for a GeoTIFF (optional). Use it for unattended runs: without a terminal to answer a prompt, EGMTrans stops with exit code `2` rather than guess.
+- `--context FOLDER`: A folder of neighboring tiles to analyze but not transform, so that a water body which continues into them gets the level a run including them would give it (optional; may be repeated). See [Notes](#notes).
+- `--export-water-levels FILE`: Write the level of every water body that touches a tile edge, keyed by the edge crossing, for later runs over neighboring tiles (optional).
+- `--water-levels FILE`: A table written by `--export-water-levels` in an earlier run; a water body found in it takes the table's level when that is lower than the level found in this run (optional).
 
 The input and output must both be files or both be folders, except that a single input file may be
 written into an output folder, in which case it keeps its own filename. An output path ending in
@@ -309,7 +319,7 @@ python EGMTrans.py -i "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif" \
   -s EGM2008 -t EGM96 -f True -p 25
 ```
 
-2. Transform an SRTM DTED file from EGM96 to EGM2008, while simultaneously creating an ocean mask file:
+2. Transform an SRTM DTED file from EGM96 to EGM2008, writing a mask of the ocean and the water bodies beside it:
 
 ```bash
 python EGMTrans.py -i "samples/03n008e_SRTM.dt2" \
@@ -331,12 +341,27 @@ python EGMTrans.py -i "INEGI_Mexico_150cm_f13a35e4_DSM.tif" \
 python EGMTrans.py -i "TERRAFORM_EGM96" -o "TERRAFORM_EGM2008" -s EGM96 -t EGM2008
 ```
 
-5. Transform a Copernicus DEM using spline interpolation for highest accuracy (slower):
+5. Transform a single Copernicus DEM that need not edge-match its neighbors with spline interpolation (slower; a few millimeters from bilinear, and not accepted for DTED):
 
 ```bash
 python EGMTrans.py -i "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif" \
   -o "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM_EGM96.tif" \
   -s EGM2008 -t EGM96 -a spline
+```
+
+6. Transform the DTED tiles of one production cell so that every lake and river reach that crosses a tile edge gets one level, with the neighboring cells' tiles as context (searched like the input, read from their headers, and only the adjoining tiles analyzed), and export the levels for the cells that follow:
+
+```bash
+python EGMTrans.py -i "cell_17_EGM2008" -o "cell_17_EGM96" -s EGM2008 -t EGM96 -y \
+  --context "delivery/cell_16" --context "delivery/cell_18" \
+  --export-water-levels "cell_17_levels.csv"
+```
+
+7. Transform a later cell with the levels of an earlier run, so that a water body shared with it gets the same level whatever the order of production, and keep only the flat areas whose boundary is at least 90% above them:
+
+```bash
+python EGMTrans.py -i "cell_18_EGM2008" -o "cell_18_EGM96" -s EGM2008 -t EGM96 -y \
+  --water-levels "cell_17_levels.csv" -c 0.9
 ```
 
 ## Run in a Container
@@ -357,7 +382,7 @@ docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/data" egmtra
 
 - Pass `-y`: a container has no terminal to answer a confirmation prompt, so without it EGMTrans stops with exit code `2` instead.
 - `--user` makes the outputs belong to you rather than to the image's non-root `egmtrans` user (UID 10001).
-- For large batches, run one container per tile or per folder with `NUMBA_NUM_THREADS=1` and as many containers as cores; for single, on-demand tiles, leave Numba all cores.
+- For large batches, run one container per region with `NUMBA_NUM_THREADS=1` and as many containers as cores. A water body that crosses a tile edge gets one level only when both tiles are in the same run (or the neighbor is given as `--context`), so split a batch along boundaries that no lake or river crosses, such as coastlines or divides. For single, on-demand tiles, leave Numba all cores.
 - `docker/smoke_test.sh` builds the image and checks a GeoTIFF and a DTED transform with the network disabled.
 - `benchmarks/benchmark_tiles.py` measures seconds and memory per tile on your own data; see [`benchmarks/README.md`](benchmarks/README.md).
 
@@ -413,7 +438,9 @@ EGMTrans supports multiple interpolation algorithms for vertical datum transform
 
 The choice of algorithm depends on your specific requirements:
 - For most applications, the default **bilinear** algorithm provides the best balance of speed and accuracy
-- For highest accuracy, especially in areas with complex geoid variations, use **spline**
+- For a single GeoTIFF that need not match its neighbors, in an area with complex geoid variations, **spline** follows the curvature of the geoid between grid nodes; the difference from bilinear is a few millimeters
+
+**DTED output accepts only `bilinear`.** DTED tiles are edge-matched products, and only bilinear gives the same correction at a shared post whatever the tile extent: the thin plate spline is solved over the clipped grid of each tile, so its result differs at every shared post, and Delaunay differs off the grid lines. Even millimeters matter once heights are rounded to whole meters: on a DTED2 tile, spline and bilinear disagree by 1 m at 0.067% of posts (about 9,000 per tile) and Delaunay and bilinear at 0.032%, from differences of 1 to 14 mm in the correction, so tiles transformed with different algorithms would not edge-match. GeoTIFF tiles that must edge-match (DGED, Copernicus, TanDEM-X) should use `bilinear` for the same reason; a batch run with another algorithm says so once.
 
 ## DTED Header Handling
 
@@ -428,13 +455,16 @@ The tool performs the following updates:
 
 - When processing DTED files, the output must also be in DTED format.
 - DTED files can only use EGM96 or EGM2008 as vertical datums, not WGS84.
+- Flat areas: every 4-connected patch of at least `-p` posts with one height (to 1 cm; whole meters for DTED) is a candidate water body. It counts as one when at least `-c` (default 80%) of its boundary posts lie above it in the input; ocean neighbors are neutral, so lagoons and river mouths qualify. A contour band on a gentle slope is bounded above on one side and below on the other (about 50%), a flat hilltop or a roof almost entirely below (near 0%), while lakes, basins and coastal flats measure above 80% on the sample tiles; the rest are left as terrain and transformed post by post. In a batch run the share is summed over every part of a water body, so both sides of a seam reach the same verdict. The ocean (0 m) stays at 0. Every water body is set to the lowest of its transformed values, so no land post is changed and no shore post can end up below the water beside it; a large lake therefore sits lower than the mean of its transformed values by up to the range of the geoid correction across it (2 to 5 m across the largest lakes, centimeters for most). The log counts, per file, the flat areas left as terrain, the shore posts whose step above the water was lost to whole-meter rounding, any that fell below it (always 0), and those that were already below the water in the input (outlets, dam faces, dipping shores), which are left as they are.
+- Water bodies that span tiles: in a batch run, patches are joined across the seams between tiles and each water body takes one level over all its parts, so the tiles edge-match. A water body that reaches an edge with no neighbor in the run is listed in the log, because a neighbor transformed separately may give it a different level. Put the tiles that share a lake or river in one run, give the neighboring tiles as `--context` (a whole delivery folder will do: it is searched like `-i`, every DEM's placement is read from its header, and only the tiles that adjoin the run, directly or through other context tiles, are analyzed), or pass the `--water-levels` table exported by an earlier run over the larger area; with the table, the level does not depend on the order in which the tiles are produced.
 - The flattening option is not available when transforming to or from WGS84.
+- After upgrading EGMTrans, restart ArcGIS Pro: the toolbox reloads `EGMTrans.py` but not the package beneath it.
 - The interpolation algorithms use Python's NumPy and Numba modules, not Esri's Spatial Analyst license.
 - For GeoTIFF outputs, the tool creates Cloud Optimized GeoTIFFs (COGs) with DEFLATE compression.
 - The tool rounds elevation values to the nearest centimeter to reduce noise in flat area detection and improve compression.
 - When batch processing, the tool preserves the input directory structure and auxiliary files in the output directory.
 - The minimum patch size parameter can be adjusted to control the granularity of flat area preservation.
-- Creating mask files can be useful for quality control and understanding the distribution of flat areas.
+- Creating mask files can be useful for quality control: the mask holds 1 for the ocean and one value per water body, so it shows exactly what was flattened, DTED included.
 - The script creates a detailed log file ending in `_transform.log`: beside the output file when the
   output is a single file (`out.dt2` → `out_transform.log`), or inside the output folder named after
   it when the output is a folder (`results/` → `results/results_transform.log`). Pass `-l False` to
@@ -448,6 +478,7 @@ The following operations are not allowed and will cause the transformation to ab
 - Transforming DTED files to the WGS 84 ellipsoid, which is outside the DTED specification (STANAG 3809).
 - Transforming files with a horizontal datum other than WGS 84 (e.g., NAD83).
 - Creating DTED files from GeoTIFFs, which lack the necessary header metadata.
+- Writing DTED with an interpolation algorithm other than `bilinear` (see [Interpolation Algorithms](#interpolation-algorithms)).
 - Transforming GeoTIFFs with more than one band. If multi-band GeoTIFFs (e.g. auxiliary orthophotos) exist in directories during batch processing, they will be ignored.
 
 In addition, users will be warned in the following circumstances and asked if they wish to proceed:

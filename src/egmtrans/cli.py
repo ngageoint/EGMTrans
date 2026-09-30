@@ -22,6 +22,7 @@ from osgeo import gdal
 
 from egmtrans import _state
 from egmtrans.arcpy_compat import init_arcpy
+from egmtrans.batch import run_batch
 from egmtrans.config import (
     DTED_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
@@ -34,14 +35,23 @@ from egmtrans.crs import standardize_srs
 from egmtrans.download import ensure_grids
 from egmtrans.file_utils import (
     IOPaths,
-    copy_folder_structure,
     is_valid_dem,
     prepare_output_target,
     resolve_io_paths,
 )
+from egmtrans.flattening import DEFAULT_CONTAINMENT
 from egmtrans.logging_setup import end_logger, setup_logger
 from egmtrans.numba_utils import NUMBA_AVAILABLE
+from egmtrans.tiling import TileLevels
 from egmtrans.transform import transform_vertical_datum
+
+# DTED tiles are edge-matched products. Only the bilinear resampling gives the
+# same correction at a shared post whatever the tile extent (the spline solve
+# depends on the clipped grid, Delaunay on the triangulation), and even a
+# millimeter of difference moves posts by 1 m after rounding to whole meters:
+# measured 0.067% of posts for spline and 0.032% for Delaunay against bilinear
+# on a DTED2 tile. Set to False to warn instead of refusing.
+DTED_REQUIRES_BILINEAR = True
 
 
 def log_numba_availability() -> None:
@@ -141,6 +151,117 @@ def delete_output_directory(output_dir: str, max_retries: int = 3, retry_delay: 
     return False
 
 
+def _configure_runtime(arc_mode: bool) -> None:
+    """Set up logging, the ArcGIS mode flag and ArcPy once per run."""
+    logger = _state.get_logger()
+
+    if len(logger.handlers) == 1 and isinstance(logger.handlers[0], logging.NullHandler):
+        setup_logger(is_arc_mode=arc_mode)
+
+    _state.set_arc_mode(arc_mode)
+    if arc_mode:
+        init_arcpy()
+        log_numba_availability()
+    elif not NUMBA_AVAILABLE:
+        logger.warning("Numba is not available. Processing will be slower.")
+
+
+def check_file_datum(
+    input_file: str,
+    output_file: str,
+    source_datum: str,
+    arc_mode: bool,
+    assume_yes: bool,
+    prompt: bool = True,
+) -> bool:
+    """Compare the file's own vertical datum with *source_datum*.
+
+    Logs the datum the header or CRS carries.  When it disagrees with
+    *source_datum* and *prompt* is set, asks whether to go on (CLI) or warns
+    and goes on (ArcGIS Pro).
+
+    Returns:
+        False if the file could not be opened or the user declined; True otherwise.
+
+    Raises:
+        NonInteractiveError: If a prompt is needed, stdin is closed, and
+            *assume_yes* is False.
+    """
+    logger = _state.get_logger()
+
+    # gdal.UseExceptions() is on, so a failed open raises rather than returning None.
+    try:
+        with gdal.Open(input_file, gdal.GA_ReadOnly) as input_ds:
+            metadata = input_ds.GetMetadata()
+            projection = input_ds.GetProjection()
+    except RuntimeError as e:
+        logger.error(f'Failed to open input file {input_file}: {e}')
+        return False
+    logger.debug(f"Input file's projection: {projection}")
+    src_srs = standardize_srs(projection)
+    logger.debug(f"Input file's SRS: {src_srs}")
+
+    if input_file.lower().endswith(DTED_EXTENSIONS):
+        file_datum = metadata.get('DTED_VerticalDatum')
+        file_datum = 'EGM96' if file_datum in ('E96', 'MSL') else 'EGM2008' if file_datum == 'E08' else None
+    else:
+        file_datum = src_srs.GetAttrValue('VERT_CS')
+    logger.info(f"Input file header's vertical datum: {file_datum}")
+
+    if file_datum and source_datum not in file_datum and prompt:
+        logger.info(
+            f"The input file's vertical datum ({file_datum}) does not match "
+            f"the specified source datum ({source_datum})."
+        )
+        if arc_mode:
+            logger.warning(f"Ignoring the input file's vertical datum, using {source_datum} instead.")
+            logger.warning(
+                f"If {source_datum} is incorrect, delete {output_file} and "
+                f"try again with the correct datum: {file_datum}."
+            )
+        else:
+            if not confirm("Do you wish to proceed and ignore the input file's vertical datum?", assume_yes):
+                logger.error("Aborting transformation.")
+                return False
+            logger.info(f"Ignoring the input file's vertical datum, using {source_datum} instead.")
+    return True
+
+
+def check_same_datum(input_file: str, source_datum: str, target_datum: str, arc_mode: bool, assume_yes: bool) -> bool:
+    """Handle a run whose source and target datums are the same.
+
+    A GeoTIFF is then rewritten as an optimized copy with a compound CRS after
+    a confirmation (CLI); a DTED file is refused.
+
+    Returns:
+        False if the run should not go on.
+
+    Raises:
+        NonInteractiveError: If a prompt is needed, stdin is closed, and
+            *assume_yes* is False.
+    """
+    logger = _state.get_logger()
+    if source_datum != target_datum:
+        return True
+    if input_file.lower().endswith(DTED_EXTENSIONS):
+        logger.error("Source and target vertical datums are the same.\nAborting transformation.")
+        return False
+
+    logger.warning(
+        "Source and target vertical datums are the same. "
+        "No vertical transformation or flattening will occur."
+    )
+    logger.warning(
+        "This operation will create an optimized GeoTIFF copy rounded to 1 cm, "
+        "with Compound CRS and DEFLATE compression."
+    )
+    if not arc_mode and not confirm("Do you wish to proceed?", assume_yes):
+        logger.error("Aborting transformation.")
+        return False
+    logger.info("Proceeding to create GeoTIFF copy with Compound CRS metadata and optimized compression.")
+    return True
+
+
 def process_file(
     input_file: str,
     output_file: str,
@@ -155,18 +276,21 @@ def process_file(
     check_for_wrong_datum: bool = True,
     arc_mode: bool = False,
     assume_yes: bool = False,
-) -> bool | None:
+    tile_levels: TileLevels | None = None,
+    min_containment: float = DEFAULT_CONTAINMENT,
+) -> bool:
     """Process a single file for vertical datum transformation.
 
     Performs comprehensive validation before calling
     :func:`~egmtrans.transform.transform_vertical_datum`:
 
     1. Validates file format and accessibility.
-    2. Checks datum compatibility (DTED cannot target WGS84, etc.).
+    2. Checks datum compatibility (DTED cannot target WGS84, etc.) and that a
+       DTED output uses the bilinear algorithm (see :data:`DTED_REQUIRES_BILINEAR`).
     3. Verifies the file's CRS/header matches the stated source datum;
        prompts the user (CLI) or logs a warning (ArcGIS) on mismatch.
     4. Disables flattening for WGS84 transforms (orthometric-only operation).
-    5. Handles same-datum copies (optimised GeoTIFF with compound CRS).
+    5. Handles same-datum copies (optimized GeoTIFF with compound CRS).
 
     Args:
         input_file: Path to the input DEM.
@@ -183,31 +307,20 @@ def process_file(
         arc_mode: Whether to use ArcPy processing path.
         assume_yes: Answer yes to the confirmation prompts instead of asking
             (CLI mode only), for unattended runs.
+        tile_levels: Water-body levels merged across the tiles of a batch run.
+        min_containment: Share of a flat area's boundary that must lie above it
+            for the area to count as a water body.
 
     Returns:
-        ``True`` if a datum mismatch was acknowledged and processing continued,
-        ``False`` if the transformation was aborted or failed, or ``None`` if
-        processing completed normally.
+        ``True`` if the file was transformed, ``False`` if the transformation
+        was aborted or failed.
 
     Raises:
         NonInteractiveError: If a prompt is needed, stdin is closed, and
             *assume_yes* is False.
     """
     logger = _state.get_logger()
-
-    if len(logger.handlers) == 1 and isinstance(logger.handlers[0], logging.NullHandler):
-        setup_logger(is_arc_mode=arc_mode)
-
-    _state.set_arc_mode(arc_mode)
-    if arc_mode:
-        init_arcpy()
-    else:
-        if not NUMBA_AVAILABLE:
-            logger.warning("Numba is not available. Processing will be slower.")
-
-    if arc_mode:
-        log_numba_availability()
-
+    _configure_runtime(arc_mode)
     verify_grids(source_datum, target_datum)
 
     if not is_valid_dem(input_file):
@@ -216,7 +329,6 @@ def process_file(
 
     input_is_dted = input_file.lower().endswith(DTED_EXTENSIONS)
     output_is_dted = output_file.lower().endswith(DTED_EXTENSIONS)
-    ignore_wrong_datum = False
 
     if not any(input_file.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
         logger.error(
@@ -233,6 +345,17 @@ def process_file(
         logger.error('DTED data can only be in EGM2008 or EGM96, not WGS84.\nAborting transformation.')
         return False
 
+    if output_is_dted and algorithm != 'bilinear':
+        message = (
+            f"DTED output requires the bilinear algorithm. '{algorithm}' gives a correction that depends on "
+            f"the tile extent or differs from bilinear by millimeters, and either moves posts by 1 m after "
+            f"rounding to whole meters, so tiles that should edge-match would not."
+        )
+        if DTED_REQUIRES_BILINEAR:
+            logger.error(f"{message}\nAborting transformation.")
+            return False
+        logger.warning(message)
+
     if create_mask and not flatten:
         logger.error(
             f"To create a mask of flat areas, you must also set "
@@ -246,83 +369,27 @@ def process_file(
         )
         return False
 
-    # gdal.UseExceptions() is on, so a failed open raises rather than returning None.
-    try:
-        with gdal.Open(input_file, gdal.GA_ReadOnly) as input_ds:
-            metadata = input_ds.GetMetadata()
-            projection = input_ds.GetProjection()
-    except RuntimeError as e:
-        logger.error(f'Failed to open input file {input_file}: {e}')
+    if not check_file_datum(input_file, output_file, source_datum, arc_mode, assume_yes, prompt=check_for_wrong_datum):
         return False
-    logger.debug(f"Input file's projection: {projection}")
-    src_srs = standardize_srs(projection)
-    logger.debug(f"Input file's SRS: {src_srs}")
-
-    file_datum = None
-    if input_is_dted:
-        file_datum = metadata.get('DTED_VerticalDatum')
-        file_datum = 'EGM96' if file_datum in ('E96', 'MSL') else 'EGM2008' if file_datum == 'E08' else None
-    else:
-        file_datum = src_srs.GetAttrValue('VERT_CS')
-    logger.info(f"Input file header's vertical datum: {file_datum}")
-
-    if file_datum and source_datum not in file_datum and check_for_wrong_datum:
-        logger.info(
-            f"The input file's vertical datum ({file_datum}) does not match "
-            f"the specified source datum ({source_datum})."
-        )
-        if arc_mode:
-            logger.warning(f"Ignoring the input file's vertical datum, using {source_datum} instead.")
-            logger.warning(
-                f"If {source_datum} is incorrect, delete {output_file} and "
-                f"try again with the correct datum: {file_datum}."
-            )
-        else:
-            if not confirm("Do you wish to proceed and ignore the input file's vertical datum?", assume_yes):
-                logger.error("Aborting transformation.")
-                return False
-            logger.info(f"Ignoring the input file's vertical datum, using {source_datum} instead.")
-
-        ignore_wrong_datum = True
-    else:
-        ignore_wrong_datum = True
 
     if (source_datum == 'WGS84' or target_datum == 'WGS84') and flatten:
         logger.info("Flattening is not supported for WGS84 ellipsoid height transforms. Proceeding without flattening.")
         flatten = False
 
-    if source_datum == target_datum:
-        if not input_is_dted:
-            logger.warning(
-                "Source and target vertical datums are the same. "
-                "No vertical transformation or flattening will occur."
-            )
-            logger.warning(
-                "This operation will create an optimized GeoTIFF copy rounded to 1 cm, "
-                "with Compound CRS and DEFLATE compression."
-            )
-            if arc_mode:
-                logger.info("Proceeding to create GeoTIFF copy with Compound CRS metadata and optimized compression.")
-            else:
-                if not confirm("Do you wish to proceed?", assume_yes):
-                    logger.error("Aborting transformation.")
-                    return False
-                logger.info("Proceeding to create GeoTIFF copy with Compound CRS metadata and optimized compression.")
-        else:
-            logger.error("Source and target vertical datums are the same.\nAborting transformation.")
-            return False
+    if not check_same_datum(input_file, source_datum, target_datum, arc_mode, assume_yes):
+        return False
 
     try:
         transform_vertical_datum(
             input_file, output_file, source_datum, target_datum,
             flatten, create_mask, min_patch_size, algorithm,
-            abs_horiz_accuracy, save_log,
+            abs_horiz_accuracy, save_log, tile_levels=tile_levels, min_containment=min_containment,
         )
     except Exception as e:
         logger.error(f"Transformation failed: {e}.")
         return False
 
-    return ignore_wrong_datum
+    return True
 
 
 def main() -> None:
@@ -337,8 +404,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Transform vertical datum between WGS 84 ellipsoid, EGM96, and EGM2008 for DTED and GeoTIFF files."
     )
-    parser.add_argument("-i", "--input", required=True, help="Input file or folder containing DTED files")
-    parser.add_argument("-o", "--output", required=True, help="Output file or folder for transformed DTED files")
+    parser.add_argument("-i", "--input", required=True, help="Input DEM file, or folder of DEMs (DTED or GeoTIFF)")
+    parser.add_argument("-o", "--output", required=True, help="Output file, or folder for the transformed DEMs")
     parser.add_argument(
         "-s", "--source_datum", required=True, type=datum_arg,
         help="Source vertical datum (WGS84, EGM96, or EGM2008)",
@@ -353,16 +420,23 @@ def main() -> None:
     )
     parser.add_argument(
         "-m", "--create_mask", required=False, type=str2bool, nargs='?', const=True, default=False,
-        help="Create a mask of ocean and, if GeoTIFF, other flat areas (default: False)",
+        help="Create a mask of the ocean and the water bodies, DTED included (default: False)",
+    )
+    # No nargs='?' here: a bare -p used to become True (one post) and a bare -a
+    # became True, which passed the choices check and ran the spline branch.
+    parser.add_argument(
+        "-p", "--min_patch_size", required=False, type=int, default=16,
+        help="Minimum patch size in pixels for flat areas, DTED included (default: 16)",
     )
     parser.add_argument(
-        "-p", "--min_patch_size", required=False, type=int, nargs='?', const=True, default=16,
-        help="Minimum patch size in pixels for flat areas (default: 16)",
+        "-c", "--containment", required=False, type=float, default=DEFAULT_CONTAINMENT,
+        help="Share of a flat area's boundary that must lie above it for the area to count as a water "
+             "body and be flattened, 0 to 1 (default: 0.8; 0 keeps every flat area)",
     )
     parser.add_argument(
         "-a", "--algorithm", required=False, choices=['bilinear', 'delaunay', 'spline', 'proj'],
-        nargs='?', const=True, default='bilinear',
-        help="Interpolation algorithm (default: bilinear)",
+        default='bilinear',
+        help="Interpolation algorithm (default: bilinear; DTED output accepts only bilinear)",
     )
     parser.add_argument(
         "--abs_horiz_accuracy", required=False, type=int,
@@ -377,6 +451,21 @@ def main() -> None:
         help="Proceed without asking when the file's vertical datum disagrees with -s, or when "
              "-s equals -t for a GeoTIFF. Needed for unattended runs such as a container.",
     )
+    parser.add_argument(
+        "--context", action="append", default=[], metavar="FOLDER",
+        help="Folder of neighboring tiles to analyze but not transform, so that a water body which "
+             "continues into them gets the level a run including them would give it. May be repeated.",
+    )
+    parser.add_argument(
+        "--water-levels", metavar="FILE",
+        help="Water-level table written by an earlier run's --export-water-levels. A water body found "
+             "in it takes the table's level when that is lower than the level found in this run.",
+    )
+    parser.add_argument(
+        "--export-water-levels", metavar="FILE",
+        help="Write the level of every water body that touches a tile edge, keyed by the edge crossing, "
+             "for later runs over neighboring tiles.",
+    )
 
     args = parser.parse_args()
 
@@ -384,6 +473,13 @@ def main() -> None:
         paths = resolve_io_paths(args.input, args.output)
     except ValueError as e:
         parser.error(str(e))
+    if not 0.0 <= args.containment <= 1.0:
+        parser.error(f"--containment must be between 0 and 1, not {args.containment}")
+    for folder in args.context:
+        if not os.path.isdir(folder):
+            parser.error(f"--context folder does not exist: {folder}")
+    if args.water_levels and not os.path.isfile(args.water_levels):
+        parser.error(f"--water-levels file does not exist: {args.water_levels}")
 
     try:
         prepare_output_target(paths)
@@ -443,61 +539,31 @@ def main() -> None:
 def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) -> int:
     """Transform one file or every DEM under a folder; return the exit code."""
     exit_code = 0
+    batch_options = args.context or args.water_levels or args.export_water_levels
 
-    if paths.mode == 'file':
+    if paths.mode == 'file' and not batch_options:
         logger.info(f"Processing file: {paths.output_path}")
         if process_file(
             paths.input_path, paths.output_path, args.source_datum, args.target_datum,
             args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
             args.abs_horiz_accuracy, args.log_file, assume_yes=args.yes,
+            min_containment=args.containment,
         ) is False:
             exit_code = 1
     else:
-        copy_folder_structure(paths.input_path, paths.output_path)
-        ignore_wrong_datum = False
-        files_processed = False
-        process_complete = True
+        result = run_batch(
+            paths, args.source_datum, args.target_datum,
+            args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
+            args.abs_horiz_accuracy, args.log_file, assume_yes=args.yes,
+            context_folders=args.context, water_levels=args.water_levels,
+            export_water_levels=args.export_water_levels, min_containment=args.containment,
+        )
+        exit_code = result.exit_code
 
-        for root, _, files in os.walk(paths.input_path):
-            for file in files:
-                if not file.lower().endswith(SUPPORTED_EXTENSIONS):
-                    continue
-                input_file = os.path.join(root, file)
-                if not is_valid_dem(input_file):
-                    # Not a DEM (mask, ortho, TanDEM-X auxiliary). Skip it rather
-                    # than aborting the batch; the plain copy stays in the output.
-                    logger.info(f"Skipping {file} as it's not a DEM.")
-                    continue
-                relative_path = os.path.relpath(input_file, paths.input_path)
-                output_file = os.path.join(paths.output_path, relative_path)
-                logger.info(f"Processing file: {output_file}")
-                try:
-                    result = process_file(
-                        input_file, output_file, args.source_datum, args.target_datum,
-                        args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
-                        args.abs_horiz_accuracy, args.log_file,
-                        check_for_wrong_datum=not ignore_wrong_datum,
-                        assume_yes=args.yes,
-                    )
-                except NonInteractiveError:
-                    raise
-                except Exception as e:
-                    logger.error(f"Error processing {input_file}: {str(e)}")
-                    exit_code = 1
-                    continue
-                if result is False:
-                    exit_code = 1
-                    process_complete = False
-                    break
-                ignore_wrong_datum = True
-                files_processed = True
-            if not process_complete:
-                break
-
-        if not files_processed:
+        if paths.mode == 'folder' and result.files_processed == 0:
             logger.info(
-                f"NOTE: The files in {args.input} were copied to output directory "
-                f"{args.output} but not transformed."
+                f"NOTE: No DEM under {args.input} was transformed. The output directory "
+                f"{args.output} holds at most copies of the other files."
             )
             if _state.get_arc_mode():
                 success = delete_output_directory(args.output, 3, 1.0)

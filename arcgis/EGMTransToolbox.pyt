@@ -138,6 +138,32 @@ class Tool:
         save_log.value = True
         params.append(save_log)
 
+        context_folder = arcpy.Parameter(
+            displayName="Context Folder (neighboring tiles analyzed but not transformed)",
+            name="context_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input")
+        params.append(context_folder)
+
+        water_levels = arcpy.Parameter(
+            displayName="Water Levels Table (from an earlier run)",
+            name="water_levels",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
+        water_levels.filter.list = ["csv"]
+        params.append(water_levels)
+
+        containment = arcpy.Parameter(
+            displayName="Minimum Containment (share of a flat area's boundary above it, for it to be water)",
+            name="containment",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
+        containment.value = 0.8
+        params.append(containment)
+
         output_layer = arcpy.Parameter(
             displayName="Output Raster Layer",
             name="output_layer",
@@ -161,6 +187,16 @@ class Tool:
     def updateMessages(self, parameters):
         """Modify the messages created by internal validation for each tool
         parameter. This method is called after internal validation."""
+        input_value = parameters[0].valueAsText or ""
+        algorithm = parameters[4].valueAsText or "Bilinear Interpolation"
+        if input_value.lower().endswith((".dt0", ".dt1", ".dt2")) and algorithm != "Bilinear Interpolation":
+            parameters[4].setErrorMessage(
+                "DTED output requires Bilinear Interpolation: DTED tiles are edge-matched, and only "
+                "bilinear gives the same correction at a shared post whatever the tile extent."
+            )
+        containment = parameters[12].value
+        if containment is not None and not 0.0 <= containment <= 1.0:
+            parameters[12].setErrorMessage("Minimum Containment must be between 0 and 1.")
         return
 
     def execute(self, parameters, messages):
@@ -182,6 +218,9 @@ class Tool:
         flatten = parameters[7].value
         create_mask = parameters[8].value
         save_log = parameters[9].value
+        context_folder = parameters[10].valueAsText
+        water_levels = parameters[11].valueAsText
+        containment = parameters[12].value if parameters[12].value is not None else 0.8
 
         # Resolve input/output and derive the log path with the same helper the
         # CLI uses, so the two entry points cannot disagree about file vs. folder.
@@ -230,22 +269,19 @@ class Tool:
             return
 
         try:
-            if io_paths.mode == 'file':
-                EGMTrans.process_file(io_paths.input_path, output_path, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)
+            if io_paths.mode == 'file' and not context_folder and not water_levels:
+                EGMTrans.process_file(io_paths.input_path, output_path, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True, min_containment=containment)
             else:
-                EGMTrans.copy_folder_structure(io_paths.input_path, output_path)
-                for root, _, files in os.walk(io_paths.input_path):
-                    for file in files:
-                        if not file.lower().endswith(EGMTrans.SUPPORTED_EXTENSIONS):
-                            continue
-                        input_file = os.path.join(root, file)
-                        if not EGMTrans.is_valid_dem(input_file):
-                            arcpy.AddMessage(f"Skipping {file} as it's not a DEM.")
-                            continue
-                        relative_path = os.path.relpath(input_file, io_paths.input_path)
-                        output_file = os.path.join(output_path, relative_path)
-                        arcpy.AddMessage(f"Processing file: {output_file}")
-                        EGMTrans.process_file(input_file, output_file, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True)
+                # The same two-pass runner as the command line: water bodies that
+                # span tiles get one level, context tiles are analyzed but not written.
+                result = EGMTrans.run_batch(
+                    io_paths, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm,
+                    abs_horiz_accuracy, save_log, arc_mode=True,
+                    context_folders=[context_folder] if context_folder else [], water_levels=water_levels,
+                    min_containment=containment,
+                )
+                if result.exit_code:
+                    arcpy.AddError(f"{len(result.failed)} DEM(s) were not transformed; see the messages above.")
         except Exception as e:
             arcpy.AddError(f"An error occurred: {str(e)}")
 
@@ -266,7 +302,7 @@ class Tool:
             try:
                 result_layer = arcpy.management.MakeRasterLayer(
                     output_path, os.path.basename(output_path))
-                arcpy.SetParameter(10, result_layer.getOutput(0))
+                arcpy.SetParameter(13, result_layer.getOutput(0))
             except Exception as e:
                 arcpy.AddWarning(f"Could not create output layer for map display: {e}")
         elif not hasattr(input_param.value, 'dataSource'):

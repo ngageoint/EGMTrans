@@ -48,9 +48,9 @@ def test_flatten_keeps_voids_ocean_and_flat_patches(tmp_dir):
     rows = cols = 40
     nodata = -9999.0
     i, j = np.mgrid[0:rows, 0:cols]
-    dem = (10.0 + i + 0.37 * j).astype(np.float32)  # no two terrain pixels share a value
-    dem[:, :10] = 0.0                                 # ocean
-    dem[20:30, 20:30] = 150.0                         # lake
+    dem = (200.0 + i + 0.37 * j).astype(np.float32)  # no two terrain pixels share a value
+    dem[:, :10] = 0.0                                  # ocean
+    dem[20:30, 20:30] = 150.0                          # lake, in a basin below the terrain
     voids = [(0, 0), (5, 3), (25, 25), (12, 33)]      # in the ocean, the lake, and on land
     for r, c in voids:
         dem[r, c] = nodata
@@ -94,6 +94,138 @@ def test_flatten_keeps_voids_ocean_and_flat_patches(tmp_dir):
     lake &= ~void
     assert np.unique(result[lake]).size == 1, "the lake surface is no longer flat"
     assert abs(float(result[lake][0]) - 150.0) > 0.5, "the lake was not shifted with the datum"
+
+
+@requires_grids
+def test_dted_flat_patch_is_one_level(tmp_dir):
+    """A DTED lake whose corrected height straddles a rounding boundary is one level.
+
+    DTED used to have only its ocean flattened, so the whole-meter rounding split
+    such a lake into two levels along the boundary. The tile sits off Mindanao,
+    where the correction changes by meters across a degree, and the lake covers
+    half the tile, so the split is certain; the test checks that precondition.
+    """
+    from egmtrans.io import round_half_away
+    from tests.conftest import read_band, write_dted
+
+    posts = 121
+    i, j = np.mgrid[0:posts, 0:posts]
+    dem = (10 + 3 * i + 5 * j).astype(np.int16)  # neighbors always differ
+    dem[30:90, 20:100] = 150
+    src = write_dted(os.path.join(tmp_dir, "n06e126.dt0"), dem, 126, 6)
+    out = os.path.join(tmp_dir, "n06e126_egm96.dt0")
+
+    transform_vertical_datum(src, out, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False)
+
+    result = read_band(out)
+    lake = result[30:90, 20:100]
+    assert np.unique(lake).size == 1, f"the lake came out at {np.unique(lake).tolist()}"
+
+    egm96 = create_datum_array(src, "EGM96", "bilinear", tmp_dir, tmp_dir)
+    egm2008 = create_datum_array(src, "EGM2008", "bilinear", tmp_dir, tmp_dir)
+    raw = 150 - (egm96 - egm2008)[30:90, 20:100].astype(np.float64)
+    assert np.unique(round_half_away(raw)).size >= 2, "the test lake does not straddle a rounding boundary"
+    assert lake[0, 0] == round_half_away(raw.min())
+    # Land posts (no two neighbors alike, so no patches) are rounded one by one.
+    land = round_half_away(dem[:30, :].astype(np.float64) - (egm96 - egm2008)[:30, :])
+    assert np.array_equal(result[:30, :], land)
+
+
+@requires_grids
+def test_single_file_reports_edge_touching_water_bodies(tmp_dir, log_lines):
+    """A lake on the tile edge is listed, because its level may differ next door."""
+    from osgeo import gdal, osr
+
+    rows = cols = 40
+    i, j = np.mgrid[0:rows, 0:cols]
+    dem = (200.0 + i + 0.37 * j).astype(np.float32)
+    dem[20:30, 30:40] = 150.0   # reaches the east edge
+    dem[5:10, 5:10] = 80.0      # interior: not listed
+
+    src = os.path.join(tmp_dir, "edge_lake.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(src, cols, rows, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform((126.30, 0.01, 0.0, 7.90, 0.0, -0.01))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.GetRasterBand(1).WriteArray(dem)
+    ds = None
+
+    out = os.path.join(tmp_dir, "edge_lake_egm96.tif")
+    transform_vertical_datum(src, out, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False)
+
+    text = "\n".join(log_lines)
+    assert "touching an edge of this run" in text
+    assert "150.00 m" in text and "edge_lake.tif:E" in text
+    assert "80.00 m" not in text
+    assert "1 touch the run boundary" in text
+
+
+@requires_grids
+def test_containment_is_counted_and_never_broken(tmp_dir, log_lines):
+    """Shore posts that were above a lake in the input never end below it."""
+    from egmtrans.flattening import containment_stats, create_labeled_array_flt, patch_levels
+    from tests.conftest import read_band, write_dted
+
+    posts = 121
+    i, j = np.mgrid[0:posts, 0:posts]
+    dem = (500 + 3 * i + 5 * j).astype(np.int16)
+    dem[30:90, 20:100] = 150  # a lake in a basin: every shore post is above it
+    src = write_dted(os.path.join(tmp_dir, "n06e126.dt0"), dem, 126, 6)
+    out = os.path.join(tmp_dir, "n06e126_egm96.dt0")
+
+    transform_vertical_datum(src, out, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False)
+
+    line = next(line for line in log_lines if line.startswith("Containment:"))
+    assert " 0 that were at or above it are now below it" in line
+    assert "shore posts border a water body" in line and "0 were already below it" in line
+
+    result = read_band(out).astype(np.float64)
+    labeled = create_labeled_array_flt(dem.astype(np.float64), 16)
+    levels, _ = patch_levels(result, labeled)
+    shore, lost_step, below, already_below = containment_stats(
+        dem.astype(np.float64), result, labeled, levels, True
+    )
+    assert shore == 2 * 60 + 2 * 80 and below == 0 and already_below == 0
+    assert np.all(result[29, 20:100] > result[30, 20:100])
+    assert np.all(result[90, 20:100] > result[30, 20:100])
+
+
+@requires_grids
+def test_uncontained_flat_area_is_left_as_terrain(tmp_dir, log_lines):
+    """A flat hilltop is not a water body: its posts are transformed one by one
+    and it stays out of the mask, while the basin lake beside it is flattened."""
+    from egmtrans.io import round_half_away
+    from tests.conftest import read_band, write_dted
+
+    posts = 121
+    i, j = np.mgrid[0:posts, 0:posts]
+    dem = (500 + 3 * i + 5 * j).astype(np.int16)
+    dem[30:60, 20:60] = 150     # a lake in a basin: every boundary post is above it
+    dem[70:100, 20:60] = 2000   # a mesa: every boundary post is below it
+    src = write_dted(os.path.join(tmp_dir, "n06e126.dt0"), dem, 126, 6)
+    out = os.path.join(tmp_dir, "n06e126_egm96.dt0")
+
+    transform_vertical_datum(src, out, "EGM2008", "EGM96", True, True, 16, "bilinear", save_log=False)
+
+    result = read_band(out)
+    assert np.unique(result[30:60, 20:60]).size == 1, "the lake is not one level"
+
+    egm96 = create_datum_array(src, "EGM96", "bilinear", tmp_dir, tmp_dir)
+    egm2008 = create_datum_array(src, "EGM2008", "bilinear", tmp_dir, tmp_dir)
+    expected_mesa = round_half_away(2000 - (egm96 - egm2008)[70:100, 20:60].astype(np.float64))
+    assert np.array_equal(result[70:100, 20:60], expected_mesa), "the mesa was flattened"
+
+    mask = read_band(os.path.join(tmp_dir, "n06e126_egm96_mask.tif"))
+    assert np.all(mask[30:60, 20:60] > 1) and np.all(mask[70:100, 20:60] == 0)
+    assert any(line.startswith("Left 1 flat area(s) of 1,200 posts as terrain") for line in log_lines)
+
+    # With the filter off, the mesa is a flat area like any other.
+    out_all = os.path.join(tmp_dir, "n06e126_all.dt0")
+    transform_vertical_datum(
+        src, out_all, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False, min_containment=0.0
+    )
+    assert np.unique(read_band(out_all)[70:100, 20:60]).size == 1
 
 
 @requires_grids

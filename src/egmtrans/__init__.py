@@ -1,6 +1,7 @@
 """EGMTrans — Vertical datum transformation tool for DEMs."""
 
 from egmtrans._version import __version__
+from egmtrans.batch import BatchResult, run_batch
 from egmtrans.cli import process_file, str2bool
 from egmtrans.config import (
     DATUM_MAPPING,
@@ -15,12 +16,14 @@ from egmtrans.file_utils import (
     copy_folder_structure,
     derive_log_path,
     ensure_writable,
+    find_dems,
     is_valid_dem,
     is_valid_filename,
     prepare_output_target,
     resolve_io_paths,
 )
 from egmtrans.logging_setup import end_logger, setup_logger
+from egmtrans.tiling import TileLevels
 from egmtrans.transform import transform_vertical_datum
 
 __all__ = [
@@ -33,6 +36,9 @@ __all__ = [
     "setup_logger",
     "end_logger",
     "process_file",
+    "run_batch",
+    "BatchResult",
+    "TileLevels",
     "str2bool",
     "IOPaths",
     "resolve_io_paths",
@@ -41,6 +47,7 @@ __all__ = [
     "ensure_writable",
     "copy_as_writable",
     "copy_folder_structure",
+    "find_dems",
     "is_valid_filename",
     "is_valid_dem",
     "transform_vertical_datum",

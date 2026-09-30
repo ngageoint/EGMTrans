@@ -72,7 +72,7 @@ class TestBilinearEdgeHandling:
     """At the source grid's edge, only the out-of-range axis may collapse.
 
     The old code clamped both axes and returned the floor corner as soon as
-    *either* went out of range, silently degrading to nearest-neighbour along an
+    *either* went out of range, silently degrading to nearest-neighbor along an
     axis that was still perfectly interpolatable.
     """
 

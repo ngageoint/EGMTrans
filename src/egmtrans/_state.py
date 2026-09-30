@@ -27,7 +27,7 @@ def set_arc_mode(value: bool) -> None:
 
 
 def get_arcpy():
-    """Return the ``arcpy`` module, or *None* if it has not been initialised."""
+    """Return the ``arcpy`` module, or *None* if it has not been initialized."""
     return _arcpy
 
 

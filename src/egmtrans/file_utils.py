@@ -41,7 +41,7 @@ class IOPaths:
     """Resolved input/output locations for one EGMTrans run.
 
     Attributes:
-        input_path: The normalised input file or folder.
+        input_path: The normalized input file or folder.
         output_path: When *mode* is ``'file'`` this is the full path of the file
             to write (already joined with the input's basename if the caller
             supplied a folder).  When *mode* is ``'folder'`` it is the folder.
@@ -204,7 +204,7 @@ def ensure_writable(path: str) -> None:
         return
 
     mode = stat.S_IMODE(os.stat(path).st_mode)
-    if mode & stat.S_IWUSR:  # S_IWUSR == S_IWRITE (0o200); the only bit Windows honours
+    if mode & stat.S_IWUSR:  # S_IWUSR == S_IWRITE (0o200); the only bit Windows honors
         return
     try:
         os.chmod(path, mode | stat.S_IWUSR)
@@ -255,6 +255,29 @@ def copy_folder_structure(input_folder: str, output_folder: str) -> None:
             ensure_writable(destination)
 
 
+def find_dems(folder: str) -> list[str]:
+    """Every DEM under *folder*, in a sorted walk so a run is the same on every OS.
+
+    Files with a supported extension that are not DEMs (masks, orthos,
+    TanDEM-X auxiliary layers) are logged and left out.
+    """
+    logger = _state.get_logger()
+    found = []
+    for root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for name in sorted(files):
+            if not name.lower().endswith(SUPPORTED_EXTENSIONS):
+                continue
+            path = os.path.join(root, name)
+            if is_valid_dem(path):
+                found.append(path)
+            else:
+                # Not a DEM (mask, ortho, TanDEM-X auxiliary). Skip it rather
+                # than aborting the batch; the plain copy stays in the output.
+                logger.info(f"Skipping {name} as it's not a DEM.")
+    return found
+
+
 def is_valid_filename(filename: str) -> bool:
     """Validate a filename against system and application constraints."""
     return (
@@ -270,9 +293,12 @@ def is_valid_dem(input_file: str) -> bool:
 
     Rejects orthophotos and mask files by name (``INVALID_FILENAME_SUBSTRINGS``)
     and TanDEM-X/DGED auxiliary layers (AMP, EDM, HEM, WBM, ...) whose code
-    appears as a whole token in the name.  For GeoTIFF files, also verifies the
-    file can be opened by GDAL, has exactly one band, and stores heights: a
-    Byte or UInt16 band is a mask or amplitude layer whatever it is called.
+    appears as a whole token in the name; the name is the only thing that
+    tells a Height Error Map from the DEM beside it, since both are single
+    Float32 bands with the same georeferencing.  Then opens the file with GDAL
+    (DTED included) and requires exactly one band that stores heights (a Byte
+    or UInt16 band is a mask or amplitude layer whatever it is called) and a
+    geotransform, so the tile can be placed against its neighbors.
     """
     filename = os.path.basename(input_file)
     lower_filename = filename.lower()
@@ -281,14 +307,15 @@ def is_valid_dem(input_file: str) -> bool:
         return False
     if _AUXILIARY_LAYER_TOKEN.search(os.path.splitext(filename)[0]):
         return False
-    if lower_filename.endswith(('.tif', '.tiff')):
-        try:
-            with gdal.Open(input_file, gdal.GA_ReadOnly) as ds:
-                if ds.RasterCount > 1:
-                    return False
-                if ds.GetRasterBand(1).DataType not in ELEVATION_DATA_TYPES:
-                    return False
-        except Exception:
-            return False
+    try:
+        with gdal.Open(input_file, gdal.GA_ReadOnly) as ds:
+            if ds.RasterCount != 1:
+                return False
+            if ds.GetRasterBand(1).DataType not in ELEVATION_DATA_TYPES:
+                return False
+            if ds.GetGeoTransform(can_return_null=True) is None:
+                return False
+    except Exception:
+        return False
 
     return True

@@ -79,7 +79,7 @@ def normalize_datum(value: str) -> str:
     and EGM2008) and let a typo through to a ``KeyError`` deep in the transform.
 
     Raises:
-        ValueError: If *value* is not a recognised datum.
+        ValueError: If *value* is not a recognized datum.
     """
     key = re.sub(r'[\s_-]', '', str(value)).upper()
     if key not in DATUM_ALIASES:

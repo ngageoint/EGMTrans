@@ -4,8 +4,8 @@
 - Processes either individual files or entire directories
 - Applies scale factors and offsets automatically when needed
 - Outputs Cloud Optimized GeoTIFF (COG) format for non-DTED results
-- Preserves ocean and flat areas during transformation with customizable patch size
-- Creates optional mask files of ocean and other flat regions for further analysis
+- Keeps the ocean at 0 and every flat area (a lake, a reservoir, a hydro-flattened river reach) at one level, across the tiles of a batch run, with a customizable patch size and containment test
+- Creates optional mask files of the ocean and the water bodies for quality control
 - Utilizes parallel processing for improved performance on multi-core systems
 - Supports NGA's most widely used coordinate reference systems, including geographic, UTM and polar stereographic projections
 - The EGMTrans Explorer in ArcGIS and QGIS formats permits visualization and comparison of the geoids with each other and elevation datasets</idAbs><idCredit>National Geospatial-Intelligence Agency (NGA)

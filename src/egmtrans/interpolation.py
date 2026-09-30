@@ -2,7 +2,7 @@
 
 Each public function accepts a dictionary of source points (``x``, ``y``, ``z``
 arrays from the clipped datum grid) and 2-D meshgrid arrays (``xx``, ``yy``)
-representing the output raster pixel centres.  Data is processed in chunks for
+representing the output raster pixel centers.  Data is processed in chunks for
 memory efficiency and, where possible, accelerated by Numba JIT compilation.
 """
 
@@ -139,7 +139,7 @@ def bilinear_interpolation(points: dict[str, np.ndarray], xx: np.ndarray, yy: np
     2. If regular, builds a lookup grid and uses Numba-accelerated bilinear
        interpolation (:func:`_bilinear_interpolate_numba`).
     3. If irregular, falls back to SciPy Delaunay triangulation with
-       nearest-neighbour fill for NaN gaps.
+       nearest-neighbor fill for NaN gaps.
 
     Data is processed in row-chunks whose size is adapted to the estimated
     memory footprint (smaller chunks for datasets > 1 GB).
