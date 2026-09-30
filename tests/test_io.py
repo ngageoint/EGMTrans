@@ -8,9 +8,25 @@ from osgeo import gdal, osr
 from egmtrans.io import (
     apply_scale_factor,
     restore_nodata,
+    round_half_away,
     write_array_to_geotiff,
     write_points_to_geojson,
 )
+
+
+class TestRoundHalfAway:
+    def test_matches_gdal_int16_write(self):
+        """The explicit rounding must agree with what GDAL does on a band write,
+        including halves, which GDAL rounds away from zero."""
+        values = np.array([[0.5, 1.5, 2.5, -0.5, -1.5, 0.49999, 173.5, 173.49999, -7.0, 12.0]])
+        ds = gdal.GetDriverByName("MEM").Create("", values.shape[1], 1, 1, gdal.GDT_Int16)
+        ds.GetRasterBand(1).WriteArray(values)
+        stored = ds.GetRasterBand(1).ReadAsArray()
+        np.testing.assert_array_equal(round_half_away(values), stored)
+
+    def test_nan_passes_through(self):
+        out = round_half_away(np.array([np.nan, 2.4]))
+        assert np.isnan(out[0]) and out[1] == 2.0
 
 
 class TestWriteArrayToGeotiff:

@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from egmtrans import cli
+from egmtrans import batch, cli
 from egmtrans.cli import datum_arg, delete_output_directory, process_file, str2bool
 
 
@@ -69,15 +69,23 @@ class TestDatumArg:
 
 @pytest.fixture
 def stub_pipeline(monkeypatch):
-    """Run main() without touching GDAL or the geoid grids."""
+    """Run main() without the transform or the geoid grids.
+
+    A batch of one DEM needs no first pass, so ``analyze_tile`` must not run.
+    """
     calls = []
 
     def fake_process_file(*args, **kwargs):
         calls.append(args)
         return True
 
+    def no_analysis(*args, **kwargs):
+        raise AssertionError("pass 1 ran for a batch that needs no merge")
+
     monkeypatch.setattr(cli, "ensure_grids", lambda **kw: [])
+    monkeypatch.setattr(cli, "verify_grids", lambda *a: None)
     monkeypatch.setattr(cli, "process_file", fake_process_file)
+    monkeypatch.setattr(batch, "analyze_tile", no_analysis)
     return calls
 
 
@@ -292,6 +300,102 @@ class TestMainYes:
             monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
             "-s", "EGM2008", "-t", "EGM96",
         ) == 2
+
+
+class TestDtedRequiresBilinear:
+    """DTED tiles are edge-matched: only bilinear gives the same correction at a
+    shared post whatever the tile extent, and any other algorithm moves posts
+    by 1 m after rounding to whole meters."""
+
+    @pytest.fixture
+    def no_transform(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(cli, "verify_grids", lambda *a: None)
+        monkeypatch.setattr(cli, "transform_vertical_datum", lambda *a, **k: calls.append((a, k)))
+        return calls
+
+    @pytest.mark.parametrize("algorithm", ["spline", "delaunay", "proj"])
+    def test_dted_output_rejects_other_algorithms(self, tmp_dir, no_transform, log_lines, algorithm):
+        import numpy as np
+
+        from tests.conftest import write_dted
+
+        src = write_dted(os.path.join(tmp_dir, "n03e008.dt0"), np.full((121, 121), 40, dtype=np.int16), 8, 3)
+        out = os.path.join(tmp_dir, "out.dt0")
+        assert process_file(src, out, "EGM2008", "EGM96", True, False, 16, algorithm) is False
+        assert no_transform == []
+        assert any("DTED output requires the bilinear algorithm" in line for line in log_lines)
+
+    def test_geotiff_output_still_accepts_spline(self, synthetic_geotiff, tmp_dir, no_transform):
+        out = os.path.join(tmp_dir, "out.tif")
+        assert process_file(synthetic_geotiff, out, "EGM2008", "EGM96", True, False, 16, "spline") is True
+        assert no_transform[0][0][7] == "spline"
+
+    def test_switch_downgrades_to_warning(self, tmp_dir, no_transform, log_lines, monkeypatch):
+        import numpy as np
+
+        from tests.conftest import write_dted
+
+        monkeypatch.setattr(cli, "DTED_REQUIRES_BILINEAR", False)
+        src = write_dted(os.path.join(tmp_dir, "n03e008.dt0"), np.full((121, 121), 40, dtype=np.int16), 8, 3)
+        out = os.path.join(tmp_dir, "out.dt0")
+        assert process_file(src, out, "EGM96", "EGM2008", True, False, 16, "spline") is True
+        assert len(no_transform) == 1
+        assert any("DTED output requires the bilinear algorithm" in line for line in log_lines)
+
+    def test_tile_levels_reach_transform(self, synthetic_geotiff, tmp_dir, no_transform):
+        from egmtrans.tiling import TileLevels
+
+        levels = TileLevels({2: 149.4}, {2: 25})
+        out = os.path.join(tmp_dir, "out.tif")
+        process_file(synthetic_geotiff, out, "EGM2008", "EGM96", True, False, 16, "bilinear", tile_levels=levels)
+        assert no_transform[0][1]["tile_levels"] is levels
+
+
+class TestBareFlags:
+    """A bare -a used to become True, pass the choices check and run the spline
+    branch; a bare -p became True, that is one post."""
+
+    @pytest.mark.parametrize("flag", ["-a", "-p"])
+    def test_bare_flag_is_a_usage_error(self, tmp_dir, stub_pipeline, monkeypatch, flag):
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        assert _run(
+            monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
+            "-s", "EGM96", "-t", "EGM2008", flag,
+        ) == 2
+        assert stub_pipeline == []
+
+
+class TestContainmentOption:
+    def test_out_of_range_is_a_usage_error(self, tmp_dir, stub_pipeline, monkeypatch):
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        assert _run(
+            monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
+            "-s", "EGM96", "-t", "EGM2008", "-c", "1.5",
+        ) == 2
+        assert stub_pipeline == []
+
+    def test_reaches_process_file(self, tmp_dir, monkeypatch):
+        seen = {}
+
+        def fake_process_file(*args, **kwargs):
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr(cli, "ensure_grids", lambda **kw: [])
+        monkeypatch.setattr(cli, "process_file", fake_process_file)
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        assert _run(
+            monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
+            "-s", "EGM2008", "-t", "EGM96", "-c", "0.5",
+        ) == 0
+        assert seen.get("min_containment") == 0.5
 
 
 class TestMainGridScope:

@@ -37,6 +37,9 @@ The project uses `ruff` with the rule set declared in `pyproject.toml`
 expected on new public functions. Logging goes through the per-module
 logger obtained from `egmtrans._state.get_logger()`, not `print`.
 
+Text is written in American English (meter, neighbor, labeled, analyze,
+center); `tests/test_spelling.py` fails on the common British spellings.
+
 ## Commit attribution
 
 If you use an AI assistant (Claude Code, Copilot, etc.) while working on a

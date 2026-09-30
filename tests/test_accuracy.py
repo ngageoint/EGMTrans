@@ -27,7 +27,7 @@ value at that coordinate — ``test_exact_node_matches_grid`` asserts that
 independently, which is what makes these pins verifiable rather than
 merely historical. Re-captured 2026-08-31 after fixing a half-pixel
 registration offset (query points were built at cell corners while the
-geoid source points were at cell centres); the previous pins were off by
+geoid source points were at cell centers); the previous pins were off by
 0.3 cm to 7.0 cm, largest at high-gradient locations.
 """
 
@@ -93,6 +93,13 @@ PINNED_VALUES: dict[tuple[float, float, str], dict[str, float]] = {
 }
 
 CONTROL_POINTS = list(PINNED_VALUES.keys())
+
+# The level of a 150 m lake off Mindanao (7.6-7.7 N, 126.5-126.6 E) transformed
+# from EGM2008 to EGM96 with flattening: 150 m minus the largest EGM96 - EGM2008
+# difference over the lake, since a flat patch takes the lowest of its
+# transformed values (the mean would give 155.035 m, half the 0.95 m range of
+# the correction higher). Captured 2026-09-30 with the bilinear algorithm.
+PINNED_LAKE_LEVEL_M = 154.5454
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -190,7 +197,7 @@ def test_exact_node_matches_grid(tmp_dir, lat, lon, label, datum):
     coincides with a post of the 1-arc-minute geoid grid, and bilinear
     interpolation there must reproduce the stored value exactly. This pins the
     *registration* of the resampling rather than a historical output: a
-    half-pixel offset between the geoid source points (cell centres) and the
+    half-pixel offset between the geoid source points (cell centers) and the
     DEM query points shows up here immediately, whereas a pinned value only
     records whatever the code did on the day it was captured.
     """
@@ -245,6 +252,55 @@ def test_high_gradient_deltas_have_expected_sign(tmp_dir):
         assert lo < delta < hi, (
             f"{label}: delta {delta:+.3f} m outside expected [{lo}, {hi}]"
         )
+
+
+@requires_grids
+def test_pinned_lake_level_uses_patch_minimum(tmp_dir):
+    """A flat patch comes out at the minimum of its transformed values.
+
+    The written value (rounded to 1 cm) must agree with ``150 - max(delta)``
+    over the lake computed independently from ``create_datum_array``, and that
+    expectation must match the pinned constant, so a change to either the
+    level rule or the interpolation shows up here.
+    """
+    from osgeo import gdal, osr
+
+    rows = cols = 40
+    i, j = np.mgrid[0:rows, 0:cols]
+    dem = (200.0 + i + 0.37 * j).astype(np.float32)  # terrain above the lake: a basin
+    dem[:, :10] = 0.0
+    dem[20:30, 20:30] = 150.0
+
+    src = os.path.join(tmp_dir, "lake.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(src, cols, rows, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform((126.30, 0.01, 0.0, 7.90, 0.0, -0.01))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.GetRasterBand(1).WriteArray(dem)
+    ds.GetRasterBand(1).SetNoDataValue(-9999.0)
+    ds = None
+
+    out = os.path.join(tmp_dir, "lake_egm96.tif")
+    transform_vertical_datum(src, out, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False)
+    out_ds = gdal.Open(out)
+    lake = out_ds.GetRasterBand(1).ReadAsArray()[20:30, 20:30].astype(np.float64)
+    out_ds = None
+    assert np.unique(lake).size == 1
+    written = float(lake[0, 0])
+
+    egm96 = create_datum_array(src, "EGM96", "bilinear", tmp_dir, tmp_dir)
+    egm2008 = create_datum_array(src, "EGM2008", "bilinear", tmp_dir, tmp_dir)
+    delta = (egm96 - egm2008)[20:30, 20:30].astype(np.float64)
+    expected = 150.0 - delta.max()
+
+    assert abs(expected - PINNED_LAKE_LEVEL_M) < PINNED_TOL_M, (
+        f"lake level expectation {expected:.4f} m drifted from the pinned {PINNED_LAKE_LEVEL_M} m"
+    )
+    assert abs(written - expected) <= 0.005 + 1e-9, (
+        f"written {written} m is not the cm-rounded minimum {expected:.4f} m"
+    )
+    assert written < 150.0 - delta.mean(), "the lake sits at its mean level, not its minimum"
 
 
 @requires_grids

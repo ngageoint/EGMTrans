@@ -107,6 +107,33 @@ class TestAuxiliaryLayers:
         assert is_valid_dem(_make_raster(tmp_dir, "scene_amplitude.tif", gdal.GDT_UInt16)) is False
 
 
+class TestHeaderCheck:
+    """Every candidate, DTED included, is opened with GDAL and must carry a geotransform."""
+
+    def test_geotiff_without_georeferencing_rejected(self, tmp_dir):
+        from osgeo import gdal
+
+        path = os.path.join(tmp_dir, "plain.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 4, 4, 1, gdal.GDT_Float32)
+        ds.FlushCache()
+        ds = None
+        assert is_valid_dem(path) is False
+
+    def test_unreadable_dted_rejected(self, tmp_dir):
+        path = os.path.join(tmp_dir, "n03e008.dt2")
+        with open(path, "wb") as f:
+            f.write(b"not a DTED file")
+        assert is_valid_dem(path) is False
+
+    def test_real_dted_accepted(self, tmp_dir):
+        import numpy as np
+
+        from tests.conftest import write_dted
+
+        path = write_dted(os.path.join(tmp_dir, "n03e008.dt0"), np.full((121, 121), 40, dtype=np.int16), 8, 3)
+        assert is_valid_dem(path) is True
+
+
 class TestCopyFolderStructure:
     def test_copies_files_and_dirs(self, tmp_dir):
         src = os.path.join(tmp_dir, "src_folder")

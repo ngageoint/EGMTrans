@@ -53,6 +53,18 @@ def apply_scale_factor(
     return scaled_file
 
 
+def round_half_away(array: np.ndarray) -> np.ndarray:
+    """Round to the nearest whole number, halves away from zero, as GDAL does
+    when it writes a float array into an Int16 band.
+
+    Rounding in EGMTrans rather than leaving it to the band write makes the
+    DTED value explicit wherever it is compared with a water level (the
+    containment count, the boundary report).  NaN passes through.
+    """
+    array = np.asarray(array, dtype=np.float64)
+    return np.where(array >= 0, np.floor(array + 0.5), np.ceil(array - 0.5))
+
+
 def restore_nodata(array: np.ndarray, nodata: float) -> np.ndarray:
     """Replace NaN with *nodata* before writing to an integer band.
 
@@ -147,7 +159,7 @@ def update_dted_header(output_file: str, tgt_datum: str, abs_horiz_accuracy: int
     - **Accuracy fields** (ACC record, offsets 731-746): four 4-byte fields
       for absolute/relative horizontal/vertical accuracy.  Existing numeric
       values are preserved.  Non-numeric values (e.g. ``'NA  '``) are
-      standardised to right-justified ``'  NA'``.  For absolute horizontal
+      standardized to right-justified ``'  NA'``.  For absolute horizontal
       accuracy, the *abs_horiz_accuracy* parameter is used as a fallback if
       the existing value is non-numeric.
 
