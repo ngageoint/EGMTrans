@@ -19,7 +19,7 @@ ENV EGMTRANS_BASE_PATH=/opt/egmtrans \
 
 # GDAL comes from conda-forge: pip wheels for GDAL are not reliable.
 RUN mamba create -y -n egmtrans -c conda-forge \
-        python=3.11 "gdal>=3.11" "numpy>=1.22" "scipy>=1.7" "numba>=0.60" "tqdm>=4.60" \
+        python=3.14 "gdal>=3.13" "numpy>=2.0" "scipy>=1.15" "numba>=0.66" "tqdm>=4.60" pyarrow lxml \
         pip setuptools \
     && mamba clean -afy
 ENV PATH=/opt/conda/envs/egmtrans/bin:$PATH

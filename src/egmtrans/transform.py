@@ -26,6 +26,8 @@ from egmtrans import _state
 from egmtrans.arcpy_compat import batch_project_points_arcpy
 from egmtrans.config import BASE_PATH, DATUM_MAPPING, DTED_EXTENSIONS, DTED_NODATA
 from egmtrans.crs import create_compound_srs, get_proj4
+from egmtrans.dted.header import read_header
+from egmtrans.dted.writer import DtedMetadataSource
 from egmtrans.file_utils import ELEVATION_DATA_TYPES, copy_as_writable
 from egmtrans.flattening import (
     DEFAULT_CONTAINMENT,
@@ -694,8 +696,14 @@ def write_output(
     tgt_datum: str,
     abs_horiz_accuracy: int | None,
     temp_dir: str,
+    dted_metadata: DtedMetadataSource | None = None,
 ) -> None:
-    """Write the transformed heights: an updated DTED copy, or a COG with a compound CRS."""
+    """Write the transformed heights: an updated DTED copy, or a COG with a compound CRS.
+
+    *dted_metadata* (the index and profile named for the run) supplies the
+    DTED header fields of the output's cell; a cell the index does not know
+    fails the write.
+    """
     logger = _state.get_logger()
 
     if output_file.lower().endswith(DTED_EXTENSIONS):
@@ -716,7 +724,20 @@ def write_output(
             band.FlushCache()
             band = None
 
-        update_dted_header(output_file, tgt_datum, abs_horiz_accuracy)
+        try:
+            metadata = None
+            if dted_metadata is not None and not dted_metadata.empty:
+                cell_id = read_header(output_file).cell_id
+                if cell_id is None:
+                    raise ValueError('The DTED header has no readable origin, so its index row cannot be found')
+                metadata = dted_metadata.for_cell(cell_id)
+            update_dted_header(output_file, tgt_datum, abs_horiz_accuracy, metadata=metadata)
+        except Exception:
+            # The records already hold the target datum's heights under the
+            # input's header: a mislabeled file must not survive the failure.
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            raise
         return
 
     logger.info('Setting the compound CRS, optimizing compression, and saving as Cloud Optimized GeoTIFF...')
@@ -820,6 +841,7 @@ def transform_vertical_datum(
     save_log: bool = True,
     tile_levels: TileLevels | None = None,
     min_containment: float = DEFAULT_CONTAINMENT,
+    dted_metadata: DtedMetadataSource | None = None,
 ) -> None:
     """Transform the vertical datum of a GeoTIFF or DTED elevation model.
 
@@ -852,6 +874,9 @@ def transform_vertical_datum(
             None when the file is transformed on its own.
         min_containment: Share of a flat patch's boundary that must lie above
             it for the patch to count as a water body; 0 keeps every patch.
+        dted_metadata: The DTED metadata index and product profile named for
+            the run, for the header of a DTED output; None keeps the input's
+            header apart from the fields the transform must change.
 
     Raises:
         ValueError: If the input data type is unsupported or CRS is missing.
@@ -905,7 +930,7 @@ def transform_vertical_datum(
                 create_flat_mask(labeled, mask_file, loaded.geotransform, loaded.projection)
                 logger.info(f'Created flat mask: {mask_file}')
 
-        write_output(loaded, warp_array, output_file, tgt_datum, abs_horiz_accuracy, temp_dir)
+        write_output(loaded, warp_array, output_file, tgt_datum, abs_horiz_accuracy, temp_dir, dted_metadata)
 
         elapsed_time = time.time() - start_time
         if elapsed_time < 60:

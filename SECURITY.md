@@ -54,9 +54,18 @@ sha256sum datums/us_nga_egm08_1.tif
   core package (`src/egmtrans/`). The tool uses only the standard library
   (`urllib`, `hashlib`) and GDAL's Python bindings to read and write
   raster files.
-- **No custom binary parsers.** GeoTIFF reads are delegated to GDAL. DTED
-  header writes use hardcoded byte offsets from STANAG 3809 and only write
-  numeric or `"  NA"` values into fixed-width fields.
+- **One fixed-width text codec, no binary parsing of user data beyond it.**
+  Raster data is read and written by GDAL. The 3,428-byte DTED header (three
+  ASCII records of fixed length and layout, STANAG 3809 / MIL-PRF-89020B) is
+  read and written by `src/egmtrans/dted/header.py` from a field table in
+  `schema.py`: every read is a bounded slice, every write is a fixed-length
+  field checked for length and printable ASCII, and the encoder refuses to
+  overwrite a file that does not carry a DTED data record after its header.
+  The record checker (`validate.py`) reads the elevation records with numpy
+  slices of known length. The optional index and profile are read with GDAL
+  (GeoPackage), `pyarrow` (GeoParquet) and `tomllib` (TOML); XML sidecars read
+  during an index build are refused when they declare a DOCTYPE or entities,
+  and are parsed with entity resolution and network access off.
 - **No credentials, API keys, or tokens** of any kind, in source or at
   runtime.
 - **No telemetry.** The tool does not send usage data anywhere.
@@ -67,7 +76,8 @@ sha256sum datums/us_nga_egm08_1.tif
 
 Runtime dependencies are pinned to permissive licenses only: `numpy`
 (BSD), `scipy` (BSD), `GDAL` (MIT/X), `numba` (BSD, optional), `tqdm`
-(MPL-2.0 / MIT). See `pyproject.toml` for the version floors.
+(MPL-2.0 / MIT); the optional `index` extra adds `pyarrow` (Apache-2.0) and
+`lxml` (BSD). See `pyproject.toml` for the version floors.
 
 ## Reporting a vulnerability
 

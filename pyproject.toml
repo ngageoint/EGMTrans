@@ -8,7 +8,7 @@ version = "1.6.0"
 description = "Vertical datum transformation tool for DEMs between WGS84, EGM96, and EGM2008"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 authors = [{ name = "Eric Robeck" }]
 keywords = ["geospatial", "vertical-datum", "EGM96", "EGM2008", "DEM", "DTED", "GeoTIFF"]
 classifiers = [
@@ -17,11 +17,14 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: GIS",
 ]
-dependencies = ["numpy>=1.22", "scipy>=1.7", "GDAL>=3.11", "numba>=0.60", "tqdm>=4.60"]
+dependencies = ["numpy>=2.0", "scipy>=1.15", "GDAL>=3.11", "numba>=0.61", "tqdm>=4.60"]
 
 [project.optional-dependencies]
-core = ["numpy>=1.22", "scipy>=1.7", "GDAL>=3.11"]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4"]
+core = ["numpy>=2.0", "scipy>=1.15", "GDAL>=3.11"]
+# GeoParquet indexes (pyarrow) and XPath harvest from XML sidecars (lxml);
+# GeoPackage indexes need only GDAL.
+index = ["pyarrow>=15", "lxml>=5"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4", "pyarrow>=15", "lxml>=5"]
 
 [project.scripts]
 egmtrans = "egmtrans.cli:main"
@@ -30,7 +33,7 @@ egmtrans = "egmtrans.cli:main"
 where = ["src"]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 120
 src = ["src"]
 

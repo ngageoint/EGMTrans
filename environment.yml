@@ -1,14 +1,16 @@
 name: egmtrans
 channels:
   - conda-forge
-  - defaults
 dependencies:
-  - python=3.11
-  - gdal>=3.11
-  - numpy
-  - scipy
-  - numba
+  - python=3.14
+  - gdal>=3.13
+  - libgdal-arrow-parquet
+  - numpy>=2.0
+  - scipy>=1.15
+  - numba>=0.66
   - tqdm
+  - pyarrow
+  - lxml
   - pip
   - pip:
     - pytest>=7.0
@@ -17,3 +19,5 @@ dependencies:
 
 # Note: optional module 'arcpy' is not available via Conda.
 # It will be available when running this as an ArcGIS Pro toolbox.
+# pyarrow and lxml serve the optional 'index' extra (GeoParquet and XPath
+# harvest); libgdal-arrow-parquet gives OGR its Parquet driver.

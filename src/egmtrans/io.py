@@ -16,6 +16,9 @@ from osgeo import gdal
 
 from egmtrans import _state
 from egmtrans.config import DATUM_MAPPING
+from egmtrans.dted.header import read_header, write_header
+from egmtrans.dted.validate import validate_header
+from egmtrans.dted.writer import DerivedFields, DtedMetadata, assemble_header, cell_of_header, describe_changes
 
 
 def apply_scale_factor(
@@ -148,92 +151,57 @@ def write_points_to_geojson(points: dict[str, np.ndarray], datum: str, output_di
     logging.info(f'{datum} grid points written to {output_file}.')
 
 
-def update_dted_header(output_file: str, tgt_datum: str, abs_horiz_accuracy: int | None = None) -> None:
-    """Update DTED file header with new vertical datum and accuracy information.
+def update_dted_header(
+    output_file: str,
+    tgt_datum: str,
+    abs_horiz_accuracy: int | None = None,
+    *,
+    metadata: DtedMetadata | None = None,
+) -> None:
+    """Rewrite the header of a DTED file for its new vertical datum.
 
-    Opens the file in binary mode and overwrites specific bytes per
-    **STANAG 3809** (MIL-PRF-89020B):
+    The file's own header is the base. The cell's row in the metadata index
+    and the product profile (*metadata*, when the run names them) override
+    it field by field, and the fields the geometry and the target datum
+    determine are written last; see :func:`egmtrans.dted.writer.assemble_header`
+    for the precedence. Without index or profile the header changes only in:
 
-    - **Vertical datum** (DSI record, offset 221): set to the 3-char DTED
-      code from ``DATUM_MAPPING`` (e.g. ``E96``).
-    - **Accuracy fields** (ACC record, offsets 731-746): four 4-byte fields
-      for absolute/relative horizontal/vertical accuracy.  Existing numeric
-      values are preserved.  Non-numeric values (e.g. ``'NA  '``) are
-      standardized to right-justified ``'  NA'``.  For absolute horizontal
-      accuracy, the *abs_horiz_accuracy* parameter is used as a fallback if
-      the existing value is non-numeric.
-
-    Args:
-        output_file: Path to the DTED file to update.
-        tgt_datum: Target vertical datum (``'EGM96'`` or ``'EGM2008'``).
-        abs_horiz_accuracy: Fallback horizontal accuracy (0-9999 m) applied
-            only when the existing field is non-numeric.
+    - the **vertical datum** (DSI 142-144): the code of *tgt_datum*,
+      ``E96`` or ``E08``;
+    - the **accuracies** (ACC 4-19 and UHL 29-32): a value that is neither
+      0000-9999 nor NA becomes NA, and NA is left justified (``NA  ``) as
+      MIL-PRF-89020B 3.13.5 requires; the UHL copy follows the ACC value;
+    - **absolute horizontal accuracy**: *abs_horiz_accuracy* fills it only
+      when it is NA;
+    - bytes that are not printable (the NULs some writers leave) become blanks.
 
     Raises:
-        OSError: If the file cannot be opened or written to.
-        ValueError: If the target datum is not supported.
+        OSError: If the file cannot be read or written.
+        ValueError: If the target datum has no DTED code, or the header
+            cannot be completed (:class:`~egmtrans.dted.writer.HeaderAssemblyError`).
     """
     logger = _state.get_logger()
+    dted_code = DATUM_MAPPING.get(tgt_datum, {}).get('dted_code')
+    if not dted_code:
+        raise ValueError(f'Unsupported target datum for DTED: {tgt_datum}')
 
-    DSI_POS = 80
-    ACC_POS = 728
-    VERT_DATUM_POS = DSI_POS + 141
-
-    accuracy_fields = {
-        'Abs. Horizontal Accuracy': {'pos': ACC_POS + 3, 'len': 4},
-        'Abs. Vertical Accuracy':   {'pos': ACC_POS + 7, 'len': 4},
-        'Rel. Horizontal Accuracy': {'pos': ACC_POS + 11, 'len': 4},
-        'Rel. Vertical Accuracy':   {'pos': ACC_POS + 15, 'len': 4},
-    }
-
+    base = read_header(output_file)
+    cell = cell_of_header(base, os.path.splitext(output_file)[1])
+    header, sources = assemble_header(
+        cell, base=base, metadata=metadata, derived=DerivedFields(vertical_datum=dted_code),
+        cli_abs_horiz_accuracy=abs_horiz_accuracy,
+    )
     try:
-        with open(output_file, 'r+b') as f:
-            dted_code = DATUM_MAPPING.get(tgt_datum, {}).get('dted_code')
-            if dted_code:
-                f.seek(VERT_DATUM_POS)
-                original_datum = f.read(3).decode('ascii')
-                f.seek(VERT_DATUM_POS)
-                f.write(dted_code.encode('ascii'))
-                logger.info('Changes to vertical datum and accuracy fields in DTED header:')
-                log_msg = f"    Vertical Datum Code: '{original_datum}' -> '{dted_code}'"
-                if original_datum == dted_code:
-                    log_msg += " (no change)"
-                logger.info(log_msg)
-            else:
-                logger.warning(f"No DTED code found for datum {tgt_datum}. Vertical datum in header not updated.")
-
-            for name, details in accuracy_fields.items():
-                f.seek(details['pos'])
-                original_value = f.read(details['len']).decode('ascii')
-                new_value = original_value
-
-                is_numeric = original_value.strip().isdigit()
-
-                if not is_numeric:
-                    if name == 'Abs. Horizontal Accuracy':
-                        if abs_horiz_accuracy is not None:
-                            if 0 <= abs_horiz_accuracy <= 9999:
-                                new_value = str(abs_horiz_accuracy).zfill(4)
-                            else:
-                                logger.warning(
-                                    "Absolute Horizontal Accuracy must be between 0 and 9999. Value not updated."
-                                )
-                        else:
-                            new_value = '  NA'
-                    else:
-                        new_value = '  NA'
-
-                if new_value != original_value:
-                    f.seek(details['pos'])
-                    f.write(new_value.encode('ascii'))
-
-                log_msg = f"    {name}: '{original_value}' -> '{new_value}'"
-                if original_value == new_value:
-                    log_msg += " (no change)"
-                logger.info(log_msg)
-
+        write_header(output_file, header)
     except OSError as e:
-        logger.error(f"Failed to write to DTED header for {output_file}: {e}")
+        logger.error(f'Failed to write the DTED header of {output_file}: {e}')
         raise
-    except KeyError as exc:
-        raise ValueError(f"Unsupported target datum for DTED: {tgt_datum}") from exc
+
+    logger.info(f'DTED header of cell {cell.cell_id} rewritten; fields that changed:')
+    for line in describe_changes(base, header, sources):
+        logger.info(line)
+    # Problems the input header had and nothing corrected are carried over,
+    # as they always were; they are reported so the producer can fix them.
+    for issue in validate_header(header, extension=os.path.splitext(output_file)[1]):
+        if issue.severity in ('error', 'warning'):
+            logger.warning(f'DTED header: {issue}')

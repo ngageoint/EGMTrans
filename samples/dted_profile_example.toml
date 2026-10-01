@@ -1,0 +1,53 @@
+# EGMTrans DTED product profile.
+#
+# [product] holds the header values that are the same for every cell of a
+# product. A cell's row in the metadata index (egmtrans dted-index) overrides
+# any of them; a NULL accuracy in the index means NA. Keys are the index
+# column names; see "DTED Metadata Index and Profile" in the README.
+#
+# The values below follow a TDF-DTED2 production header. The free text is an
+# example only.
+
+schema = 1
+
+[product]
+dted_level = 2
+security_code = "U"
+security_handling = "LIMITED DISTRIBUTION"
+unique_ref_uhl = "TDF"
+data_edition = 1
+match_merge_version = "A"
+producer_code = "USNGA"
+digitizing_system = "TandemXTDF"
+product_spec = "PRF89020B"
+product_spec_amend = "00"
+product_spec_date = "2000-05"
+# Most products set the compilation date per cell in the index; this is the
+# fallback for cells whose row leaves it NULL.
+compilation_date = "2024-07"
+abs_horiz_acc = 14
+abs_vert_acc = 10
+rel_horiz_acc = "NA"
+rel_vert_acc = 10
+dsi_free_text = "Example free text comment: questions about this product go to the producer named in the DSI."
+
+# How "egmtrans dted-index build --from-rasters" fills per-cell columns from
+# the source rasters. A mapping is a tag or XPath, or a table with a regular
+# expression whose first group is the value.
+
+[harvest.tags.fields]
+source_date = "TIFFTAG_DATETIME"
+source_version = { tag = "TIFFTAG_SOFTWARE", pattern = "DEMES ([0-9A-Za-z.]+)" }
+
+[harvest.xml]
+# Relative to the raster's folder; {stem}, {name}, {cell} and {dir} are
+# replaced, and the pattern may be a glob.
+sidecar = "{stem}.xml"
+
+[harvest.xml.namespaces]
+gmd = "http://www.isotc211.org/2005/gmd"
+gco = "http://www.isotc211.org/2005/gco"
+
+[harvest.xml.fields]
+source_id = "//gmd:fileIdentifier/gco:CharacterString"
+compilation_date = "//gmd:identificationInfo//gmd:CI_Citation/gmd:date/gmd:CI_Date/gmd:date/gco:Date"

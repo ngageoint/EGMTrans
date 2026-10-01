@@ -6,8 +6,9 @@ requests.
 
 ## Development setup
 
-EGMTrans targets Python 3.11+. GDAL is the one dependency that is painful
-to install via pip on Windows; conda is the path of least resistance.
+EGMTrans targets Python 3.13+ (ArcGIS Pro 3.7 ships 3.13; the development
+environment is 3.14). GDAL is the one dependency that is painful to install
+via pip on Windows; conda is the path of least resistance.
 
 ```bash
 conda env create -f environment.yml
@@ -17,7 +18,8 @@ python download_grids.py
 ```
 
 The `[dev]` extra installs `pytest`, `pytest-cov`, and `ruff` in addition
-to the runtime dependencies.
+to the runtime dependencies, plus `pyarrow` and `lxml` (the `[index]` extra)
+so the GeoParquet and XML harvest tests run rather than skip.
 
 ## Running tests and lint
 
@@ -27,7 +29,7 @@ pytest tests/test_accuracy.py  # regression tests against known values
 ruff check src tests           # style and lint
 ```
 
-CI runs the same commands on Python 3.11 and 3.12 on Ubuntu — please make
+CI runs the same commands on Python 3.13 and 3.14 on Ubuntu; please make
 sure both are green locally before opening a PR.
 
 ## Code style

@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from egmtrans import _state
 from egmtrans._version import __version__
 from egmtrans.config import DTED_EXTENSIONS
+from egmtrans.dted.header import read_header
+from egmtrans.dted.writer import DtedMetadataSource
 from egmtrans.file_utils import IOPaths, copy_folder_structure, find_dems, is_valid_dem
 from egmtrans.flattening import DEFAULT_CONTAINMENT
 from egmtrans.tiling import (
@@ -182,6 +184,7 @@ def run_batch(
     water_levels: str | None = None,
     export_water_levels: str | None = None,
     min_containment: float = DEFAULT_CONTAINMENT,
+    dted_metadata: DtedMetadataSource | None = None,
 ) -> BatchResult:
     """Transform every DEM of a run with water bodies levelled across tiles.
 
@@ -198,6 +201,10 @@ def run_batch(
     is then 1.  The report of water bodies that touch an edge with no
     neighbor in the run is logged after the merge, so it exists even if a
     later transform fails.
+
+    *dted_metadata* (the index and profile for DTED headers) is checked
+    against every DTED output's cell before anything is copied: a cell the
+    index does not hold ends the run.
 
     Raises:
         NonInteractiveError: If a prompt is needed, stdin is closed, and
@@ -258,6 +265,23 @@ def run_batch(
             f"millimeters: tiles transformed with it will not match bilinear tiles at shared posts, and a "
             f"water body's level may differ at a seam."
         )
+
+    if dted_metadata is not None and dted_metadata.index is not None and dted_outputs:
+        missing = []
+        for f in dted_outputs:
+            try:
+                cell = read_header(f).cell_id
+            except (OSError, ValueError):
+                cell = None
+            if cell is None or dted_metadata.index.get(cell) is None:
+                missing.append(f'{os.path.basename(f)} ({cell or "no readable origin"})')
+        if missing:
+            logger.error(
+                f"The DTED metadata index has no row for {len(missing)} of the {len(dted_outputs)} DTED output(s): "
+                f"{', '.join(missing[:5])}{', ...' if len(missing) > 5 else ''}.\nAborting transformation."
+            )
+            result.exit_code = 1
+            return result
 
     table = None
     if water_levels:
@@ -344,6 +368,7 @@ def run_batch(
                     abs_horiz_accuracy, save_log,
                     check_for_wrong_datum=False, arc_mode=arc_mode, assume_yes=True,
                     tile_levels=tile_levels, min_containment=min_containment,
+                    dted_metadata=dted_metadata,
                 )
             except cli.NonInteractiveError:
                 raise

@@ -23,6 +23,7 @@ from osgeo import gdal
 from egmtrans import _state
 from egmtrans.arcpy_compat import init_arcpy
 from egmtrans.batch import run_batch
+from egmtrans.cli_dted import SUBCOMMANDS
 from egmtrans.config import (
     DTED_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
@@ -33,6 +34,9 @@ from egmtrans.config import (
 )
 from egmtrans.crs import standardize_srs
 from egmtrans.download import ensure_grids
+from egmtrans.dted.header import read_header
+from egmtrans.dted.validate import count as count_issues
+from egmtrans.dted.writer import DtedMetadataSource
 from egmtrans.file_utils import (
     IOPaths,
     is_valid_dem,
@@ -192,7 +196,6 @@ def check_file_datum(
     # gdal.UseExceptions() is on, so a failed open raises rather than returning None.
     try:
         with gdal.Open(input_file, gdal.GA_ReadOnly) as input_ds:
-            metadata = input_ds.GetMetadata()
             projection = input_ds.GetProjection()
     except RuntimeError as e:
         logger.error(f'Failed to open input file {input_file}: {e}')
@@ -202,8 +205,14 @@ def check_file_datum(
     logger.debug(f"Input file's SRS: {src_srs}")
 
     if input_file.lower().endswith(DTED_EXTENSIONS):
-        file_datum = metadata.get('DTED_VerticalDatum')
-        file_datum = 'EGM96' if file_datum in ('E96', 'MSL') else 'EGM2008' if file_datum == 'E08' else None
+        # From the raw header: GDAL would answer from a .aux.xml sidecar if one
+        # is there, and a stale sidecar can say anything.
+        try:
+            code = read_header(input_file).stripped('dsi.vertical_datum')
+        except (OSError, ValueError) as e:
+            logger.error(f'Failed to read the DTED header of {input_file}: {e}')
+            return False
+        file_datum = 'EGM96' if code in ('E96', 'MSL') else 'EGM2008' if code == 'E08' else None
     else:
         file_datum = src_srs.GetAttrValue('VERT_CS')
     logger.info(f"Input file header's vertical datum: {file_datum}")
@@ -278,6 +287,7 @@ def process_file(
     assume_yes: bool = False,
     tile_levels: TileLevels | None = None,
     min_containment: float = DEFAULT_CONTAINMENT,
+    dted_metadata: DtedMetadataSource | None = None,
 ) -> bool:
     """Process a single file for vertical datum transformation.
 
@@ -310,6 +320,8 @@ def process_file(
         tile_levels: Water-body levels merged across the tiles of a batch run.
         min_containment: Share of a flat area's boundary that must lie above it
             for the area to count as a water body.
+        dted_metadata: The DTED metadata index and product profile for the
+            header of a DTED output (``--dted-index``, ``--dted-profile``).
 
     Returns:
         ``True`` if the file was transformed, ``False`` if the transformation
@@ -384,6 +396,7 @@ def process_file(
             input_file, output_file, source_datum, target_datum,
             flatten, create_mask, min_patch_size, algorithm,
             abs_horiz_accuracy, save_log, tile_levels=tile_levels, min_containment=min_containment,
+            dted_metadata=dted_metadata,
         )
     except Exception as e:
         logger.error(f"Transformation failed: {e}.")
@@ -401,8 +414,17 @@ def main() -> None:
     place.  Datum-mismatch confirmation is requested once and applied to all
     subsequent files.
     """
+    # The DTED tools are subcommands; the transform keeps its flag-only form.
+    if len(sys.argv) > 1 and sys.argv[1] in SUBCOMMANDS:
+        from egmtrans.cli_dted import main as dted_main
+
+        sys.exit(dted_main(sys.argv[1:]))
+
     parser = argparse.ArgumentParser(
-        description="Transform vertical datum between WGS 84 ellipsoid, EGM96, and EGM2008 for DTED and GeoTIFF files."
+        description="Transform vertical datum between WGS 84 ellipsoid, EGM96, and EGM2008 for DTED and GeoTIFF files.",
+        epilog="DTED header tools: 'egmtrans dted-header FILE...' reports and validates headers; "
+               "'egmtrans dted-index build|validate' builds and checks a metadata index. "
+               "Run either with --help for its options.",
     )
     parser.add_argument("-i", "--input", required=True, help="Input DEM file, or folder of DEMs (DTED or GeoTIFF)")
     parser.add_argument("-o", "--output", required=True, help="Output file, or folder for the transformed DEMs")
@@ -466,6 +488,15 @@ def main() -> None:
         help="Write the level of every water body that touches a tile edge, keyed by the edge crossing, "
              "for later runs over neighboring tiles.",
     )
+    parser.add_argument(
+        "--dted-index", metavar="FILE",
+        help="DTED metadata index (.gpkg or .parquet) whose row for the output cell fills the DTED header; "
+             "a cell the index does not hold fails. See 'egmtrans dted-index --help'.",
+    )
+    parser.add_argument(
+        "--dted-profile", metavar="FILE",
+        help="DTED product profile (TOML) of header constants; the index row overrides it field by field.",
+    )
 
     args = parser.parse_args()
 
@@ -480,6 +511,13 @@ def main() -> None:
             parser.error(f"--context folder does not exist: {folder}")
     if args.water_levels and not os.path.isfile(args.water_levels):
         parser.error(f"--water-levels file does not exist: {args.water_levels}")
+    for option, path in (("--dted-index", args.dted_index), ("--dted-profile", args.dted_profile)):
+        if path and not os.path.isfile(path):
+            parser.error(f"{option} file does not exist: {path}")
+    try:
+        dted_metadata = DtedMetadataSource.load(args.dted_index, args.dted_profile)
+    except (OSError, ValueError, RuntimeError) as e:
+        parser.error(str(e))
 
     try:
         prepare_output_target(paths)
@@ -489,6 +527,17 @@ def main() -> None:
 
     logger = setup_logger(paths.log_path if args.log_file else None, args.log_file, False)
 
+    if not dted_metadata.empty:
+        issues = dted_metadata.validate()
+        for issue in issues:
+            if issue.severity == 'error':
+                logger.error(str(issue))
+        if count_issues(issues, 'error'):
+            logger.error("The DTED metadata index is not valid; see 'egmtrans dted-index validate'.")
+            end_logger(save_log=args.log_file)
+            sys.exit(2)
+        logger.info(f"DTED header metadata: {dted_metadata.describe()}")
+
     args_list = list(vars(args).items())
     for i, (arg, value) in enumerate(args_list):
         if isinstance(value, str):
@@ -497,6 +546,7 @@ def main() -> None:
             logger.info(f"Argument - {arg}: {value}\n\n")
         else:
             logger.info(f"Argument - {arg}: {value}")
+    args.dted_metadata = dted_metadata
 
     try:
         # Only the grids this transform reads. The Explorer grids come from
@@ -547,7 +597,7 @@ def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) 
             paths.input_path, paths.output_path, args.source_datum, args.target_datum,
             args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
             args.abs_horiz_accuracy, args.log_file, assume_yes=args.yes,
-            min_containment=args.containment,
+            min_containment=args.containment, dted_metadata=getattr(args, 'dted_metadata', None),
         ) is False:
             exit_code = 1
     else:
@@ -557,6 +607,7 @@ def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) 
             args.abs_horiz_accuracy, args.log_file, assume_yes=args.yes,
             context_folders=args.context, water_levels=args.water_levels,
             export_water_levels=args.export_water_levels, min_containment=args.containment,
+            dted_metadata=getattr(args, 'dted_metadata', None),
         )
         exit_code = result.exit_code
 
