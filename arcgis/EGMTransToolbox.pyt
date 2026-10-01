@@ -37,7 +37,7 @@ class Toolbox:
         self.icon = "../img/icons/EGMTrans_32.png"
 
         # List of tool classes associated with this toolbox
-        self.tools = [Tool]
+        self.tools = [Tool, DtedHeaderReport]
 
 class Tool:
     def __init__(self):
@@ -164,6 +164,24 @@ class Tool:
         containment.value = 0.8
         params.append(containment)
 
+        dted_index = arcpy.Parameter(
+            displayName="DTED Metadata Index (GeoPackage or GeoParquet; fills the DTED header per cell)",
+            name="dted_index",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
+        dted_index.filter.list = ["gpkg", "parquet"]
+        params.append(dted_index)
+
+        dted_profile = arcpy.Parameter(
+            displayName="DTED Product Profile (TOML of header constants)",
+            name="dted_profile",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
+        dted_profile.filter.list = ["toml"]
+        params.append(dted_profile)
+
         output_layer = arcpy.Parameter(
             displayName="Output Raster Layer",
             name="output_layer",
@@ -221,6 +239,8 @@ class Tool:
         context_folder = parameters[10].valueAsText
         water_levels = parameters[11].valueAsText
         containment = parameters[12].value if parameters[12].value is not None else 0.8
+        dted_index = parameters[13].valueAsText
+        dted_profile = parameters[14].valueAsText
 
         # Resolve input/output and derive the log path with the same helper the
         # CLI uses, so the two entry points cannot disagree about file vs. folder.
@@ -231,6 +251,21 @@ class Tool:
             arcpy.AddError(str(e))
             return
         output_path = io_paths.output_path
+
+        # The DTED metadata index and profile, checked before anything is written.
+        try:
+            dted_metadata = EGMTrans.DtedMetadataSource.load(dted_index, dted_profile)
+        except (OSError, ValueError, RuntimeError) as e:
+            arcpy.AddError(str(e))
+            return
+        if not dted_metadata.empty:
+            issues = dted_metadata.validate()
+            errors = [issue for issue in issues if issue.severity == 'error']
+            for issue in errors:
+                arcpy.AddError(str(issue))
+            if errors:
+                arcpy.AddError("The DTED metadata index is not valid; see the DTED Header Report tool.")
+                return
 
         EGMTrans.setup_logger(io_paths.log_path if save_log else None, save_log, is_arc_mode=True)
 
@@ -251,6 +286,11 @@ class Tool:
         arcpy.AddMessage(f"Create Mask: {create_mask}")
         arcpy.AddMessage(f"Absolute Horizontal Accuracy: {abs_horiz_accuracy}")
         arcpy.AddMessage(f"Save Log File: {save_log}")
+        arcpy.AddMessage(f"Context Folder: {context_folder}")
+        arcpy.AddMessage(f"Water Levels Table: {water_levels}")
+        arcpy.AddMessage(f"Minimum Containment: {containment}")
+        arcpy.AddMessage(f"DTED Metadata Index: {dted_index}")
+        arcpy.AddMessage(f"DTED Product Profile: {dted_profile}")
         arcpy.AddMessage(f'{"="*80}\n')
 
         # Download geoid grid files on first run if they are missing.
@@ -270,7 +310,11 @@ class Tool:
 
         try:
             if io_paths.mode == 'file' and not context_folder and not water_levels:
-                EGMTrans.process_file(io_paths.input_path, output_path, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True, min_containment=containment)
+                EGMTrans.process_file(
+                    io_paths.input_path, output_path, source_datum, target_datum, flatten, create_mask,
+                    min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True,
+                    min_containment=containment, dted_metadata=dted_metadata,
+                )
             else:
                 # The same two-pass runner as the command line: water bodies that
                 # span tiles get one level, context tiles are analyzed but not written.
@@ -278,7 +322,7 @@ class Tool:
                     io_paths, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm,
                     abs_horiz_accuracy, save_log, arc_mode=True,
                     context_folders=[context_folder] if context_folder else [], water_levels=water_levels,
-                    min_containment=containment,
+                    min_containment=containment, dted_metadata=dted_metadata,
                 )
                 if result.exit_code:
                     arcpy.AddError(f"{len(result.failed)} DEM(s) were not transformed; see the messages above.")
@@ -302,7 +346,7 @@ class Tool:
             try:
                 result_layer = arcpy.management.MakeRasterLayer(
                     output_path, os.path.basename(output_path))
-                arcpy.SetParameter(13, result_layer.getOutput(0))
+                arcpy.SetParameter(15, result_layer.getOutput(0))
             except Exception as e:
                 arcpy.AddWarning(f"Could not create output layer for map display: {e}")
         elif not hasattr(input_param.value, 'dataSource'):
@@ -313,4 +357,130 @@ class Tool:
     def postExecute(self, parameters):
         """This method takes place after outputs are processed and
         added to the display."""
+        return
+
+
+class DtedHeaderReport:
+    """Report and validate the MIL-PRF-89020B header of DTED files."""
+
+    def __init__(self):
+        self.label = "DTED Header Report"
+        self.description = (
+            "Report every field of the UHL, DSI and ACC records of DTED files, with the level evidence, a summary "
+            "and the MIL-PRF-89020B findings, as text, JSON, CSV or Markdown."
+        )
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        params = []
+
+        input_param = arcpy.Parameter(
+            displayName="DTED File or Folder",
+            name="input",
+            datatype=["DEFile", "DEFolder"],
+            parameterType="Required",
+            direction="Input")
+        params.append(input_param)
+
+        report_format = arcpy.Parameter(
+            displayName="Report Format",
+            name="report_format",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        report_format.filter.list = ["text", "json", "csv", "md"]
+        report_format.value = "text"
+        params.append(report_format)
+
+        output_file = arcpy.Parameter(
+            displayName="Report File (optional; the report is also shown in the messages)",
+            name="output_file",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Output")
+        params.append(output_file)
+
+        check_data = arcpy.Parameter(
+            displayName="Check the elevation records (sentinels, counts, checksums, voids)",
+            name="check_data",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
+        check_data.value = False
+        params.append(check_data)
+
+        zero_based = arcpy.Parameter(
+            displayName="Count byte positions from 0 instead of 1",
+            name="zero_based",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
+        zero_based.value = False
+        params.append(zero_based)
+
+        return params
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        from egmtrans.dted.harvest import DTED_EXTENSIONS, find_files
+        from egmtrans.dted.report import build_report, render_report
+        from egmtrans.dted.validate import count, validate_file
+
+        input_path = parameters[0].valueAsText
+        report_format = parameters[1].valueAsText or "text"
+        output_file = parameters[2].valueAsText
+        check_data = bool(parameters[3].value)
+        zero_based = bool(parameters[4].value)
+
+        try:
+            files = find_files([input_path], DTED_EXTENSIONS)
+        except FileNotFoundError as e:
+            arcpy.AddError(f"Not found: {e}")
+            return
+        if not files:
+            arcpy.AddError(f"No DTED file (.dt0, .dt1, .dt2) under {input_path}.")
+            return
+
+        chunks = []
+        for path in files:
+            try:
+                header, issues = validate_file(path, check_data=check_data)
+            except (OSError, ValueError) as e:
+                arcpy.AddError(f"{path}: {e}")
+                continue
+            report = build_report(path, header, issues, zero_based=zero_based)
+            chunks.append(render_report(report, report_format))
+            errors, warnings = count(issues, 'error'), count(issues, 'warning')
+            line = f"{os.path.basename(path)}: {errors} error(s), {warnings} warning(s)"
+            (arcpy.AddError if errors else arcpy.AddWarning if warnings else arcpy.AddMessage)(line)
+            for issue in issues:
+                if issue.severity == 'error':
+                    arcpy.AddError(f"    {issue}")
+                elif issue.severity == 'warning':
+                    arcpy.AddWarning(f"    {issue}")
+            if report_format == "text" and not output_file:
+                for text_line in chunks[-1].splitlines():
+                    arcpy.AddMessage(text_line)
+
+        if report_format == "csv":
+            text = chunks[0] + "".join(c.split("\n", 1)[1] for c in chunks[1:]) if chunks else ""
+        elif report_format == "json" and len(chunks) > 1:
+            text = "[\n" + ",\n".join(c.rstrip("\n") for c in chunks) + "\n]\n"
+        else:
+            text = "\n".join(chunks)
+        if output_file:
+            with open(output_file, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+            arcpy.AddMessage(f"Report written to {output_file}")
+        return
+
+    def postExecute(self, parameters):
         return

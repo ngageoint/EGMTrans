@@ -169,6 +169,28 @@ def _bundled_proj_db_is_compatible() -> bool:
     return bundled >= installed
 
 
+def _pin_installed_proj_db() -> None:
+    """Point GDAL at the one PROJ search path that holds ``proj.db``.
+
+    GDAL 3.13 with PROJ 9.9 lists the user's own PROJ directory
+    (``~/.local/share/proj``, where downloaded grids go) ahead of the
+    installation's, and when that directory exists without a ``proj.db`` every
+    EPSG lookup fails with "proj_create_from_database: Open of .../share/proj
+    failed". Naming the directory that has the database restores the lookups;
+    an explicit ``PROJ_DATA`` or ``PROJ_LIB`` in the environment is respected.
+    """
+    from osgeo import gdal, osr
+
+    if os.environ.get('PROJ_DATA') or os.environ.get('PROJ_LIB'):
+        return
+    paths = osr.GetPROJSearchPaths()
+    if len(paths) < 2:
+        return
+    with_db = [p for p in paths if os.path.isfile(os.path.join(p, 'proj.db'))]
+    if len(with_db) == 1 and with_db[0] != paths[0]:
+        gdal.SetConfigOption('PROJ_DATA', with_db[0])
+
+
 def configure_gdal() -> None:
     """Set GDAL/PROJ configuration options. Must run before any GDAL operations.
 
@@ -187,6 +209,8 @@ def configure_gdal() -> None:
     gdal.SetConfigOption('PROJ_NETWORK', 'OFF')
     if _bundled_proj_db_is_compatible():
         gdal.SetConfigOption('PROJ_DATA', get_crs_dir())
+    else:
+        _pin_installed_proj_db()
     gdal.SetConfigOption('GDAL_CACHEMAX', '512')
 
     warnings.filterwarnings("ignore", category=FutureWarning, module="osgeo.gdal")

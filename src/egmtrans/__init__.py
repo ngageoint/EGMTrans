@@ -10,6 +10,7 @@ from egmtrans.config import (
     SUPPORTED_EXTENSIONS,
     configure_gdal,
 )
+from egmtrans.dted.writer import DtedMetadataSource
 from egmtrans.file_utils import (
     IOPaths,
     copy_as_writable,
@@ -38,6 +39,7 @@ __all__ = [
     "process_file",
     "run_batch",
     "BatchResult",
+    "DtedMetadataSource",
     "TileLevels",
     "str2bool",
     "IOPaths",

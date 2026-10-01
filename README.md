@@ -32,6 +32,8 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - [EGMTrans Explorer](#egmtrans-explorer)
 - [Interpolation Algorithms](#interpolation-algorithms)
 - [DTED Header Handling](#dted-header-handling)
+- [DTED Header Report](#dted-header-report)
+- [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)
 - [Notes](#notes)
 - [Constraints](#constraints)
 - [Troubleshooting](#troubleshooting)
@@ -46,6 +48,8 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - Outputs Cloud Optimized GeoTIFF (COG) format for non-DTED results
 - Keeps the ocean at 0 and every flat area (a lake, a reservoir, a hydro-flattened river reach) at one level, across the tiles of a batch run, with a customizable patch size
 - Creates optional mask files of the ocean and the water bodies for quality control
+- Reports and validates every field of a DTED header against MIL-PRF-89020B, as text, JSON, CSV or Markdown
+- Fills DTED headers from a collection-wide metadata index (GeoPackage or GeoParquet) and a product profile, so a production run writes the same header fields on every machine
 - Utilizes parallel processing for improved performance on multi-core systems
 - Runs unattended in a Docker container that carries its own geoid grids and needs no network access
 - Supports multiple interpolation algorithms (bilinear, thin plate spline, and Delaunay triangulation)
@@ -64,11 +68,12 @@ This project is licensed under the MIT License - see the [`LICENSE`](LICENSE) fi
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.13+ (ArcGIS Pro 3.7 ships 3.13; the development environment is 3.14)
 - GDAL 3.11.0+ (with Python bindings)
-- NumPy 1.22.0+
-- SciPy 1.7.0+
-- Numba 0.60+ (recommended but optional)
+- NumPy 2.0+
+- SciPy 1.15+
+- Numba 0.61+ (recommended but optional)
+- pyarrow and lxml (optional, the `index` extra: GeoParquet metadata indexes and XPath harvest from XML sidecars; both ship with ArcGIS Pro 3.7)
 
 ## Installation
 
@@ -79,6 +84,7 @@ This project is licensed under the MIT License - see the [`LICENSE`](LICENSE) fi
 ```bash
 pip install -e .               # includes numba + tqdm for best performance
 pip install -e ".[core]"       # without numba/tqdm (restricted environments)
+pip install -e ".[index]"      # plus pyarrow and lxml for GeoParquet indexes and XML harvest
 pip install -e ".[dev]"        # with test/lint tools
 ```
 
@@ -173,7 +179,7 @@ PROJ registers the lower-resolution grids for EPSG:5773 and EPSG:3855, so left t
 
 ## ArcGIS Pro Setup Instructions
 
-1. Ensure you have ArcGIS Pro installed on your system.
+1. Ensure you have ArcGIS Pro 3.7 or later installed on your system (its Python is 3.13).
 
 2. Copy the `EGMTrans` folder to a location accessible by ArcGIS Pro.
 
@@ -188,7 +194,10 @@ EGMTrans/
 │       ├── _state.py
 │       ├── config.py
 │       ├── cli.py
+│       ├── cli_dted.py          # dted-header and dted-index subcommands
+│       ├── dted/                # DTED header schema, codec, validator, report, index, profile
 │       ├── crs.py
+│       ├── download.py
 │       ├── interpolation.py
 │       ├── flattening.py
 │       ├── io.py
@@ -200,7 +209,7 @@ EGMTrans/
 │       ├── logging_setup.py
 │       └── numba_utils.py
 ├── tests/                   # Test suite
-├── arcgis/                  # ArcGIS Pro toolbox
+├── arcgis/                  # ArcGIS Pro toolbox: EGMTrans Tool and DTED Header Report
 │   ├── EGMTransToolbox.pyt
 │   └── ...
 ├── crs/                     # PROJ data
@@ -223,7 +232,7 @@ EGMTrans/
 
 7. Navigate to the `EGMTrans/arcgis` folder and select the `EGMTransToolbox.pyt` file.
 
-8. The "EGMTransToolbox" toolbox should now appear in your Toolboxes list.
+8. The "EGMTransToolbox" toolbox should now appear in your Toolboxes list, with two tools: *EGMTrans Tool* (the transformation) and *DTED Header Report* (see [DTED Header Report](#dted-header-report)).
 
 ## ArcGIS Pro Python Environment
 
@@ -267,10 +276,14 @@ Note: While Numba is recommended for optimal performance, EGMTrans will still fu
    - **Context Folder**: A folder of neighboring tiles that are analyzed but not transformed, so that a water body which continues into them gets the level a run including them would give it (see [Notes](#notes)).
    - **Water Levels Table**: A CSV written by the command line's `--export-water-levels` in an earlier run over a larger area; a water body found in it takes the table's level when that is lower than the level found in this run.
    - **Minimum Containment**: The share of a flat area's boundary that must lie above it for the area to count as a water body; defaults to 0.8 (see [Notes](#notes)).
+   - **DTED Metadata Index**: A GeoPackage or GeoParquet index whose row for the output cell fills the DTED header; a cell the index does not hold fails (see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
+   - **DTED Product Profile**: A TOML file of header constants for the product; the index row overrides it field by field.
 
 5. Click "Run" to execute the tool.
 
 6. The tool will process the input file(s) and create the transformed output(s) in the specified location.
+
+The *DTED Header Report* tool in the same toolbox reports and validates the header of a DTED file or of every DTED file under a folder: choose the format (text, JSON, CSV or Markdown), an optional report file, whether to check the elevation records too, and whether to count byte positions from 0 instead of the specification's 1. Findings appear as errors and warnings in the messages, and a text report is shown there when no report file is given.
 
 ## Using EGMTrans on the Command Line
 
@@ -279,7 +292,8 @@ The basic syntax for using EGMTrans in a terminal or command prompt is:
 ```
 python EGMTrans.py -i INPUT -o OUTPUT -s SOURCE_DATUM -t TARGET_DATUM \
   [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-c CONTAINMENT] [-a ALGORITHM] [-y] \
-  [--context FOLDER] [--water-levels FILE] [--export-water-levels FILE]
+  [--context FOLDER] [--water-levels FILE] [--export-water-levels FILE] \
+  [--dted-index FILE] [--dted-profile FILE]
 ```
 
 Arguments:
@@ -298,6 +312,17 @@ Arguments:
 - `--context FOLDER`: A folder of neighboring tiles to analyze but not transform, so that a water body which continues into them gets the level a run including them would give it (optional; may be repeated). See [Notes](#notes).
 - `--export-water-levels FILE`: Write the level of every water body that touches a tile edge, keyed by the edge crossing, for later runs over neighboring tiles (optional).
 - `--water-levels FILE`: A table written by `--export-water-levels` in an earlier run; a water body found in it takes the table's level when that is lower than the level found in this run (optional).
+- `--dted-index FILE`: A DTED metadata index (`.gpkg` or `.parquet`) whose row for the output cell fills the DTED header; a cell the index does not hold fails (optional; see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
+- `--dted-profile FILE`: A DTED product profile (TOML) of header constants; the index row overrides it field by field (optional).
+
+Two subcommands serve DTED headers; each has its own `--help`:
+
+```
+egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH] [--zero-based] [--check-data] [--strict]
+egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH... | --from-footprints FILE) \
+  [--profile FILE] [--level N] [--product NAME] [--update]
+egmtrans dted-index validate INDEX [--profile FILE] [--level N]
+```
 
 The input and output must both be files or both be folders, except that a single input file may be
 written into an output folder, in which case it keeps its own filename. An output path ending in
@@ -444,12 +469,80 @@ The choice of algorithm depends on your specific requirements:
 
 ## DTED Header Handling
 
-When transforming DTED files, EGMTrans updates the output file's header to reflect the new vertical datum. This process adheres to [**STANAG 3809**](https://nsgreg.nga.mil/doc/view?i=2126) for the header metadata. Note, however, that STANAG 3809 (MIL-PRF-89020B) was last updated in 2004 and does not support EGM2008 for standard DTED products. While GeoTIFF transforms can go in any direction, DTED transforms should only use EGM96 as the target datum for full standard compliance.
+When transforming DTED files, EGMTrans rewrites the output file's 3,428-byte header (the UHL, DSI and ACC records) from the input's header, following [**STANAG 3809**](https://nsgreg.nga.mil/doc/view?i=2126) (MIL-PRF-89020B). The header is read and written as raw bytes, never through GDAL, so a `.aux.xml` sidecar or a driver default cannot stand between the tool and the file. Note that MIL-PRF-89020B (2000) knows only `MSL` and `E96` as vertical datum codes; `E08` for EGM2008 is common practice but not in the specification, so DTED transforms should use EGM96 as the target datum for full compliance.
 
-The tool performs the following updates:
-- **Vertical Datum:** The vertical datum code is updated to `E96` for EGM96.
-- **Accuracy Fields:** The tool checks the absolute and relative horizontal and vertical accuracy fields. If any of these fields contain non-numeric values (e.g., `NA  `), they are standardized to `  NA` (right-aligned) to ensure compliance with the specification. This helps to prevent issues with software that may not correctly handle non-standard accuracy values.
-- **Horizontal Accuracy Default**: If the absolute horizontal accuracy of the input DTED file is missing, and a default value is provided in the parameters, it will be inserted into the output header. This can prevent errors in some software programs, which expect the value to be populated.
+Without a metadata index or profile, the header changes only in:
+- **Vertical datum** (DSI characters 142-144): the code of the target datum, `E96` or `E08`.
+- **Accuracies** (ACC characters 4-19 and the UHL copy at 29-32): a value that is neither `0000`-`9999` nor NA becomes NA, and NA is written left justified (`NA  `), as section 3.13.5 of the specification requires for alpha values; versions up to 1.6.0 wrote it right justified (`  NA`), which the validator now reports as a warning. The UHL absolute vertical accuracy always repeats the ACC value.
+- **Absolute horizontal accuracy**: the `--abs_horiz_accuracy` value fills the field only when it is NA.
+- **Bytes that are not printable**: the NUL bytes that GDAL-written headers carry where the specification wants blanks become blanks.
+
+Every change is logged with its source, and the findings of the validator (see [DTED Header Report](#dted-header-report)) are logged as warnings, so a problem the input header had and nothing corrected is visible. With `--dted-index` and `--dted-profile`, the cell's row and the profile fill the rest of the header (see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
+
+## DTED Header Report
+
+`egmtrans dted-header` (and the *DTED Header Report* tool in ArcGIS Pro) reports every field of a DTED header as a table with the columns Start, End, Length, Title, Value and Description, one section per record, followed by the decoded accuracy subregions, a summary and the findings. Byte positions are the specification's one-based character positions, so a row can be checked against the MIL-PRF-89020B tables as printed; `--zero-based` counts from 0 as a hex editor does. The level is taken from four sources (the extension, the DSI series designator, the UHL latitude interval and the UHL latitude point count) and a disagreement is reported. Accuracy titles name the statistic: absolute horizontal accuracy is a 90% circular error (CE90), vertical accuracies are 90% linear errors (LE90).
+
+```bash
+egmtrans dted-header N55.dt2                          # text report on stdout
+egmtrans dted-header N55.dt2 --check-data             # also check every elevation record
+egmtrans dted-header E038 --format csv --out headers.csv   # files given one by one
+egmtrans dted-header N55.dt2 --format json --strict   # exit 1 on warnings too
+```
+
+Findings have three severities. An error breaks readers or a mandatory rule: a wrong sentinel, a byte that is not printable, an interval that does not match the latitude zone (Tables I to III of the specification), counts that do not match the interval, a UHL origin that differs from the DSI, security codes that differ between UHL and DSI, a UHL vertical accuracy that differs from the ACC, flags that disagree with the subregions, a malformed date or accuracy. A warning is a deviation that readers tolerate: NA right justified, `E08`, a product specification other than `PRF89020B`, a producer code that does not start with a country code, an unset compilation date. Information notes free text in a reserved area, the elevation range, and an overall accuracy better than its worst subregion. With `--check-data`, the elevation records are checked too: the `0xAA` sentinel, the block and line counts, the checksum of every record, and the share of null posts against the partial cell indicator. Log messages go to stderr, the report to stdout (or `--out`), so a JSON or CSV report can be piped; the exit code is 1 when a file has errors (or warnings with `--strict`), 2 for a usage error.
+
+## DTED Metadata Index and Profile
+
+The geometry fields of a DTED header follow from the raster, but the accuracies (CE90 and LE90), the edition, the dates, the producer, the security markings and the free text do not, and they differ per cell. EGMTrans takes them from two files that a producer prepares once for a whole collection:
+
+- A **metadata index**, a GeoPackage (`.gpkg`) or GeoParquet (`.parquet`) file with one row per one-degree cell, keyed by `cell_id` (`N38E045`), built and checked with `egmtrans dted-index`. The index is also a catalog of the collection that other services can read, filter and style: every row carries the cell polygon.
+- A **product profile**, a TOML file of the values that are the same for every cell of a product. `samples/dted_profile_example.toml` follows a TDF-DTED2 production header.
+
+When a header is written, its fields are filled in order of precedence: values derived from the cell geometry, the target datum and the data (sentinels, origin, intervals, counts, corners, series, vertical and horizontal datum, partial cell indicator, the multiple-accuracy flags, the UHL copies of the security code and the vertical accuracy) can never be overridden; then the cell's index row; then the profile; then the `--abs_horiz_accuracy` fallback; then the input file's header; then the specification's fill (NA, `0000`, blanks). A cell the index does not hold stops the run before anything is written. A `vertical_datum` or `horizontal_datum` the profile or index states for another product (`E96` in an index harvested from the EGM96 collection, for an EGM2008 output) is reported as a warning and the output keeps its own code. A NULL accuracy in the index means NA, so the profile's accuracies serve runs without an index. Every field's source is logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
+
+Index columns (layer `dted_cells`; dates are ISO dates and are written as YYMM):
+
+| Column | Header field | Notes |
+|---|---|---|
+| `cell_id`, `dted_level` | | The key (`N38E045`) and the level the row describes |
+| `security_code` | UHL 33, DSI 4 | U, R, C or S; required |
+| `security_control`, `security_handling` | DSI 5-6, 7-33 | Control and release markings, handling description |
+| `unique_ref_uhl`, `unique_ref_dsi` | UHL 36-47, DSI 65-79 | Unique reference numbers |
+| `data_edition`, `match_merge_version` | DSI 88-89, 90 | 1-99 and A-Z; required |
+| `maintenance_date`, `match_merge_date`, `maintenance_code` | DSI 91-102 | NULL until used |
+| `producer_code` | DSI 103-110 | Country code first (FIPS 10-4); required |
+| `product_spec`, `product_spec_amend`, `product_spec_date` | DSI 127-141 | `PRF89020B`, `00`, 2000-05 by default |
+| `digitizing_system`, `compilation_date` | DSI 150-163 | Compilation date required |
+| `abs_horiz_acc`, `abs_vert_acc`, `rel_horiz_acc`, `rel_vert_acc` | ACC 4-19 | Meters; NULL means NA |
+| `acc_nima_reserved`, `dsi_nima_text`, `dsi_producer_text`, `dsi_free_text` | ACC 24, DSI 292-648 | Free text areas |
+| `vertical_datum`, `horizontal_datum` | DSI 142-149 | Checked against the output, never written from here |
+| `source_id`, `source_file`, `source_metadata_file`, `source_date`, `source_version`, `partial_cell`, `qc_status`, `notes`, `updated` | | Catalog columns the writer ignores |
+
+Accuracy subregions (up to nine per cell, each with its four accuracies and an outline of 3 to 14 vertices) go in the layer `dted_acc_subregions` (`cell_id`, `seq`, the accuracies, a polygon); in a GeoParquet index they are the sibling file `<name>_subregions.parquet`. The table `dted_index_meta` (or the Parquet file's metadata) records the schema version, the level, the product and the generator. Columns the writer does not know are kept, so an index may carry whatever else a collection needs.
+
+Building an index:
+
+```bash
+# Rows from the headers of an existing DTED collection (subregions included)
+egmtrans dted-index build --out tdf_dted2.gpkg --from-dted /data/dted --product TDF-DTED2
+
+# Rows for every cell the source rasters cover, with values the profile's harvest
+# mappings pull from raster tags and XML sidecars
+egmtrans dted-index build --out tdf_dted2.parquet --from-rasters /data/tdf --profile tdf_dted2.toml
+
+# Rows from a footprint layer, then add what the DTED headers say, keeping the rest
+egmtrans dted-index build --out tdf_dted2.gpkg --from-footprints footprints.gpkg --cell-field item_name
+egmtrans dted-index build --out tdf_dted2.gpkg --from-dted /data/dted --update
+
+egmtrans dted-index validate tdf_dted2.gpkg --profile tdf_dted2.toml --level 2
+```
+
+The profile's `[harvest.tags.fields]` map index columns to raster metadata tags and `[harvest.xml.fields]` to XPath expressions in a sidecar found through `[harvest.xml] sidecar` (`{stem}`, `{name}`, `{cell}` and `{dir}` are replaced); a mapping may be a table with a `pattern` whose first group is the value. XPath with namespaces and predicates needs `lxml`; a sidecar that declares a DOCTYPE or entities is refused. Harvested accuracies are rounded up to whole meters. Values the build cannot find stay NULL, to be filled in any GIS or with a script, and `dted-index validate` lists what is missing. Using the index:
+
+```bash
+egmtrans -i in/N55.dt2 -o out/N55.dt2 -s EGM2008 -t EGM96 --dted-index tdf_dted2.gpkg --dted-profile tdf_dted2.toml
+```
 
 ## Notes
 
@@ -493,6 +586,10 @@ In addition, users will be warned in the following circumstances and asked if th
 This error occurs when `pip` cannot find a pre-built GDAL wheel for your Python version and falls back to compiling from source. Building GDAL from source requires both the Microsoft Visual C++ Build Tools and the GDAL C library headers, which most users will not have installed. This is especially common with newer Python releases (e.g., 3.13+) that GDAL has not yet published wheels for.
 
 **Fix:** Use the [conda installation method](#option-c-conda-environment), which provides pre-compiled GDAL binaries from conda-forge. Alternatively, install GDAL via [OSGeo4W](https://trac.osgeo.org/osgeo4w/) before running `pip install`.
+
+### EPSG lookups fail with `proj_create_from_database: Open of .../share/proj failed`
+
+GDAL 3.13 with PROJ 9.9 lists the user's own PROJ directory (`~/.local/share/proj`, where downloaded transformation grids go) ahead of the installation's, and when that directory exists without a `proj.db` every EPSG lookup fails. EGMTrans points GDAL at the directory that holds the database when it starts. If the error still appears (another program initialized PROJ first), set `PROJ_DATA` to that directory, for example `<env>/share/proj` of the conda environment.
 
 ### EGMTrans Toolbox in ArcGIS Pro
 
