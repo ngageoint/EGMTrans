@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Prove the EGMTrans image transforms a GeoTIFF and a DTED file with the network off.
+# Prove the EGMTrans image transforms a GeoTIFF and a DTED file, and makes DTED from
+# a GeoTIFF, with the network off.
 #
 #   docker/smoke_test.sh                  build egmtrans:smoke, then test it
 #   docker/smoke_test.sh egmtrans:1.7.0   test an image that is already built
@@ -22,7 +23,7 @@ py() { docker run --rm --network none --user "$(id -u):$(id -g)" -v "$work:/data
 
 samples=/opt/egmtrans/samples
 
-echo "1/3 GeoTIFF: Copernicus DEM (EGM2008) to EGM96"
+echo "1/4 GeoTIFF: Copernicus DEM (EGM2008) to EGM96"
 run -i "$samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif" -o /data/cop_egm96.tif \
     -s EGM2008 -t EGM96 -y -l False >/dev/null
 py "
@@ -39,7 +40,7 @@ assert np.all(out[ocean] == 0), 'ocean left 0 m'
 print(f'    compound CRS carries EGM96 height, {int(ocean.sum()):,} ocean pixels at 0 m, no new voids: ok')
 "
 
-echo "2/3 DTED2: SRTM (EGM96) to EGM2008 and back"
+echo "2/4 DTED2: SRTM (EGM96) to EGM2008 and back"
 run -i "$samples/03n008e_SRTM.dt2" -o /data/srtm_egm08.dt2 -s EGM96 -t EGM2008 -y -l False >/dev/null
 run -i /data/srtm_egm08.dt2 -o /data/srtm_egm96.dt2 -s EGM2008 -t EGM96 -y -l False >/dev/null
 py "
@@ -69,7 +70,7 @@ print(f'    header E96, {int(void.sum()):,} voids kept, ocean at 0 m, record che
 print(f'    round trip within 1 m except {int(sea_level_land.sum())} land posts that rounded to 0 m: ok')
 "
 
-echo "3/3 Unattended: a prompt that cannot be answered exits with code 2"
+echo "3/4 Unattended: a prompt that cannot be answered exits with code 2"
 set +e
 run -i "$samples/03n008e_SRTM.dt2" -o /data/mismatch.dt2 -s EGM2008 -t EGM96 -l False >/dev/null 2>&1
 rc=$?
@@ -79,5 +80,39 @@ if [[ $rc -ne 2 ]]; then
     exit 1
 fi
 echo "    header says EGM96 but -s says EGM2008, no --yes: exit code 2: ok"
+
+echo "4/4 DTED from GeoTIFF: the self-test, then the SRTM sample as a Float32 tile to DTED2"
+run dted-selftest >/dev/null 2>&1 || { echo "    the self-test did not reproduce the reference bytes" >&2; exit 1; }
+py "
+import numpy as np
+from osgeo import gdal
+# A Float32 copy of the SRTM sample on the whole-degree lattice, voids kept.
+gdal.Translate('/data/srtm_float.tif', '$samples/03n008e_SRTM.dt2', outputType=gdal.GDT_Float32,
+               creationOptions=['COMPRESS=DEFLATE'])
+with gdal.Open('/data/srtm_float.tif', gdal.GA_Update) as ds:
+    ds.SetMetadataItem('AREA_OR_POINT', 'Point')
+"
+run -i /data/srtm_float.tif -o /data/srtm_made.dt2 -s EGM96 -t EGM2008 -y -l False \
+    --dted-profile "$samples/dted_profile_example.toml" >/dev/null
+run dted-header /data/srtm_made.dt2 --check-data >/dev/null
+py "
+import numpy as np
+from osgeo import gdal
+messages = []
+gdal.PushErrorHandler(lambda cls, no, msg: messages.append(msg))
+gdal.SetConfigOption('DTED_VERIFY_CHECKSUM', 'YES')
+src = gdal.Open('$samples/03n008e_SRTM.dt2').ReadAsArray().astype(int)
+made = gdal.Open('/data/srtm_made.dt2').ReadAsArray().astype(int)
+gdal.PopErrorHandler()
+assert not [m for m in messages if 'checksum' in m.lower()], messages
+with open('/data/srtm_made.dt2', 'rb') as f:
+    header = f.read(3428)
+assert header[221:224] == b'E08', header[221:224]
+assert header[80 + 59:80 + 64] == b'DTED2', header[80 + 59:80 + 64]
+void = src == -32767
+assert np.array_equal(void, made == -32767), 'voids moved'
+assert np.all(made[src == 0] == 0), 'ocean left 0 m'
+print(f'    DTED2 made from a GeoTIFF: header E08, {int(void.sum()):,} voids kept, ocean at 0 m, checksums valid: ok')
+"
 
 echo "Smoke test passed: $image"

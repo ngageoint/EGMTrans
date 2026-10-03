@@ -1,4 +1,4 @@
-"""Integration tests for egmtrans.batch: water bodies levelled across tiles.
+"""Integration tests for egmtrans.batch: water bodies leveled across tiles.
 
 The tiles are synthetic DTED0 (121 x 121 posts at 30 arc seconds) and Float32
 GeoTIFF tiles near 126-128 E, 6-7 N, where EGM2008 - EGM96 changes by meters
@@ -148,7 +148,7 @@ class TestOverlappingDted:
                 nested_bytes = f.read()
             assert flat_bytes == nested_bytes, f"{name} differs with the folder layout"
 
-    def test_context_folder_is_analysed_but_not_written(self, tmp_dir):
+    def test_context_folder_is_analyzed_but_not_written(self, tmp_dir):
         src_a, src_b = dted_tiles(os.path.join(tmp_dir, "both"))
         run_folder = os.path.join(tmp_dir, "run")
         context = os.path.join(tmp_dir, "context")
@@ -375,3 +375,261 @@ class TestBatchChecks:
             f.write("no tiles here")
         result = _run(folder, os.path.join(tmp_dir, "out"))
         assert result.exit_code == 1 and result.files_processed == 0
+
+
+# ---------------------------------------------------------------------------
+# DTED cells made from GeoTIFF
+# ---------------------------------------------------------------------------
+
+CELL_PER_DEGREE = 300   # source posts per degree of the lattice tiles
+CELL_LON0, CELL_LAT0 = 30, 85   # zone V: a level-2 cell is 3601 x 601 posts
+
+
+def _profile(folder, level=2):
+    """A profile file for the fictional product, at *level*."""
+    path = os.path.join(folder, f'profile_{level}.toml')
+    with open(path, 'w') as handle:
+        handle.write(
+            f'schema = 1\n[product]\ndted_level = {level}\nsecurity_code = "U"\ndata_edition = 1\n'
+            f'match_merge_version = "A"\nproducer_code = "USNGA"\ncompilation_date = "2026-01"\n'
+            f'abs_horiz_acc = 10\nabs_vert_acc = 5\nrel_horiz_acc = "NA"\nrel_vert_acc = 3\n'
+        )
+    return path
+
+
+def lattice_tiles(folder, cells=((0, 0),), lake_across=False):
+    """Lattice tiles of one cell each at (CELL_LON0 + dx, CELL_LAT0 + dy), with a
+    lake at 350 m that, when *lake_across*, spans the shared column of (0, 0) and (1, 0)."""
+    from tests.conftest import lattice_geotransform, synthetic_cell
+
+    os.makedirs(folder, exist_ok=True)
+    paths = []
+    for dx, dy in cells:
+        heights = synthetic_cell(CELL_PER_DEGREE, seed_offset=100 * dx + 7 * dy, base_cm=40000)
+        if lake_across and (dx, dy) == (0, 0):
+            heights[100:200, 250:] = 350.0     # to the east edge
+        elif lake_across and (dx, dy) == (1, 0):
+            heights[100:200, :60] = 350.0      # from the west edge
+        else:
+            heights[100:200, 120:220] = 350.0
+        heights[200, 170] = 349.6
+        heights[201, 170] = 350.5
+        name = f'tile_{CELL_LAT0 + dy}_{CELL_LON0 + dx}.tif'
+        paths.append(write_geotiff(
+            os.path.join(folder, name), heights,
+            lattice_geotransform(CELL_LON0 + dx, CELL_LAT0 + dy, CELL_PER_DEGREE, CELL_PER_DEGREE), nodata=-32767.0,
+        ))
+    return paths
+
+
+def _convert(input_folder, output_folder, profile, level=2, naming='stem', **kwargs):
+    from egmtrans.dted.writer import DtedMetadataSource
+
+    paths = resolve_io_paths(input_folder, output_folder, dted_level=level)
+    options = dict(flatten=True, create_mask=False, min_patch_size=400, algorithm='bilinear', assume_yes=True,
+                   dted_metadata=DtedMetadataSource.load(None, profile), dted_level=level, dted_naming=naming)
+    options.update(kwargs)
+    return run_batch(paths, 'EGM2008', 'EGM2008', **options)
+
+
+def _sha(path):
+    import hashlib
+
+    with open(path, 'rb') as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _shifted(input_folder, output_folder, profile, context=(), table=None, export=None):
+    """A conversion batch from EGM2008 to EGM96 with the cell naming preset."""
+    from egmtrans.dted.writer import DtedMetadataSource
+
+    return run_batch(
+        resolve_io_paths(input_folder, output_folder, dted_level=2), 'EGM2008', 'EGM96', True, False, 400,
+        'bilinear', assume_yes=True, dted_metadata=DtedMetadataSource.load(None, profile), dted_level=2,
+        dted_naming='cell', context_folders=context, water_levels=table, export_water_levels=export,
+    )
+
+
+@requires_grids
+class TestConvertedCells:
+    def test_naming_presets_and_template_without_a_tree_copy(self, tmp_dir):
+        src = os.path.join(tmp_dir, 'in', 'sub')
+        lattice_tiles(src)
+        with open(os.path.join(tmp_dir, 'in', 'readme.txt'), 'w') as handle:
+            handle.write('not a DEM')
+        profile = _profile(tmp_dir)
+        expected = {
+            'stem': 'sub/tile_85_30.dt2', 'cell': 'N85E030.dt2', 'dted': 'E030/N85.dt2',
+            'TDF-DTED{level}_{lon}{lat}': 'TDF-DTED2_E030N85.dt2',
+        }
+        for naming, name in expected.items():
+            out = os.path.join(tmp_dir, 'out_' + naming.replace('{', '').replace('}', '').replace('-', '_'))
+            result = _convert(os.path.join(tmp_dir, 'in'), out, profile, naming=naming, create_mask=True)
+            assert result.exit_code == 0 and result.files_processed == 1, naming
+            assert os.path.isfile(os.path.join(out, name)), naming
+            assert os.path.isfile(os.path.join(out, name[:-4] + '_mask.tif'))
+            assert not os.path.exists(os.path.join(out, 'readme.txt')), 'the input tree was copied'
+            assert not os.path.exists(os.path.join(out, 'sub', 'tile_85_30.tif'))
+        hashes = {_sha(os.path.join(tmp_dir, folder, name)) for folder, name in (
+            ('out_stem', 'sub/tile_85_30.dt2'), ('out_cell', 'N85E030.dt2'), ('out_dted', 'E030/N85.dt2'))}
+        assert len(hashes) == 1, 'the name changed the bytes'
+
+    def test_collisions_and_duplicate_cells_stop_the_run(self, tmp_dir, log_lines):
+        from tests.conftest import lattice_geotransform, synthetic_cell
+
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder)
+        # A second raster covering the same cell.
+        shutil.copy(os.path.join(folder, 'tile_85_30.tif'), os.path.join(folder, 'again.tif'))
+        result = _convert(folder, os.path.join(tmp_dir, 'out'), _profile(tmp_dir), naming='cell')
+        assert result.exit_code == 1 and not os.path.exists(os.path.join(tmp_dir, 'out', 'N85E030.dt2'))
+        assert any('both be written to' in line for line in log_lines)
+        os.remove(os.path.join(folder, 'again.tif'))
+        # A raster of two cells under stem naming.
+        wide = np.concatenate([synthetic_cell(CELL_PER_DEGREE), synthetic_cell(CELL_PER_DEGREE)[:, 1:]], axis=1)
+        write_geotiff(os.path.join(folder, 'wide.tif'), wide,
+                      lattice_geotransform(CELL_LON0 + 2, CELL_LAT0, CELL_PER_DEGREE, CELL_PER_DEGREE, extent_x=2))
+        result = _convert(folder, os.path.join(tmp_dir, 'out2'), _profile(tmp_dir))
+        assert result.exit_code == 1
+        assert any('--dted-naming cell' in line for line in log_lines)
+        assert not os.path.exists(os.path.join(tmp_dir, 'out2'))
+
+    def test_a_wide_raster_gives_two_cells_that_share_a_column(self, tmp_dir):
+        from egmtrans.dted.records import read_records
+        from tests.conftest import lattice_geotransform, synthetic_cell
+
+        folder = os.path.join(tmp_dir, 'in')
+        os.makedirs(folder)
+        left = synthetic_cell(CELL_PER_DEGREE, base_cm=40000)
+        right = synthetic_cell(CELL_PER_DEGREE, seed_offset=1, base_cm=40000)
+        right[:, 0] = left[:, -1]
+        left[100:200, 250:] = 350.0
+        right[100:200, :60] = 350.0
+        wide = np.concatenate([left, right[:, 1:]], axis=1)
+        write_geotiff(os.path.join(folder, 'wide.tif'), wide,
+                      lattice_geotransform(CELL_LON0, CELL_LAT0, CELL_PER_DEGREE, CELL_PER_DEGREE, extent_x=2))
+        out = os.path.join(tmp_dir, 'out')
+        result = _shifted(folder, out, _profile(tmp_dir))
+        assert result.exit_code == 0 and result.files_processed == 2 and len(result.units) == 2
+        a = read_records(os.path.join(out, 'N85E030.dt2')).values
+        b = read_records(os.path.join(out, 'N85E031.dt2')).values
+        assert np.array_equal(a[:, -1], b[:, 0]), 'the shared column differs'
+        lake_a, lake_b = np.unique(a[1200:2389, 500:]), np.unique(b[1200:2389, :119])
+        assert lake_a.size == 1 and lake_b.size == 1 and lake_a[0] == lake_b[0]
+        assert result.seam_checks and all(check.clean for check in result.seam_checks)
+
+    def test_band_boundary_pair_shares_its_row_and_the_seam_report_sees_a_bad_copy(self, tmp_dir, log_lines):
+        from egmtrans.dted.records import read_edges
+        from egmtrans.dted.selftest import COARSE, FINE, LAT0_SOUTH, LON0, northern_tile, southern_tile, write_tile
+
+        folder = os.path.join(tmp_dir, 'in')
+        os.makedirs(folder)
+        north = northern_tile()
+        south = southern_tile(north)
+        write_tile(os.path.join(folder, 'south.tif'), south, LON0, LAT0_SOUTH, FINE, FINE)
+        write_tile(os.path.join(folder, 'north.tif'), north, LON0, LAT0_SOUTH + 1, COARSE, FINE)
+        out = os.path.join(tmp_dir, 'out')
+        result = _convert(folder, out, _profile(tmp_dir), naming='cell')
+        assert result.exit_code == 0 and result.files_processed == 2
+        assert len(result.seam_checks) == 1 and result.seam_checks[0].clean
+        assert result.seam_checks[0].shared == 1801
+        south_edge = read_edges(os.path.join(out, 'N49E006.dt2'))['north']
+        north_edge = read_edges(os.path.join(out, 'N50E006.dt2'))['south']
+        assert np.array_equal(south_edge[::2], north_edge)
+        assert any('1 seam(s), 1,801 shared posts, 0 seam(s) with posts that differ' in line for line in log_lines)
+
+        # An edge row that is not a copy of the coarser row is resampled as it is, and the report says so.
+        south[0] = north[-1][np.arange(FINE + 1) * COARSE // FINE]  # a nearest-neighbor copy rounded down: not the rule
+        south[0, 1] += 1.0
+        write_tile(os.path.join(folder, 'south.tif'), south, LON0, LAT0_SOUTH, FINE, FINE)
+        log_lines.clear()
+        result = _convert(folder, os.path.join(tmp_dir, 'out2'), _profile(tmp_dir), naming='cell')
+        assert result.exit_code == 0
+        assert len(result.seam_checks) == 1 and not result.seam_checks[0].clean
+        assert any(line.startswith('  Seam ') and 'differ' in line for line in log_lines)
+
+    def test_context_cells_and_a_table_reproduce_the_full_run(self, tmp_dir):
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder, cells=((0, 0), (1, 0)), lake_across=True)
+        profile = _profile(tmp_dir)
+        full = _shifted(folder, os.path.join(tmp_dir, 'full'), profile, export=os.path.join(tmp_dir, 'levels.csv'))
+        assert full.exit_code == 0 and full.files_processed == 2
+        reference = _sha(os.path.join(tmp_dir, 'full', 'N85E030.dt2'))
+
+        west = os.path.join(tmp_dir, 'west')
+        os.makedirs(west)
+        shutil.copy(os.path.join(folder, 'tile_85_30.tif'), west)
+        with_context = _shifted(west, os.path.join(tmp_dir, 'ctx'), profile, context=[folder])
+        assert with_context.exit_code == 0
+        assert _sha(os.path.join(tmp_dir, 'ctx', 'N85E030.dt2')) == reference
+        table = os.path.join(tmp_dir, 'levels.csv')
+        with_table = _shifted(west, os.path.join(tmp_dir, 'tab'), profile, table=table)
+        assert with_table.exit_code == 0
+        assert _sha(os.path.join(tmp_dir, 'tab', 'N85E030.dt2')) == reference
+        # Alone, the lake's level is the minimum over its western part only.
+        from egmtrans.dted.records import read_records
+
+        alone = _shifted(west, os.path.join(tmp_dir, 'alone'), profile)
+        assert alone.exit_code == 0
+        assert len(full.water_bodies) == 1 and full.water_bodies[0].tile_ids == [0, 1]
+        level_full = read_records(os.path.join(tmp_dir, 'full', 'N85E030.dt2')).values[1800, 550]
+        level_alone = read_records(os.path.join(tmp_dir, 'alone', 'N85E030.dt2')).values[1800, 550]
+        assert level_alone >= level_full
+
+    def test_tile_order_does_not_change_the_bytes(self, tmp_dir):
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder, cells=((0, 0), (1, 0)), lake_across=True)
+        profile = _profile(tmp_dir)
+        first = _shifted(folder, os.path.join(tmp_dir, 'first'), profile)
+        reversed_folder = os.path.join(tmp_dir, 'reversed')
+        os.makedirs(reversed_folder)
+        shutil.copy(os.path.join(folder, 'tile_85_30.tif'), os.path.join(reversed_folder, 'z_east_first.tif'))
+        shutil.copy(os.path.join(folder, 'tile_85_31.tif'), os.path.join(reversed_folder, 'a_west_last.tif'))
+        second = _shifted(reversed_folder, os.path.join(tmp_dir, 'second'), profile)
+        assert first.exit_code == 0 and second.exit_code == 0
+        for name in ('N85E030.dt2', 'N85E031.dt2'):
+            assert _sha(os.path.join(tmp_dir, 'first', name)) == _sha(os.path.join(tmp_dir, 'second', name))
+
+    def test_a_failed_cell_leaves_nothing_and_the_run_goes_on(self, tmp_dir, monkeypatch):
+        from egmtrans import io as egm_io
+
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder, cells=((0, 0), (1, 0)))
+        original = egm_io._verify_dted
+
+        def flaky(path, cell, posts):
+            if cell.cell_id == 'N85E031':
+                raise RuntimeError('verification failed on purpose')
+            original(path, cell, posts)
+
+        monkeypatch.setattr(egm_io, '_verify_dted', flaky)
+        out = os.path.join(tmp_dir, 'out')
+        result = _convert(folder, out, _profile(tmp_dir), naming='cell', create_mask=True)
+        assert result.exit_code == 1 and result.files_processed == 1
+        assert sorted(os.listdir(out)) == ['N85E030.dt2', 'N85E030_mask.tif']
+        assert result.failed == [('tile_85_31.tif [N85E031]', 'transformation failed')]
+
+    def test_header_problems_stop_the_run_before_anything_is_written(self, tmp_dir, log_lines):
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder)
+        out = os.path.join(tmp_dir, 'out')
+        result = _convert(folder, out, _profile(tmp_dir, level=1))
+        assert result.exit_code == 1 and not os.path.exists(out)
+        assert any('profile is for level 1, not 2' in line for line in log_lines)
+        from egmtrans.dted.writer import DtedMetadataSource
+
+        result = run_batch(resolve_io_paths(folder, out, dted_level=2), 'EGM2008', 'EGM2008', True, False, 400,
+                           'bilinear', assume_yes=True, dted_metadata=DtedMetadataSource(), dted_level=2)
+        assert result.exit_code == 1 and not os.path.exists(out)
+        assert any('needs --dted-profile and/or --dted-index' in line for line in log_lines)
+
+
+def test_an_empty_run_never_offers_to_delete_the_input_folder(tmp_dir):
+    from egmtrans.cli import _may_offer_delete
+
+    folder = os.path.join(tmp_dir, 'data')
+    os.makedirs(os.path.join(folder, 'sub'))
+    assert not _may_offer_delete(folder, folder)
+    assert not _may_offer_delete(folder, os.path.join(folder, 'sub'))
+    assert not _may_offer_delete(os.path.join(folder, 'sub'), folder)
+    assert _may_offer_delete(folder, os.path.join(tmp_dir, 'out'))

@@ -1,4 +1,4 @@
-"""Command-line interface — process_file, main, and helpers.
+"""Command-line interface: process_file, main, and helpers.
 
 ``process_file`` is the primary public entry point used by both the CLI and
 the ArcGIS Pro toolbox.  It validates inputs, checks for datum mismatches
@@ -21,8 +21,9 @@ import time
 from osgeo import gdal
 
 from egmtrans import _state
+from egmtrans._version import __version__
 from egmtrans.arcpy_compat import init_arcpy
-from egmtrans.batch import run_batch
+from egmtrans.batch import plan_units, run_batch
 from egmtrans.cli_dted import SUBCOMMANDS
 from egmtrans.config import (
     DTED_EXTENSIONS,
@@ -34,11 +35,13 @@ from egmtrans.config import (
 )
 from egmtrans.crs import standardize_srs
 from egmtrans.download import ensure_grids
-from egmtrans.dted.header import read_header
+from egmtrans.dted.header import CellGeometry, read_header
 from egmtrans.dted.validate import count as count_issues
 from egmtrans.dted.writer import DtedMetadataSource
 from egmtrans.file_utils import (
+    DTED_NAMING_PRESETS,
     IOPaths,
+    dted_naming_template,
     is_valid_dem,
     prepare_output_target,
     resolve_io_paths,
@@ -59,20 +62,34 @@ DTED_REQUIRES_BILINEAR = True
 
 
 def log_numba_availability() -> None:
-    """Log whether Numba is available for JIT compilation."""
+    """Log whether Numba is available, and which Numba (ArcGIS mode)."""
     logger = _state.get_logger()
     if NUMBA_AVAILABLE:
-        msg = (
-            "Python's Numba library is available. "
-            "Flat and ocean patches will be processed in parallel for maximum speed."
-        )
+        import numba
+
+        logger.info(f'Numba {numba.__version__} is available: compiled kernels are in use.')
     else:
-        msg = (
-            "Python's Numba library is not available. "
-            "Flattening and interpolation will be MUCH slower (20-50 times!).\n"
-            "NGA recommends using a custom ArcGIS Pro environment with Numba installed for faster execution."
+        logger.warning(
+            'Numba is not available: the kernels run as plain Python, which is much slower on large tiles. '
+            'A custom ArcGIS Pro environment with Numba installed is faster; the results are the same.'
         )
-    logger.info(msg)
+
+
+def versions_line() -> str:
+    """What two producers compare first: the versions behind a run."""
+    import numpy
+    from osgeo import gdal as _gdal
+
+    numba_version = 'absent'
+    if NUMBA_AVAILABLE:
+        import numba
+
+        numba_version = numba.__version__
+    python = '.'.join(str(part) for part in sys.version_info[:3])
+    return (
+        f'EGMTrans {__version__}, Python {python}, GDAL {_gdal.__version__}, numpy {numpy.__version__}, '
+        f'numba {numba_version}'
+    )
 
 
 def str2bool(v: str | bool | None) -> bool:
@@ -236,11 +253,15 @@ def check_file_datum(
     return True
 
 
-def check_same_datum(input_file: str, source_datum: str, target_datum: str, arc_mode: bool, assume_yes: bool) -> bool:
+def check_same_datum(
+    input_file: str, source_datum: str, target_datum: str, arc_mode: bool, assume_yes: bool, converting: bool = False
+) -> bool:
     """Handle a run whose source and target datums are the same.
 
     A GeoTIFF is then rewritten as an optimized copy with a compound CRS after
-    a confirmation (CLI); a DTED file is refused.
+    a confirmation (CLI); a DTED file is refused. A conversion to DTED
+    (*converting*) goes on without asking: the cell is resampled and its
+    water flattened whatever the datum.
 
     Returns:
         False if the run should not go on.
@@ -251,6 +272,9 @@ def check_same_datum(input_file: str, source_datum: str, target_datum: str, arc_
     """
     logger = _state.get_logger()
     if source_datum != target_datum:
+        return True
+    if converting:
+        logger.info('Source and target vertical datums are the same: the cell is resampled, not shifted.')
         return True
     if input_file.lower().endswith(DTED_EXTENSIONS):
         logger.error("Source and target vertical datums are the same.\nAborting transformation.")
@@ -271,6 +295,37 @@ def check_same_datum(input_file: str, source_datum: str, target_datum: str, arc_
     return True
 
 
+def conversion_cell(input_file: str, output_file: str, dted_cell: CellGeometry | None) -> CellGeometry | None:
+    """The DTED cell a GeoTIFF input is converted to, or None for a transform.
+
+    A ``.dtN`` output with a GeoTIFF input is a conversion: the cell is
+    *dted_cell* when the caller names it (a batch run does), else the one
+    whole cell the raster covers.
+
+    Raises:
+        ValueError: If the raster cannot become DTED, covers no whole cell or
+            several, or *dted_cell* is not at the output's level.
+    """
+    output_is_dted = output_file.lower().endswith(DTED_EXTENSIONS)
+    input_is_dted = input_file.lower().endswith(DTED_EXTENSIONS)
+    if not output_is_dted or input_is_dted:
+        if dted_cell is not None:
+            raise ValueError('A cell can only be named for a GeoTIFF written as DTED')
+        return None
+    level = int(output_file[-1])
+    if dted_cell is not None:
+        if dted_cell.level != level:
+            raise ValueError(f'Cell {dted_cell.cell_id} is level {dted_cell.level}, but the output is level {level}')
+        return dted_cell
+    units = plan_units([(input_file, None)], level, 'cell', os.path.dirname(input_file), os.path.dirname(output_file))
+    if len(units) != 1:
+        raise ValueError(
+            f'{os.path.basename(input_file)} covers {len(units)} whole cells; write it to a folder with '
+            f'--dted-level and --dted-naming to get one DTED file per cell'
+        )
+    return units[0].cell
+
+
 def process_file(
     input_file: str,
     output_file: str,
@@ -288,19 +343,26 @@ def process_file(
     tile_levels: TileLevels | None = None,
     min_containment: float = DEFAULT_CONTAINMENT,
     dted_metadata: DtedMetadataSource | None = None,
+    *,
+    dted_cell: CellGeometry | None = None,
 ) -> bool:
-    """Process a single file for vertical datum transformation.
+    """Process a single file for vertical datum transformation, or convert a
+    GeoTIFF cell to DTED.
 
     Performs comprehensive validation before calling
     :func:`~egmtrans.transform.transform_vertical_datum`:
 
     1. Validates file format and accessibility.
-    2. Checks datum compatibility (DTED cannot target WGS84, etc.) and that a
-       DTED output uses the bilinear algorithm (see :data:`DTED_REQUIRES_BILINEAR`).
-    3. Verifies the file's CRS/header matches the stated source datum;
+    2. Checks datum compatibility (DTED cannot target WGS84, etc.), that a
+       DTED output uses the bilinear algorithm (see :data:`DTED_REQUIRES_BILINEAR`),
+       and that a DTED input is not written at another level.
+    3. For a GeoTIFF written as DTED, finds the cell to convert
+       (:func:`conversion_cell`) and checks that its header can be completed.
+    4. Verifies the file's CRS/header matches the stated source datum;
        prompts the user (CLI) or logs a warning (ArcGIS) on mismatch.
-    4. Disables flattening for WGS84 transforms (orthometric-only operation).
-    5. Handles same-datum copies (optimized GeoTIFF with compound CRS).
+    5. Disables flattening for WGS84 transforms (orthometric-only operation).
+    6. Handles same-datum copies (optimized GeoTIFF with compound CRS); a
+       conversion goes on without asking.
 
     Args:
         input_file: Path to the input DEM.
@@ -322,6 +384,8 @@ def process_file(
             for the area to count as a water body.
         dted_metadata: The DTED metadata index and product profile for the
             header of a DTED output (``--dted-index``, ``--dted-profile``).
+        dted_cell: The cell of a GeoTIFF written as DTED, when a batch run
+            names it; found from the raster otherwise.
 
     Returns:
         ``True`` if the file was transformed, ``False`` if the transformation
@@ -349,8 +413,17 @@ def process_file(
         )
         return False
 
-    if output_is_dted and not input_is_dted:
-        logger.error('DTED files can only be created from other DTED files.\nAborting transformation.')
+    if input_is_dted and output_is_dted and input_file[-1] != output_file[-1]:
+        logger.error(
+            f'A DTED file keeps its level: {os.path.basename(input_file)} cannot be written as '
+            f'{os.path.basename(output_file)}.\nAborting transformation.'
+        )
+        return False
+
+    try:
+        cell = conversion_cell(input_file, output_file, dted_cell)
+    except ValueError as e:
+        logger.error(f'{e}\nAborting transformation.')
         return False
 
     if output_is_dted and target_datum == 'WGS84':
@@ -381,6 +454,22 @@ def process_file(
         )
         return False
 
+    if cell is not None and tile_levels is None:
+        # The batch run checked its cells before writing anything; a single
+        # conversion checks its own header now, before the datum prompts.
+        from egmtrans.io import new_dted_header
+
+        source = dted_metadata if dted_metadata is not None and not dted_metadata.empty else None
+        try:
+            metadata = source.for_cell(cell.cell_id) if source is not None else None
+            new_dted_header(cell, target_datum, abs_horiz_accuracy, metadata=metadata)
+        except (ValueError, LookupError) as e:
+            logger.error(
+                f'The DTED header of cell {cell.cell_id} cannot be completed: {e}\n'
+                f'A DTED cell made from GeoTIFF needs --dted-profile and/or --dted-index.\nAborting transformation.'
+            )
+            return False
+
     if not check_file_datum(input_file, output_file, source_datum, arc_mode, assume_yes, prompt=check_for_wrong_datum):
         return False
 
@@ -388,7 +477,7 @@ def process_file(
         logger.info("Flattening is not supported for WGS84 ellipsoid height transforms. Proceeding without flattening.")
         flatten = False
 
-    if not check_same_datum(input_file, source_datum, target_datum, arc_mode, assume_yes):
+    if not check_same_datum(input_file, source_datum, target_datum, arc_mode, assume_yes, converting=cell is not None):
         return False
 
     try:
@@ -396,7 +485,7 @@ def process_file(
             input_file, output_file, source_datum, target_datum,
             flatten, create_mask, min_patch_size, algorithm,
             abs_horiz_accuracy, save_log, tile_levels=tile_levels, min_containment=min_containment,
-            dted_metadata=dted_metadata,
+            dted_metadata=dted_metadata, cell=cell,
         )
     except Exception as e:
         logger.error(f"Transformation failed: {e}.")
@@ -497,11 +586,25 @@ def main() -> None:
         "--dted-profile", metavar="FILE",
         help="DTED product profile (TOML) of header constants; the index row overrides it field by field.",
     )
+    parser.add_argument(
+        "--dted-level", type=int, choices=[0, 1, 2], default=None,
+        help="Write every GeoTIFF input as DTED of this level, one file per whole one-degree cell it covers "
+             "(DTED inputs keep their level). The GeoTIFF must lie on the whole-degree lattice, as TanDEM-X "
+             "tiles do. A .dt0/.dt1/.dt2 output name for a single GeoTIFF needs no level.",
+    )
+    parser.add_argument(
+        "--dted-naming", default="stem", metavar="NAME|TEMPLATE",
+        help="How DTED cells made from GeoTIFF are named under the output folder: "
+             + ", ".join(f"'{k}' ({v})" for k, v in DTED_NAMING_PRESETS.items())
+             + ", or a template with {stem}, {dir}, {cell}, {lat}, {lon} and {level}; the extension is added "
+             "(default: stem).",
+    )
 
     args = parser.parse_args()
 
     try:
-        paths = resolve_io_paths(args.input, args.output)
+        paths = resolve_io_paths(args.input, args.output, dted_level=args.dted_level)
+        dted_naming_template(args.dted_naming)
     except ValueError as e:
         parser.error(str(e))
     if not 0.0 <= args.containment <= 1.0:
@@ -526,9 +629,10 @@ def main() -> None:
         sys.exit(1)
 
     logger = setup_logger(paths.log_path if args.log_file else None, args.log_file, False)
+    logger.info(versions_line())
 
     if not dted_metadata.empty:
-        issues = dted_metadata.validate()
+        issues = dted_metadata.validate(args.dted_level)
         for issue in issues:
             if issue.severity == 'error':
                 logger.error(str(issue))
@@ -586,12 +690,25 @@ def main() -> None:
     sys.exit(exit_code)
 
 
+def _may_offer_delete(input_path: str, output_path: str) -> bool:
+    """Whether deleting the output folder after an empty run could not touch
+    the inputs: never when the two folders are the same or one holds the other."""
+    source = os.path.normcase(os.path.abspath(input_path))
+    target = os.path.normcase(os.path.abspath(output_path))
+    try:
+        if os.path.commonpath([source, target]) in (source, target):
+            return False
+    except ValueError:
+        return True
+    return True
+
+
 def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) -> int:
     """Transform one file or every DEM under a folder; return the exit code."""
     exit_code = 0
     batch_options = args.context or args.water_levels or args.export_water_levels
 
-    if paths.mode == 'file' and not batch_options:
+    if paths.mode == 'file' and not batch_options and paths.dted_level is None:
         logger.info(f"Processing file: {paths.output_path}")
         if process_file(
             paths.input_path, paths.output_path, args.source_datum, args.target_datum,
@@ -608,10 +725,11 @@ def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) 
             context_folders=args.context, water_levels=args.water_levels,
             export_water_levels=args.export_water_levels, min_containment=args.containment,
             dted_metadata=getattr(args, 'dted_metadata', None),
+            dted_level=paths.dted_level, dted_naming=args.dted_naming,
         )
         exit_code = result.exit_code
 
-        if paths.mode == 'folder' and result.files_processed == 0:
+        if paths.mode == 'folder' and result.files_processed == 0 and _may_offer_delete(args.input, args.output):
             logger.info(
                 f"NOTE: No DEM under {args.input} was transformed. The output directory "
                 f"{args.output} holds at most copies of the other files."

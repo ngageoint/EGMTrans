@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
-EGMTrans transforms vertical datums between the WGS 84 ellipsoid and the EGM96 and EGM2008 geoids for DTED and GeoTIFF files. It resamples NGA's global geoid undulation models at one arc minute (~1.8 km) resolution to the input DEM resolution using bilinear, thin plate spline, or Delaunay triangulation interpolation, then applies the difference to generate the output DEM. It can be run as an ArcGIS Pro toolbox or a standalone Python script.
+EGMTrans transforms vertical datums between the WGS 84 ellipsoid and the EGM96 and EGM2008 geoids for DTED and GeoTIFF files, and makes DTED0, DTED1 and DTED2 directly from GeoTIFF tiles that lie on the whole-degree lattice. It resamples NGA's global geoid undulation models at one arc minute (~1.8 km) resolution to the input DEM resolution using bilinear, thin plate spline, or Delaunay triangulation interpolation, then applies the difference to generate the output DEM. It can be run as an ArcGIS Pro toolbox or a standalone Python script.
 
 The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS, stores the full-resolution geoid models and allows users to interrogate datum transformations performed by this tool or other software and identify datum errors.
 
@@ -34,6 +34,7 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - [DTED Header Handling](#dted-header-handling)
 - [DTED Header Report](#dted-header-report)
 - [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)
+- [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)
 - [Notes](#notes)
 - [Constraints](#constraints)
 - [Troubleshooting](#troubleshooting)
@@ -50,6 +51,7 @@ The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS,
 - Creates optional mask files of the ocean and the water bodies for quality control
 - Reports and validates every field of a DTED header against MIL-PRF-89020B, as text, JSON, CSV or Markdown
 - Fills DTED headers from a collection-wide metadata index (GeoPackage or GeoParquet) and a product profile, so a production run writes the same header fields on every machine
+- Makes DTED0, DTED1 and DTED2 directly from GeoTIFF tiles on the whole-degree lattice (TanDEM-X and similar products), one file per cell, with the same bytes on every computer; `egmtrans dted-selftest` proves it on yours
 - Utilizes parallel processing for improved performance on multi-core systems
 - Runs unattended in a Docker container that carries its own geoid grids and needs no network access
 - Supports multiple interpolation algorithms (bilinear, thin plate spline, and Delaunay triangulation)
@@ -144,7 +146,7 @@ For restricted environments without access to Anaconda or custom ArcGIS Pro envi
 
 The geoid grid GeoTIFFs (~1.3 GB total) are hosted as [GitHub Release assets](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1), not stored in the repository itself.
 
-Both the command-line tool and the ArcGIS Pro toolbox download any missing grid files automatically on first run -- no manual step required. If you prefer to pre-populate the `datums/` folder up front (e.g. on an offline machine, or to avoid the download delay inside ArcGIS Pro), you can run:
+Both the command-line tool and the ArcGIS Pro toolbox download any missing grid files automatically on first run – no manual step required. If you prefer to pre-populate the `datums/` folder up front (e.g. on an offline machine, or to avoid the download delay inside ArcGIS Pro), you can run:
 
 ```bash
 python download_grids.py
@@ -278,12 +280,14 @@ Note: While Numba is recommended for optimal performance, EGMTrans will still fu
    - **Minimum Containment**: The share of a flat area's boundary that must lie above it for the area to count as a water body; defaults to 0.8 (see [Notes](#notes)).
    - **DTED Metadata Index**: A GeoPackage or GeoParquet index whose row for the output cell fills the DTED header; a cell the index does not hold fails (see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
    - **DTED Product Profile**: A TOML file of header constants for the product; the index row overrides it field by field.
+   - **DTED Level**: Write every GeoTIFF input as DTED of this level, one file per whole one-degree cell it covers; DTED inputs keep their level (see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)).
+   - **DTED Output Naming**: How the cells are named under the output folder: `stem`, `cell`, `dted`, or a template.
 
 5. Click "Run" to execute the tool.
 
 6. The tool will process the input file(s) and create the transformed output(s) in the specified location.
 
-The *DTED Header Report* tool in the same toolbox reports and validates the header of a DTED file or of every DTED file under a folder: choose the format (text, JSON, CSV or Markdown), an optional report file, whether to check the elevation records too, and whether to count byte positions from 0 instead of the specification's 1. Findings appear as errors and warnings in the messages, and a text report is shown there when no report file is given.
+The *DTED Header Report* tool in the same toolbox reports and validates the header of a DTED file or of every DTED file under a folder: choose the format (text, JSON, CSV or Markdown), an optional report file, whether to check the elevation records too, and whether to count byte positions from 0 instead of the specification's 1. Findings appear as errors and warnings in the messages, and a text report is shown there when no report file is given. The *DTED Self-Test* tool converts built-in synthetic tiles and checks that this computer reproduces the reference bytes (see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)).
 
 ## Using EGMTrans on the Command Line
 
@@ -291,9 +295,10 @@ The basic syntax for using EGMTrans in a terminal or command prompt is:
 
 ```
 python EGMTrans.py -i INPUT -o OUTPUT -s SOURCE_DATUM -t TARGET_DATUM \
-  [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-c CONTAINMENT] [-a ALGORITHM] [-y] \
+  [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-c CONTAINMENT] [-a ALGORITHM] \
+  [--abs_horiz_accuracy METERS] [-l LOG_FILE] [-y] \
   [--context FOLDER] [--water-levels FILE] [--export-water-levels FILE] \
-  [--dted-index FILE] [--dted-profile FILE]
+  [--dted-index FILE] [--dted-profile FILE] [--dted-level N] [--dted-naming NAME]
 ```
 
 Arguments:
@@ -314,19 +319,23 @@ Arguments:
 - `--water-levels FILE`: A table written by `--export-water-levels` in an earlier run; a water body found in it takes the table's level when that is lower than the level found in this run (optional).
 - `--dted-index FILE`: A DTED metadata index (`.gpkg` or `.parquet`) whose row for the output cell fills the DTED header; a cell the index does not hold fails (optional; see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
 - `--dted-profile FILE`: A DTED product profile (TOML) of header constants; the index row overrides it field by field (optional).
+- `--dted-level N`: Write every GeoTIFF input as DTED of level `N` (0, 1 or 2), one file per whole one-degree cell it covers; DTED inputs keep their level (optional; see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)). A single GeoTIFF written to a `.dt0`, `.dt1` or `.dt2` output name needs no level.
+- `--dted-naming NAME|TEMPLATE`: How the cells made from GeoTIFF are named under the output folder: `stem` (the input's folder and name), `cell` (`N49E006.dt2`), `dted` (`E006/N49.dt2`), or a template with `{stem}`, `{dir}`, `{cell}`, `{lat}`, `{lon}` and `{level}`; the extension is added (optional; default: `stem`).
 
-Two subcommands serve DTED headers; each has its own `--help`:
+Three subcommands serve DTED; each has its own `--help`:
 
 ```
 egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH] [--zero-based] [--check-data] [--strict]
 egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH... | --from-footprints FILE) \
   [--profile FILE] [--level N] [--product NAME] [--update]
 egmtrans dted-index validate INDEX [--profile FILE] [--level N]
+egmtrans dted-selftest [--keep FOLDER]
 ```
 
 The input and output must both be files or both be folders, except that a single input file may be
-written into an output folder, in which case it keeps its own filename. An output path ending in
-`.tif`, `.tiff`, `.dt0`, `.dt1`, or `.dt2` is treated as a file; anything else is treated as a folder.
+written into an output folder, in which case it keeps its own filename (with the DTED extension when a
+level is given). An output path ending in `.tif`, `.tiff`, `.dt0`, `.dt1`, or `.dt2` is treated as a
+file; anything else is treated as a folder.
 
 **Exit codes:** `0` success, `1` a transformation failed, `2` an argument or path error, or a prompt that could not be answered.
 
@@ -389,6 +398,21 @@ python EGMTrans.py -i "cell_18_EGM2008" -o "cell_18_EGM96" -s EGM2008 -t EGM96 -
   --water-levels "cell_17_levels.csv" -c 0.9
 ```
 
+8. Make a DTED2 cell from one TanDEM-X tile, with the header filled from a product profile:
+
+```bash
+python EGMTrans.py -i "TDF_N50W001_01_DEM.tif" -o "N50W001.dt2" -s EGM2008 -t EGM96 -y \
+  --dted-profile "samples/dted_profile_example.toml"
+```
+
+9. Make DTED2 from every tile under a folder, one file per cell named `TDF-DTED2_E006N49.dt2`, with the headers filled from the collection's index and profile, and check that this computer reproduces the reference bytes first:
+
+```bash
+egmtrans dted-selftest
+python EGMTrans.py -i "tdf_tiles" -o "tdf_dted2" -s EGM2008 -t EGM96 -y --dted-level 2 \
+  --dted-naming "TDF-DTED{level}_{lon}{lat}" --dted-index "tdf_dted2.gpkg" --dted-profile "tdf_dted2.toml"
+```
+
 ## Run in a Container
 
 The `Dockerfile` builds an image with GDAL, NumPy, SciPy and Numba from conda-forge, the two 1-arc-minute geoid grids (downloaded during the build and checked against their pinned SHA-256 hashes), and precompiled Numba kernels. A container needs no network access at run time.
@@ -408,7 +432,7 @@ docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/data" egmtra
 - Pass `-y`: a container has no terminal to answer a confirmation prompt, so without it EGMTrans stops with exit code `2` instead.
 - `--user` makes the outputs belong to you rather than to the image's non-root `egmtrans` user (UID 10001).
 - For large batches, run one container per region with `NUMBA_NUM_THREADS=1` and as many containers as cores. A water body that crosses a tile edge gets one level only when both tiles are in the same run (or the neighbor is given as `--context`), so split a batch along boundaries that no lake or river crosses, such as coastlines or divides. For single, on-demand tiles, leave Numba all cores.
-- `docker/smoke_test.sh` builds the image and checks a GeoTIFF and a DTED transform with the network disabled.
+- `docker/smoke_test.sh` builds the image and checks a GeoTIFF transform, a DTED transform, the self-test and a DTED made from a GeoTIFF, with the network disabled.
 - `benchmarks/benchmark_tiles.py` measures seconds and memory per tile on your own data; see [`benchmarks/README.md`](benchmarks/README.md).
 
 ## EGMTrans Explorer
@@ -499,7 +523,7 @@ The geometry fields of a DTED header follow from the raster, but the accuracies 
 - A **metadata index**, a GeoPackage (`.gpkg`) or GeoParquet (`.parquet`) file with one row per one-degree cell, keyed by `cell_id` (`N38E045`), built and checked with `egmtrans dted-index`. The index is also a catalog of the collection that other services can read, filter and style: every row carries the cell polygon.
 - A **product profile**, a TOML file of the values that are the same for every cell of a product. `samples/dted_profile_example.toml` follows a TDF-DTED2 production header.
 
-When a header is written, its fields are filled in order of precedence: values derived from the cell geometry, the target datum and the data (sentinels, origin, intervals, counts, corners, series, vertical and horizontal datum, partial cell indicator, the multiple-accuracy flags, the UHL copies of the security code and the vertical accuracy) can never be overridden; then the cell's index row; then the profile; then the `--abs_horiz_accuracy` fallback; then the input file's header; then the specification's fill (NA, `0000`, blanks). A cell the index does not hold stops the run before anything is written. A `vertical_datum` or `horizontal_datum` the profile or index states for another product (`E96` in an index harvested from the EGM96 collection, for an EGM2008 output) is reported as a warning and the output keeps its own code. A NULL accuracy in the index means NA, so the profile's accuracies serve runs without an index. Every field's source is logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
+When a header is written, its fields are filled in order of precedence: values derived from the cell geometry, the target datum and the data (sentinels, origin, intervals, counts, corners, series, vertical and horizontal datum, partial cell indicator, the multiple-accuracy flags, the UHL copies of the security code and the vertical accuracy) can never be overridden; then the cell's index row; then the profile; then the input file's header (for a DTED input); then the `--abs_horiz_accuracy` fallback, which fills its field only when it is still NA; then the specification's fill (NA, `0000`, blanks). A cell the index does not hold stops the run before anything is written, and so does an index or profile made for another DTED level. For a DTED cell made from a GeoTIFF there is no input header: the security code, the edition, the match/merge version, the producer code, the compilation date and the four accuracies must come from the index, the profile or `--abs_horiz_accuracy`, and the run stops before writing when one of them has no source (an explicit NA counts). A `vertical_datum` or `horizontal_datum` the profile or index states for another product (`E96` in an index harvested from the EGM96 collection, for an EGM2008 output) is reported as a warning and the output keeps its own code. A NULL accuracy in the index means NA, so the profile's accuracies serve runs without an index. Every field's source is logged, the validator's warnings on the result are logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
 
 Index columns (layer `dted_cells`; dates are ISO dates and are written as YYMM):
 
@@ -544,18 +568,33 @@ The profile's `[harvest.tags.fields]` map index columns to raster metadata tags 
 egmtrans -i in/N55.dt2 -o out/N55.dt2 -s EGM2008 -t EGM96 --dted-index tdf_dted2.gpkg --dted-profile tdf_dted2.toml
 ```
 
+## Creating DTED from GeoTIFF
+
+With `--dted-level` (or a `.dt0`, `.dt1` or `.dt2` output name for a single file), a GeoTIFF becomes DTED without an intermediate product, so the vertical transform works on the unrounded heights. The source must be in geographic coordinates on WGS 84, pixel-is-point, with a whole number of posts per degree on each axis and a post on every whole degree, as TanDEM-X tiles are; each whole one-degree cell it covers becomes one DTED file. The heights are kept as they are read: a band with a scale or offset, a rotated or projected raster, or one off the lattice is refused.
+
+How a cell is made:
+
+- **Resampling.** Every DTED post lies at a rational position between source posts, so bilinear interpolation is a mean with whole-number weights (halves and thirds for TanDEM-X spacings), computed exactly. A void source post is dropped and the weights renormalized; a post is void when no valid neighbor carries weight. The lower levels are the finished DTED2 thinned (every third post for DTED1, every thirtieth for DTED0), so the three levels agree at every common post.
+- **Water.** Flat areas and the containment test (`-p`, `-c`) are judged on the source grid, where rivers and lakes were flattened, and carried to the cell: a DTED post belongs to a water body when every source post that contributes to it does. Enclosed low spots beside a water body are raised to its level (see [Notes](#notes)), when they are enclosed on the source grid as well.
+- **Longitude-spacing boundaries.** On the TanDEM-X boundaries at 50, 60, 70, 80 and 85 degrees, the tile on the equator side carries a copy of the coarser tile's edge row. EGMTrans recovers that row and resamples from it, so the two cells derive their shared row from the same data and agree post for post.
+- **Geoid correction.** The correction is evaluated on the arc-minute lattice of the 1' grids with the same whole-number weights, and the grids are checked against their published SHA-256 before a cell is written.
+- **Writing.** EGMTrans writes the header and the elevation records itself, verifies the file (header, records, checksums, and GDAL reading it back) and only then gives it the output name. The log records the versions of EGMTrans, Python, GDAL, numpy and Numba, the SHA-256 of the grids read, and the size and SHA-256 of every DTED written.
+
+The same version of EGMTrans, the same grids and the same inputs give the same bytes on every computer, with or without Numba, in a terminal or in ArcGIS Pro. "The same inputs" includes the other tiles of the run, the context folders and the water-levels table, since they decide the levels of water bodies that cross cell edges, and the index and the profile, which fill the header; distribute the index rather than rebuilding it per computer. `egmtrans dted-selftest` converts two built-in synthetic tiles and compares the bytes with the reference pinned in EGMTrans, so each producer can prove their installation before a run. After a batch run, the shared posts of the DTED outputs along every seam are read back and compared; the log reports any that differ.
+
 ## Notes
 
-- When processing DTED files, the output must also be in DTED format.
+- When processing DTED files, the output must also be in DTED format, at the same level.
 - DTED files can only use EGM96 or EGM2008 as vertical datums, not WGS84.
-- Flat areas: every 4-connected patch of at least `-p` posts with one height (to 1 cm; whole meters for DTED) is a candidate water body. It counts as one when at least `-c` (default 80%) of its boundary posts lie above it in the input; ocean neighbors are neutral, so lagoons and river mouths qualify. A contour band on a gentle slope is bounded above on one side and below on the other (about 50%), a flat hilltop or a roof almost entirely below (near 0%), while lakes, basins and coastal flats measure above 80% on the sample tiles; the rest are left as terrain and transformed post by post. In a batch run the share is summed over every part of a water body, so both sides of a seam reach the same verdict. The ocean (0 m) stays at 0. Every water body is set to the lowest of its transformed values, so no land post is changed and no shore post can end up below the water beside it; a large lake therefore sits lower than the mean of its transformed values by up to the range of the geoid correction across it (2 to 5 m across the largest lakes, centimeters for most). The log counts, per file, the flat areas left as terrain, the shore posts whose step above the water was lost to whole-meter rounding, any that fell below it (always 0), and those that were already below the water in the input (outlets, dam faces, dipping shores), which are left as they are.
-- Water bodies that span tiles: in a batch run, patches are joined across the seams between tiles and each water body takes one level over all its parts, so the tiles edge-match. A water body that reaches an edge with no neighbor in the run is listed in the log, because a neighbor transformed separately may give it a different level. Put the tiles that share a lake or river in one run, give the neighboring tiles as `--context` (a whole delivery folder will do: it is searched like `-i`, every DEM's placement is read from its header, and only the tiles that adjoin the run, directly or through other context tiles, are analyzed), or pass the `--water-levels` table exported by an earlier run over the larger area; with the table, the level does not depend on the order in which the tiles are produced.
+- Flat areas: every 4-connected patch of at least `-p` posts of one height (the same whole centimeter; whole meters for DTED) is a candidate water body. It counts as one when at least `-c` (default 80%) of its boundary posts lie above it in the input; ocean neighbors are neutral, so lagoons and river mouths qualify; a contour band on a slope or a flat hilltop does not qualify and is transformed post by post. In a batch run the share is summed over every part of a water body, so both sides of a seam reach the same verdict. The ocean (0 m) stays at 0. Every water body is set to the lowest of its transformed values, so no land post is changed and no shore post can end up below the water beside it. The log counts, per file, the flat areas left as terrain and how the shore posts stand to the water after the transform.
+- Enclosed low spots: in floating-point data, a few posts below the water body beside them, bounded by the water and by higher ground, are set to the water's level and join it in the mask, when there are fewer of them than `-p`. A low spot that reaches lower water (an outlet), the tile edge or a void is left as it is, and so is every post of DTED and whole-meter input. The log counts the spots and lists every raise of a meter or more with its position.
+- Water bodies that span tiles: in a batch run, patches are joined across the seams between tiles and each water body takes one level over all its parts, so the tiles edge-match. A water body that reaches an edge with no neighbor in the run is listed in the log, because a neighbor transformed separately may give it a different level. Put the tiles that share a lake or river in one run, give the neighboring tiles as `--context` (a whole delivery folder will do: it is searched like `-i`, every DEM's placement is read from its header, and only the tiles that adjoin the run are analyzed), or pass the `--water-levels` table exported by an earlier run over the larger area; with the table, the level does not depend on the order in which the tiles are produced.
 - The flattening option is not available when transforming to or from WGS84.
-- After upgrading EGMTrans, restart ArcGIS Pro: the toolbox reloads `EGMTrans.py` but not the package beneath it.
+- After upgrading EGMTrans, restart ArcGIS Pro: the toolbox reloads `EGMTrans.py` but not the package beneath it, and warns when the two versions differ.
 - The interpolation algorithms use Python's NumPy and Numba modules, not Esri's Spatial Analyst license.
 - For GeoTIFF outputs, the tool creates Cloud Optimized GeoTIFFs (COGs) with DEFLATE compression.
 - The tool rounds elevation values to the nearest centimeter to reduce noise in flat area detection and improve compression.
-- When batch processing, the tool preserves the input directory structure and auxiliary files in the output directory.
+- When batch processing, the tool preserves the input directory structure and auxiliary files in the output directory, except when a DTED level is given: then only the DTED files, their masks and the log are written.
 - The minimum patch size parameter can be adjusted to control the granularity of flat area preservation.
 - Creating mask files can be useful for quality control: the mask holds 1 for the ocean and one value per water body, so it shows exactly what was flattened, DTED included.
 - The script creates a detailed log file ending in `_transform.log`: beside the output file when the
@@ -570,13 +609,14 @@ The following operations are not allowed and will cause the transformation to ab
 - Transforming DEMs in unsupported formats (only GeoTIFF, DTED0, DTED1, and DTED2 are supported).
 - Transforming DTED files to the WGS 84 ellipsoid, which is outside the DTED specification (STANAG 3809).
 - Transforming files with a horizontal datum other than WGS 84 (e.g., NAD83).
-- Creating DTED files from GeoTIFFs, which lack the necessary header metadata.
+- Writing a DTED file at another level than its input.
+- Creating DTED from a GeoTIFF that is not on the whole-degree lattice (projected, rotated, a spacing that is not a whole number of posts per degree, posts off the whole degree), whose band has a scale or offset, or that covers no whole cell, and creating it without a product profile or metadata index to fill the header.
 - Writing DTED with an interpolation algorithm other than `bilinear` (see [Interpolation Algorithms](#interpolation-algorithms)).
 - Transforming GeoTIFFs with more than one band. If multi-band GeoTIFFs (e.g. auxiliary orthophotos) exist in directories during batch processing, they will be ignored.
 
 In addition, users will be warned in the following circumstances and asked if they wish to proceed:
 - The user requests flattening or ignores the flag (flattening is the default), when transforming to or from the WGS 84 ellipsoid. Flattening can only be applied between orthometric heights. If the user chooses to proceed with the transformation, no flattening will occur.
-- The source datum and target datum are the same. If the source is a GeoTIFF file and the user chooses to proceed, the output GeoTIFF will be assigned the correct vertical datum (which is often missing in GeoTIFF files) with values rounded to 1 cm and optimized DEFLATE compression. If the source is a DTED file, the operation will abort.
+- The source datum and target datum are the same. If the source is a GeoTIFF file and the user chooses to proceed, the output GeoTIFF will be assigned the correct vertical datum (which is often missing in GeoTIFF files) with values rounded to 1 cm and optimized DEFLATE compression. If the source is a DTED file, the operation will abort. A GeoTIFF made into DTED goes on without asking: the cell is resampled and its water flattened whatever the datum.
 - The source datum does not match the datum in the source file header. If the user chooses to proceed, the source file metadata will be ignored. This may be necessary if the source file is in error, but it is important to check the sources to be sure.
 
 ## Troubleshooting

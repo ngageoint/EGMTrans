@@ -423,3 +423,45 @@ class TestMainGridScope:
 
     def test_ellipsoid_to_geoid_needs_one_grid(self, tmp_dir, monkeypatch):
         assert self._grids_requested(tmp_dir, monkeypatch, "WGS84", "EGM96") == ["us_nga_egm96_1.tif"]
+
+
+class TestDtedLevelFlags:
+    """--dted-level and --dted-naming: parsing, the versions line, and the dispatch to the batch."""
+
+    def test_level_with_a_folder_output_goes_to_the_batch(self, tmp_dir, stub_pipeline, monkeypatch):
+        from tests.conftest import lattice_geotransform, synthetic_cell, write_geotiff
+
+        src = write_geotiff(os.path.join(tmp_dir, "tile.tif"), synthetic_cell(60),
+                            lattice_geotransform(30, 85, 60, 60), nodata=-32767.0)
+        outdir = os.path.join(tmp_dir, "out")
+        profile = os.path.join(os.path.dirname(os.path.dirname(__file__)), "samples", "dted_profile_example.toml")
+        assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "2",
+                    "--dted-naming", "cell", "--dted-profile", profile) == 0
+        assert stub_pipeline[0][1] == os.path.join(outdir, "N85E030.dt2")
+        assert stub_pipeline[0][0] == src
+        with open(os.path.join(outdir, "tile_transform.log")) as handle:
+            log = handle.read()
+        assert "EGMTrans " in log and "GDAL " in log and "numba " in log, "the versions line is missing"
+        assert not os.path.exists(os.path.join(outdir, "tile.tif")), "the input was copied"
+
+    def test_bad_level_and_naming_are_usage_errors(self, tmp_dir, stub_pipeline, monkeypatch):
+        src = os.path.join(tmp_dir, "tile.tif")
+        with open(src, "wb"):
+            pass
+        base = ["-i", src, "-o", os.path.join(tmp_dir, "out"), "-s", "EGM2008", "-t", "EGM96"]
+        assert _run(monkeypatch, *base, "--dted-level", "3") == 2
+        assert _run(monkeypatch, *base, "--dted-level", "2", "--dted-naming", "{lvl}") == 2
+        assert _run(monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.tif"), "-s", "EGM2008", "-t", "EGM96",
+                    "--dted-level", "2") == 2
+        assert stub_pipeline == []
+
+    def test_dted_input_keeps_its_level(self, tmp_dir, stub_pipeline, monkeypatch):
+        import numpy as np
+
+        from tests.conftest import write_dted
+
+        src = write_dted(os.path.join(tmp_dir, "n50w001.dt0"), np.full((121, 121), 5, dtype=np.int16), -1, 50)
+        outdir = os.path.join(tmp_dir, "out")
+        assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "2",
+                    "-y") == 0
+        assert stub_pipeline[0][1] == os.path.join(outdir, "n50w001.dt0")

@@ -101,6 +101,23 @@ def point_geotransform(lon0, lat0, posts, extent=1.0):
     return (lon0 - step / 2, step, 0.0, lat0 + extent + step / 2, 0.0, -step)
 
 
+def lattice_geotransform(lon0, lat0, per_degree_x, per_degree_y, extent_x=1.0, extent_y=1.0):
+    """A pixel-is-point geotransform on the whole-degree lattice: *per_degree_x*
+    posts per degree of longitude from *lon0*, *per_degree_y* per degree of
+    latitude down from ``lat0 + extent_y``; posts on every whole degree."""
+    px, py = 1.0 / per_degree_x, 1.0 / per_degree_y
+    return (lon0 - px / 2, px, 0.0, lat0 + extent_y + py / 2, 0.0, -py)
+
+
+def synthetic_cell(per_degree, seed_offset=0, base_cm=30000):
+    """Float32 heights of a one-degree tile at *per_degree* posts per degree
+    from an integer formula: whole centimeters, no two 4-neighbors alike."""
+    n = per_degree + 1
+    i, j = np.mgrid[0:n, 0:n]
+    cm = base_cm + ((i * 7 + j * 13 + seed_offset) % 997) * 3
+    return (cm / 100).astype(np.float32)
+
+
 def write_dted(path, array, lon0, lat0):
     """Write a DTED tile with the posts of *array* on lon0..lon0+1, lat0..lat0+1.
 

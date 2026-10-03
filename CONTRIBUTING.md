@@ -29,8 +29,10 @@ pytest tests/test_accuracy.py  # regression tests against known values
 ruff check src tests           # style and lint
 ```
 
-CI runs the same commands on Python 3.13 and 3.14 on Ubuntu; please make
-sure both are green locally before opening a PR.
+CI runs the same commands on Python 3.13 and 3.14 on Ubuntu, and the
+determinism, conversion and flattening tests once more on a stack like
+ArcGIS Pro 3.7 (Python 3.13, GDAL 3.12, numpy 2.3, no Numba); please make
+sure the suite is green locally before opening a PR.
 
 ## Code style
 
@@ -41,6 +43,18 @@ logger obtained from `egmtrans._state.get_logger()`, not `print`.
 
 Text is written in American English (meter, neighbor, labeled, analyze,
 center); `tests/test_spelling.py` fails on the common British spellings.
+
+A DTED file made from a GeoTIFF must come out the same on every computer,
+so the code that can feed one keeps to a few rules: heights are compared in
+whole centimeters (`flattening.height_centimeters`), never as floats; the
+Numba kernels on that path take no fast-math flags and do no float
+arithmetic beyond comparisons and copies, so their plain-Python form gives
+the same result; the resampler (`dted/resample.py`) uses whole-number
+weights and elementwise numpy, no reductions, no GDAL; and the DTED bytes
+are written by `dted/records.py`, not by a GDAL driver. A change that moves
+those bytes on purpose must regenerate the reference hashes of
+`egmtrans dted-selftest` (`--print-reference`) and the pins in
+`tests/test_determinism.py`, and say so in the CHANGELOG.
 
 ## Commit attribution
 
@@ -62,7 +76,7 @@ change.
 
 ## Reporting bugs
 
-Open a GitHub issue with a minimal reproducer — ideally the command line
+Open a GitHub issue with a minimal reproducer – ideally the command line
 you ran, the input file's format and size, and the traceback or wrong
 output. For security-relevant bugs, follow the process in
 `SECURITY.md` instead.

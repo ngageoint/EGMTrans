@@ -72,3 +72,67 @@ jobs:
 
       - name: Run tests
         run: pytest
+
+  arcgis-pro-like:
+    name: test (ArcGIS Pro 3.7 stack, no numba)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ArcGIS Pro 3.7 ships Python 3.13, GDAL 3.12 and numpy 2.3 without numba:
+      # the kernels run as plain Python there, and the DTED bytes must not change.
+      - name: Set up micromamba + GDAL
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-name: egmtrans-arc
+          create-args: >-
+            python=3.13
+            gdal=3.12
+            numpy=2.3
+            scipy>=1.15
+            tqdm>=4.60
+            pyarrow
+            lxml
+            pytest
+          cache-environment: true
+          init-shell: bash
+
+      - name: Install package without its dependencies
+        run: pip install --no-deps -e .
+
+      - name: Cache geoid grid files
+        id: cache-grids
+        uses: actions/cache@v4
+        with:
+          path: datums
+          key: datum-grids-v1-${{ hashFiles('src/egmtrans/download.py') }}
+
+      - name: Download geoid grids (test subset)
+        if: steps.cache-grids.outputs.cache-hit != 'true'
+        run: |
+          python - <<'PY'
+          import os
+          from egmtrans.download import (
+              GRID_FILES, RELEASE_URL, _default_datums_dir,
+              download_file, verify_checksum,
+          )
+          d = _default_datums_dir()
+          os.makedirs(d, exist_ok=True)
+          for fn in ("us_nga_egm96_1.tif", "us_nga_egm08_1.tif"):
+              info = GRID_FILES[fn]
+              dest = os.path.join(d, fn)
+              if verify_checksum(dest, info["sha256"]):
+                  continue
+              download_file(f"{RELEASE_URL}/{fn}", dest, info["sha256"])
+          PY
+
+      - name: Run the determinism, conversion and flattening tests
+        run: |
+          python -c "from egmtrans.numba_utils import NUMBA_AVAILABLE; assert not NUMBA_AVAILABLE"
+          pytest tests/test_determinism.py tests/test_dted_create.py tests/test_dted_resample.py \
+                 tests/test_dted_records.py tests/test_flattening.py tests/test_transform.py

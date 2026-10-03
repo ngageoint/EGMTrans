@@ -3,6 +3,7 @@
 import os
 
 import numpy as np
+import pytest
 from osgeo import gdal, osr
 
 from egmtrans.io import (
@@ -129,3 +130,90 @@ class TestRestoreNodata:
 
         assert stored[0, 1] == -32767, "void was flattened to sea level"
         assert stored[0, 0] == 10 and stored[0, 2] == -6, "GDAL rounds float to int"
+
+
+class TestWriteDted:
+    """A DTED file written from scratch: rounded, verified, published by rename."""
+
+    PROFILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'samples', 'dted_profile_example.toml')
+
+    def _metadata(self, level=2):
+        from egmtrans.dted.profile import load_profile
+        from egmtrans.dted.writer import DtedMetadata
+
+        profile = load_profile(self.PROFILE)
+        profile.product['dted_level'] = level
+        return DtedMetadata(None, [], profile)
+
+    def test_writes_a_verified_file(self, tmp_dir, log_lines):
+        import hashlib
+
+        from egmtrans.dted.header import CellGeometry, read_header
+        from egmtrans.dted.records import read_records
+        from egmtrans.dted.validate import validate_file
+        from egmtrans.io import write_dted
+
+        cell = CellGeometry(2, 0, 85)  # zone V: 601 lines of 3601 posts
+        rng = np.random.default_rng(4)
+        heights = rng.uniform(-50, 2000, size=(cell.lat_points, cell.lon_lines))
+        heights[0, 0] = 0.5          # halves away from zero
+        heights[0, 1] = -0.5
+        heights[0, 2] = 173.49999
+        heights[10:13, :300] = np.nan  # a void strip
+        out = os.path.join(tmp_dir, 'N85E000.dt2')
+
+        digest = write_dted(out, cell, heights, 'EGM96', 14, tmp_dir, metadata=self._metadata())
+
+        with open(out, 'rb') as handle:
+            content = handle.read()
+        assert hashlib.sha256(content).hexdigest() == digest
+        assert any(f'SHA-256 {digest}' in line and f'{len(content):,} bytes' in line for line in log_lines)
+        assert not [name for name in os.listdir(tmp_dir) if name.endswith('.part')]
+
+        header = read_header(out)
+        assert header['dsi.vertical_datum'] == 'E96' and header['dsi.series'] == 'DTED2'
+        assert header['uhl.lon_lines'] == '0601' and header['dsi.partial_cell'] == '99'
+        assert header['acc.abs_horiz_acc'] == '0014' and header['dsi.producer_code'] == 'USNGA   '
+        _header, issues = validate_file(out, check_data=True)
+        assert not [issue for issue in issues if issue.severity == 'error']
+
+        values = read_records(out).values
+        assert values[0, 0] == 1 and values[0, 1] == -1 and values[0, 2] == 173
+        assert np.all(values[10:13, :300] == -32767) and values[13, 0] != -32767
+        expected = round_half_away(heights)
+        valid = ~np.isnan(heights)
+        assert np.array_equal(values[valid], expected[valid])
+        with gdal.Open(out) as ds:
+            assert ds.GetGeoTransform() == cell.geotransform
+
+    def test_a_failure_leaves_no_file(self, tmp_dir):
+        from egmtrans.dted.header import CellGeometry
+        from egmtrans.dted.records import RecordError
+        from egmtrans.dted.writer import HeaderAssemblyError
+        from egmtrans.io import new_dted_header, write_dted
+
+        cell = CellGeometry(0, 126, 6)
+        heights = np.full((121, 121), 100.0)
+        out = os.path.join(tmp_dir, 'N06E126.dt0')
+        with pytest.raises(HeaderAssemblyError, match='security_code is required'):
+            write_dted(out, cell, heights, 'EGM96', temp_dir=tmp_dir)
+        with pytest.raises(HeaderAssemblyError, match='profile is for DTED level 2'):
+            write_dted(out, cell, heights, 'EGM96', temp_dir=tmp_dir, metadata=self._metadata(level=2))
+        with pytest.raises(ValueError, match='Unsupported target datum'):
+            write_dted(out, cell, heights, 'WGS84', temp_dir=tmp_dir, metadata=self._metadata(level=0))
+        with pytest.raises(ValueError, match='Unsupported target datum'):
+            new_dted_header(cell, 'WGS84', metadata=self._metadata(level=0))
+        heights[5, 5] = 9001.0
+        with pytest.raises(RecordError, match='outside'):
+            write_dted(out, cell, heights, 'EGM96', temp_dir=tmp_dir, metadata=self._metadata(level=0))
+        assert os.listdir(tmp_dir) == []
+
+        # The dry run and the write build the same header.
+        heights[5, 5] = 100.0
+        header, sources = new_dted_header(cell, 'EGM2008', 7, metadata=self._metadata(level=0))
+        assert header['dsi.vertical_datum'] == 'E08' and header['acc.abs_horiz_acc'] == '0014'
+        assert sources['acc.abs_horiz_acc'] == 'profile'
+        write_dted(out, cell, heights, 'EGM2008', 7, tmp_dir, metadata=self._metadata(level=0))
+        from egmtrans.dted.header import read_header
+
+        assert read_header(out) == header

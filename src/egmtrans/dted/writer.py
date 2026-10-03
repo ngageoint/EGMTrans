@@ -6,13 +6,17 @@
    DSI security code and the ACC vertical accuracy): never overridable;
 2. the cell's row in the metadata index (a NULL accuracy means NA);
 3. the product profile's constants;
-4. the command line's absolute horizontal accuracy;
-5. the base header (the input DTED file's, for a DTED-to-DTED transform);
+4. the base header (the input DTED file's, for a DTED-to-DTED transform);
+5. the command line's absolute horizontal accuracy, which fills the field
+   only when the base header, or the spec fill, left it NA;
 6. the spec fill (NA, 0000, blanks).
 
-A field that is required and still blank at the end stops the write. A
-profile or index datum that differs from the output's is reported; the
-output keeps the derived code.
+With a base header the input is the authority, gaps included. Built from
+scratch, every required field must come from the index, the profile or the
+command line; the spec fill is not a value for them (the tool never invents a
+security code), and an index or profile made for another level stops the
+write. A profile or index datum that differs from the output's is reported;
+the output keeps the derived code.
 """
 
 from __future__ import annotations
@@ -131,26 +135,55 @@ class DerivedFields:
 def _apply(header: DtedHeader, sources: dict[str, str], column_name: str, value, source: str) -> None:
     column = COLUMNS_BY_NAME[column_name]
     key = column.dted_key
-    if column_name in ACCURACY_COLUMNS:
-        header.set(key, value)  # meters, 'NA' or None (NA)
-        sources[key] = source
-        return
-    if value is None:
-        return
-    if column.type == 'date':
-        header.set(key, to_yymm(value))
-    elif column.type == 'int':
-        header.set(key, int(value))
-    else:
-        header.set(key, str(value))
+    try:
+        if column_name in ACCURACY_COLUMNS:
+            header.set(key, value)  # meters, 'NA' or None (NA)
+            sources[key] = source
+            return
+        if value is None:
+            return
+        if column.type == 'date':
+            header.set(key, to_yymm(value))
+        elif column.type == 'int':
+            header.set(key, int(value))
+        else:
+            header.set(key, str(value))
+    except (ValueError, LookupError) as e:
+        raise HeaderAssemblyError(f'{column_name} ({source}): {value!r} cannot be written: {e}') from e
     sources[key] = source
+
+
+def normalize_ring(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """A subregion outline as the specification lists it: no closing vertex,
+    clockwise, starting at the most southern vertex and the most western of those.
+
+    *points* are ``(latitude, longitude)`` pairs.
+    """
+    ring = [(float(lat), float(lon)) for lat, lon in points]
+    if len(ring) > 1 and ring[0] == ring[-1]:
+        ring.pop()
+    if len(ring) < 3:
+        return ring
+    # Shoelace in (x, y) = (lon, lat): positive is counterclockwise.
+    area = sum(
+        ring[i][1] * ring[(i + 1) % len(ring)][0] - ring[(i + 1) % len(ring)][1] * ring[i][0]
+        for i in range(len(ring))
+    )
+    if area > 0:
+        ring.reverse()
+    start = min(range(len(ring)), key=lambda i: ring[i])
+    return ring[start:] + ring[:start]
 
 
 def _subregion_from_row(item: dict) -> AccSubregion:
     return AccSubregion.from_values(
         item.get('abs_horiz_acc'), item.get('abs_vert_acc'), item.get('rel_horiz_acc'), item.get('rel_vert_acc'),
-        [(float(lat), float(lon)) for lat, lon in item['outline']],
+        normalize_ring(item['outline']),
     )
+
+
+def _level_of(value) -> int | None:
+    return None if value in (None, '') else int(value)
 
 
 def assemble_header(
@@ -164,11 +197,21 @@ def assemble_header(
     """The complete header of *cell* and, for every field, where its value came from.
 
     Raises:
-        HeaderAssemblyError: If a required field is still blank, a profile or
-            index value contradicts a derived one, or the result fails validation.
+        HeaderAssemblyError: If the index row or the profile is for another
+            level, a value cannot be written, the vertical datum is unknown,
+            or, from scratch, a required field has no source or the result
+            fails validation.
     """
     derived = derived or DerivedFields()
     metadata = metadata or DtedMetadata()
+    for where, level in (
+        ('index row', _level_of((metadata.row or {}).get('dted_level'))),
+        ('profile', metadata.profile.level if metadata.profile is not None else None),
+    ):
+        if level is not None and level != cell.level:
+            raise HeaderAssemblyError(
+                f'The {where} is for DTED level {level}; cell {cell.cell_id} is being written at level {cell.level}'
+            )
     if base is not None:
         header = base.copy()
         sources = dict.fromkeys(header.values, 'base')
@@ -264,33 +307,45 @@ def assemble_header(
                 f'the output keeps {current!r}'
             )
     if base is None:
-        # Built from scratch, every required field must come from somewhere.
-        # With a base header the input is the authority, gaps included.
+        # Built from scratch, every required field must come from a source:
+        # the spec fill (NA, 0000) is not a value for it. With a base header
+        # the input is the authority, gaps included.
         for column in HEADER_COLUMNS:
-            if column.required and not header[column.dted_key].strip():
-                problems.append(f'{column.name} is required and nothing supplies it (index or profile)')
+            if column.required and sources.get(column.dted_key, 'default').startswith('default'):
+                also = ' or --abs_horiz_accuracy' if column.name == 'abs_horiz_acc' else ''
+                problems.append(f'{column.name} is required and nothing supplies it (index or profile{also})')
     if not header['dsi.vertical_datum'].strip():
         problems.append('the vertical datum is unknown')
     if problems:
         raise HeaderAssemblyError('The DTED header cannot be completed:\n  ' + '\n  '.join(problems))
 
     if base is None:
-        errors = [issue for issue in validate_header(header) if issue.severity == 'error']
+        issues = validate_header(header)
+        errors = [issue for issue in issues if issue.severity == 'error']
         if errors:
             raise HeaderAssemblyError(
                 'The assembled DTED header is not valid:\n  ' + '\n  '.join(str(e) for e in errors)
             )
+        for issue in issues:
+            if issue.severity == 'warning':
+                logger.warning(f'DTED header of cell {cell.cell_id}: {issue}')
     return header, sources
 
 
 def describe_changes(before: DtedHeader | None, after: DtedHeader, sources: dict[str, str]) -> list[str]:
-    """Log lines for the fields that changed, with their source."""
+    """Log lines for the fields that changed, with their source; for a header
+    built from scratch (*before* is None), every supplied field with its source."""
     lines = []
     if before is None:
         counts: dict[str, int] = {}
         for source in sources.values():
             counts[source] = counts.get(source, 0) + 1
         lines.append('Header fields by source: ' + ', '.join(f'{k} {v}' for k, v in sorted(counts.items())))
+        for key, source in sources.items():
+            if source in ('default', 'derived'):
+                continue
+            value = 'subregion block' if key == 'acc.subregions' else repr(after[key])
+            lines.append(f'    {key}: {value} ({source})')
         return lines
     for key, old, new in changed_fields(before, after):
         if key == 'acc.subregions':

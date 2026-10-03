@@ -28,6 +28,26 @@ sys.path.append(parent_dir)
 import EGMTrans
 reload(EGMTrans)  # refresh changes if the Python script was altered
 
+
+def _warn_if_stale():
+    """ArcGIS Pro reloads the shim, not the package: a session that loaded an
+    earlier egmtrans would keep writing that version's bytes."""
+    try:
+        import egmtrans
+        from egmtrans import _version
+
+        on_disk = {}
+        with open(_version.__file__) as handle:
+            exec(handle.read(), on_disk)
+        if on_disk.get("__version__") != egmtrans.__version__:
+            arcpy.AddWarning(
+                f"EGMTrans {egmtrans.__version__} is loaded in this session, but version {on_disk.get('__version__')} "
+                f"is on disk. Restart ArcGIS Pro to run the version on disk."
+            )
+    except Exception:
+        pass
+
+
 class Toolbox:
     def __init__(self):
         """Define the toolbox (the name of the toolbox is the name of the
@@ -37,7 +57,7 @@ class Toolbox:
         self.icon = "../img/icons/EGMTrans_32.png"
 
         # List of tool classes associated with this toolbox
-        self.tools = [Tool, DtedHeaderReport]
+        self.tools = [Tool, DtedHeaderReport, DtedSelfTest]
 
 class Tool:
     def __init__(self):
@@ -182,6 +202,24 @@ class Tool:
         dted_profile.filter.list = ["toml"]
         params.append(dted_profile)
 
+        dted_level = arcpy.Parameter(
+            displayName="DTED Level (write every GeoTIFF input as DTED of this level, one file per cell)",
+            name="dted_level",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        dted_level.filter.list = ["0", "1", "2"]
+        params.append(dted_level)
+
+        dted_naming = arcpy.Parameter(
+            displayName="DTED Output Naming (stem, cell, dted, or a template with {stem} {dir} {cell} {lat} {lon} {level})",
+            name="dted_naming",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        dted_naming.value = "stem"
+        params.append(dted_naming)
+
         output_layer = arcpy.Parameter(
             displayName="Output Raster Layer",
             name="output_layer",
@@ -206,12 +244,32 @@ class Tool:
         """Modify the messages created by internal validation for each tool
         parameter. This method is called after internal validation."""
         input_value = parameters[0].valueAsText or ""
+        output_value = parameters[1].valueAsText or ""
         algorithm = parameters[4].valueAsText or "Bilinear Interpolation"
-        if input_value.lower().endswith((".dt0", ".dt1", ".dt2")) and algorithm != "Bilinear Interpolation":
+        level = parameters[15].valueAsText
+        dted_extensions = (".dt0", ".dt1", ".dt2")
+        # DTED is written for a DTED input, a .dtN output name, or a level.
+        writes_dted = (
+            input_value.lower().endswith(dted_extensions) or output_value.lower().endswith(dted_extensions)
+            or bool(level)
+        )
+        if writes_dted and algorithm != "Bilinear Interpolation":
             parameters[4].setErrorMessage(
                 "DTED output requires Bilinear Interpolation: DTED tiles are edge-matched, and only "
                 "bilinear gives the same correction at a shared post whatever the tile extent."
             )
+        if level and output_value and not os.path.isdir(output_value):
+            extension = os.path.splitext(output_value)[1].lower()
+            if extension in (".tif", ".tiff"):
+                parameters[1].setErrorMessage("A DTED level was given, but the output is a GeoTIFF file.")
+            elif extension in dted_extensions and extension != f".dt{level}":
+                parameters[1].setErrorMessage(f"The output is not DTED level {level}.")
+        naming = parameters[16].valueAsText
+        if naming:
+            try:
+                EGMTrans.dted_naming_template(naming)
+            except ValueError as e:
+                parameters[16].setErrorMessage(str(e))
         containment = parameters[12].value
         if containment is not None and not 0.0 <= containment <= 1.0:
             parameters[12].setErrorMessage("Minimum Containment must be between 0 and 1.")
@@ -241,12 +299,15 @@ class Tool:
         containment = parameters[12].value if parameters[12].value is not None else 0.8
         dted_index = parameters[13].valueAsText
         dted_profile = parameters[14].valueAsText
+        dted_level = int(parameters[15].valueAsText) if parameters[15].valueAsText else None
+        dted_naming = parameters[16].valueAsText or "stem"
 
         # Resolve input/output and derive the log path with the same helper the
         # CLI uses, so the two entry points cannot disagree about file vs. folder.
         try:
-            io_paths = EGMTrans.resolve_io_paths(input_path, output_path)
+            io_paths = EGMTrans.resolve_io_paths(input_path, output_path, dted_level=dted_level)
             EGMTrans.prepare_output_target(io_paths)
+            EGMTrans.dted_naming_template(dted_naming)
         except (ValueError, OSError) as e:
             arcpy.AddError(str(e))
             return
@@ -259,7 +320,7 @@ class Tool:
             arcpy.AddError(str(e))
             return
         if not dted_metadata.empty:
-            issues = dted_metadata.validate()
+            issues = dted_metadata.validate(dted_level)
             errors = [issue for issue in issues if issue.severity == 'error']
             for issue in errors:
                 arcpy.AddError(str(issue))
@@ -268,6 +329,8 @@ class Tool:
                 return
 
         EGMTrans.setup_logger(io_paths.log_path if save_log else None, save_log, is_arc_mode=True)
+        arcpy.AddMessage(EGMTrans.versions_line())
+        _warn_if_stale()
 
         algorithm_dict = {
             "Bilinear Interpolation": "bilinear",
@@ -291,6 +354,8 @@ class Tool:
         arcpy.AddMessage(f"Minimum Containment: {containment}")
         arcpy.AddMessage(f"DTED Metadata Index: {dted_index}")
         arcpy.AddMessage(f"DTED Product Profile: {dted_profile}")
+        arcpy.AddMessage(f"DTED Level: {dted_level}")
+        arcpy.AddMessage(f"DTED Output Naming: {dted_naming}")
         arcpy.AddMessage(f'{"="*80}\n')
 
         # Download geoid grid files on first run if they are missing.
@@ -308,22 +373,27 @@ class Tool:
             )
             return
 
+        written = [output_path] if os.path.isfile(output_path) else []
         try:
-            if io_paths.mode == 'file' and not context_folder and not water_levels:
-                EGMTrans.process_file(
+            if io_paths.mode == 'file' and not context_folder and not water_levels and dted_level is None:
+                ok = EGMTrans.process_file(
                     io_paths.input_path, output_path, source_datum, target_datum, flatten, create_mask,
                     min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True,
                     min_containment=containment, dted_metadata=dted_metadata,
                 )
+                written = [output_path] if ok and os.path.isfile(output_path) else []
             else:
                 # The same two-pass runner as the command line: water bodies that
-                # span tiles get one level, context tiles are analyzed but not written.
+                # span tiles get one level, context tiles are analyzed but not
+                # written, and GeoTIFF inputs become DTED cells when a level is given.
                 result = EGMTrans.run_batch(
                     io_paths, source_datum, target_datum, flatten, create_mask, min_patch_size, algorithm,
                     abs_horiz_accuracy, save_log, arc_mode=True,
                     context_folders=[context_folder] if context_folder else [], water_levels=water_levels,
                     min_containment=containment, dted_metadata=dted_metadata,
+                    dted_level=dted_level, dted_naming=dted_naming,
                 )
+                written = list(result.outputs)
                 if result.exit_code:
                     arcpy.AddError(f"{len(result.failed)} DEM(s) were not transformed; see the messages above.")
         except Exception as e:
@@ -333,30 +403,95 @@ class Tool:
         arcpy.AddMessage("Processing completed.")
         EGMTrans.end_logger(save_log=save_log)
 
-        # After processing, check if the output path is a single file.
-        # If so, calculate stats and create a layer to add to the map.
-        if os.path.isfile(output_path):
+        # When exactly one file was written, calculate its statistics and add
+        # it to the map; the derived output is the last parameter.
+        if len(written) == 1 and os.path.isfile(written[0]):
             try:
                 messages.addMessage("Calculating statistics before loading to map...")
-                arcpy.management.CalculateStatistics(output_path)
+                arcpy.management.CalculateStatistics(written[0])
                 messages.addMessage("Statistics calculated successfully.")
             except Exception:
                 pass  # ArcGIS Pro will calculate stats on-the-fly for display
 
             try:
                 result_layer = arcpy.management.MakeRasterLayer(
-                    output_path, os.path.basename(output_path))
-                arcpy.SetParameter(15, result_layer.getOutput(0))
+                    written[0], os.path.basename(written[0]))
+                arcpy.SetParameter(len(parameters) - 1, result_layer.getOutput(0))
             except Exception as e:
                 arcpy.AddWarning(f"Could not create output layer for map display: {e}")
         elif not hasattr(input_param.value, 'dataSource'):
-            messages.addMessage("Output is a folder. Skipping automatic layer addition to map.")
+            messages.addMessage("Several files were written, or none. Skipping automatic layer addition to map.")
 
         return
 
     def postExecute(self, parameters):
         """This method takes place after outputs are processed and
         added to the display."""
+        return
+
+
+class DtedSelfTest:
+    """Convert built-in synthetic tiles to DTED and compare the bytes with the reference."""
+
+    def __init__(self):
+        self.label = "DTED Self-Test"
+        self.description = (
+            "Converts two built-in synthetic tiles to DTED2, DTED1 and DTED0 from EGM2008 to EGM96 and compares the "
+            "SHA-256 of every header and record block with the pinned reference. A match shows that this host "
+            "reproduces the reference bytes, so the DTED it makes from real tiles matches any other host that matches."
+        )
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        keep = arcpy.Parameter(
+            displayName="Keep the tiles and DTED files in this folder (optional)",
+            name="keep",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input")
+        return [keep]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        from egmtrans.config import verify_grids
+        from egmtrans.dted.selftest import SOURCE_DATUM, TARGET_DATUM, run_selftest
+
+        keep = parameters[0].valueAsText
+        EGMTrans.setup_logger(None, False, is_arc_mode=True)
+        arcpy.AddMessage(EGMTrans.versions_line())
+        _warn_if_stale()
+        try:
+            verify_grids(SOURCE_DATUM, TARGET_DATUM)
+        except FileNotFoundError as e:
+            arcpy.AddError(str(e))
+            return
+        try:
+            result = run_selftest(keep, keep=bool(keep))
+        except Exception as e:
+            arcpy.AddError(f"The self-test could not run: {e}")
+            return
+        finally:
+            EGMTrans.end_logger(save_log=False)
+        for item in result.items:
+            state = "matches the reference" if item.ok else "DIFFERS from the reference"
+            (arcpy.AddMessage if item.ok else arcpy.AddError)(
+                f"{item.name}: header {item.header[:16]}..., records {item.records[:16]}...: {state}"
+            )
+        if result.ok:
+            arcpy.AddMessage("Self-test passed: this host reproduces the reference bytes.")
+        else:
+            arcpy.AddError("Self-test FAILED: this host does not reproduce the reference bytes.")
+        return
+
+    def postExecute(self, parameters):
         return
 
 

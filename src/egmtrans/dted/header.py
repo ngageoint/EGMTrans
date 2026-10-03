@@ -495,6 +495,16 @@ class CellGeometry:
     def series(self) -> str:
         return LEVELS[self.level].series
 
+    @property
+    def geotransform(self) -> tuple[float, float, float, float, float, float]:
+        """The GDAL geotransform of the cell's post grid, as GDAL's DTED driver
+        computes it: posts are pixel centers, so the raster's edges lie half a
+        post beyond the cell. The arithmetic is the driver's, in its order, so
+        the value is the one GDAL reports for the file."""
+        px = self.lon_interval_tenths / 36000.0
+        py = self.lat_interval_tenths / 36000.0
+        return (self.lon0 - 0.5 * px, px, 0.0, self.lat0 - 0.5 * py + self.lat_points * py, 0.0, -py)
+
     def header_values(self) -> dict[str, str]:
         """Raw text of every header field that the cell geometry determines."""
         lon0, lat0, lon1, lat1 = self.lon0, self.lat0, self.lon0 + 1, self.lat0 + 1

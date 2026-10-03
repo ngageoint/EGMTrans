@@ -48,6 +48,7 @@ RUN mkdir -p "$NUMBA_CACHE_DIR" /tmp/warmup \
     && egmtrans -i samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif -o /tmp/warmup/cop.tif \
         -s EGM2008 -t EGM96 -y -l False \
     && egmtrans -i samples/03n008e_SRTM.dt2 -o /tmp/warmup/srtm.dt2 -s EGM96 -t EGM2008 -y -l False \
+    && egmtrans dted-selftest \
     && rm -rf /tmp/warmup \
     && chmod -R a+rwX "$NUMBA_CACHE_DIR"
 

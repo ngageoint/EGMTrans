@@ -18,8 +18,11 @@ from egmtrans.numba_utils import get_numba_decorator, prange, tqdm
 # ---------------------------------------------------------------------------
 # RBF helpers (numba-accelerated)
 # ---------------------------------------------------------------------------
+# The two spline kernels are the only ones compiled with fast-math: their
+# results move by millimeters without it, and DTED output never uses them (see
+# egmtrans.numba_utils.FASTMATH_FLAGS).
 
-@get_numba_decorator()
+@get_numba_decorator(fastmath=True)
 def compute_rbf_weights(coords: np.ndarray, values: np.ndarray, epsilon: float = 0.1) -> np.ndarray:
     """Compute weights for RBF interpolation using the thin-plate spline kernel.
 
@@ -49,7 +52,7 @@ def compute_rbf_weights(coords: np.ndarray, values: np.ndarray, epsilon: float =
     return weights
 
 
-@get_numba_decorator()
+@get_numba_decorator(fastmath=True)
 def interpolate_chunk(
     source_coords: np.ndarray, weights: np.ndarray, chunk_points: np.ndarray, epsilon: float = 0.1
 ) -> np.ndarray:
@@ -87,7 +90,11 @@ def interpolate_chunk(
 
 @get_numba_decorator()
 def _bilinear_interpolate_numba(x_vals, y_vals, grid, x_min, y_min, x_step, y_step, nx, ny):
-    """Low-level numba-accelerated bilinear interpolation on a regular grid."""
+    """Low-level numba-accelerated bilinear interpolation on a regular grid.
+
+    Compiled without fast-math, so the compiled kernel and the plain-Python
+    fallback perform the same IEEE operations in the same order.
+    """
     n_points = len(x_vals)
     result = np.empty(n_points, dtype=np.float32)
 

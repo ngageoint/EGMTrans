@@ -1,23 +1,27 @@
 """GeoTIFF and DTED I/O utilities.
 
 Handles writing transformed arrays to GeoTIFF, applying scale/offset
-corrections, updating DTED file headers per STANAG 3809, and exporting
-interpolation points to GeoJSON for verification.
+corrections, updating DTED file headers per STANAG 3809, writing whole DTED
+files, and exporting interpolation points to GeoJSON for verification.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+from secrets import token_hex
 
 import numpy as np
 from osgeo import gdal
 
 from egmtrans import _state
 from egmtrans.config import DATUM_MAPPING
-from egmtrans.dted.header import read_header, write_header
-from egmtrans.dted.validate import validate_header
+from egmtrans.dted.header import CellGeometry, DtedHeader, read_header, write_header
+from egmtrans.dted.records import check_values, partial_cell_indicator, write_dted_file
+from egmtrans.dted.schema import NULL_ELEVATION
+from egmtrans.dted.validate import validate_file, validate_header
 from egmtrans.dted.writer import DerivedFields, DtedMetadata, assemble_header, cell_of_header, describe_changes
 
 
@@ -181,9 +185,7 @@ def update_dted_header(
             cannot be completed (:class:`~egmtrans.dted.writer.HeaderAssemblyError`).
     """
     logger = _state.get_logger()
-    dted_code = DATUM_MAPPING.get(tgt_datum, {}).get('dted_code')
-    if not dted_code:
-        raise ValueError(f'Unsupported target datum for DTED: {tgt_datum}')
+    dted_code = _dted_code(tgt_datum)
 
     base = read_header(output_file)
     cell = cell_of_header(base, os.path.splitext(output_file)[1])
@@ -205,3 +207,110 @@ def update_dted_header(
     for issue in validate_header(header, extension=os.path.splitext(output_file)[1]):
         if issue.severity in ('error', 'warning'):
             logger.warning(f'DTED header: {issue}')
+
+
+def _dted_code(tgt_datum: str) -> str:
+    dted_code = DATUM_MAPPING.get(tgt_datum, {}).get('dted_code')
+    if not dted_code:
+        raise ValueError(f'Unsupported target datum for DTED: {tgt_datum}')
+    return dted_code
+
+
+def new_dted_header(
+    cell: CellGeometry,
+    tgt_datum: str,
+    abs_horiz_accuracy: int | None = None,
+    *,
+    metadata: DtedMetadata | None = None,
+    partial_cell: int = 0,
+) -> tuple[DtedHeader, dict[str, str]]:
+    """The header of a DTED file made from scratch for *cell* in *tgt_datum*.
+
+    The one function behind the dry run before a conversion, the pre-flight
+    of a batch and the write itself, so what passes the check is what gets
+    written. See :func:`egmtrans.dted.writer.assemble_header` for the sources
+    and their precedence.
+
+    Raises:
+        ValueError: If the target datum has no DTED code, or the header
+            cannot be completed (:class:`~egmtrans.dted.writer.HeaderAssemblyError`).
+    """
+    return assemble_header(
+        cell, base=None, metadata=metadata,
+        derived=DerivedFields(vertical_datum=_dted_code(tgt_datum), partial_cell=partial_cell),
+        cli_abs_horiz_accuracy=abs_horiz_accuracy,
+    )
+
+
+def write_dted(
+    output_file: str,
+    cell: CellGeometry,
+    heights: np.ndarray,
+    tgt_datum: str,
+    abs_horiz_accuracy: int | None = None,
+    temp_dir: str | None = None,
+    *,
+    metadata: DtedMetadata | None = None,
+) -> str:
+    """Write *heights* (rows north to south, voids as NaN) as the DTED file of *cell*.
+
+    Heights are rounded to whole meters, halves away from zero
+    (:func:`round_half_away`), voids become -32767, and every value must lie
+    within the specification's limits. The file is written under *temp_dir*
+    (the output's folder when None), verified there (the header and records
+    validate, and GDAL reads back the array and the cell's geotransform with
+    checksum verification on), and only then moved onto *output_file*, so a
+    file under the output name is always a verified one. Returns the SHA-256
+    of the file, which is also logged with its size.
+
+    Raises:
+        ValueError: If the datum has no DTED code, the header cannot be
+            completed, or a value cannot be written
+            (:class:`~egmtrans.dted.records.RecordError`).
+        RuntimeError: If the written file does not verify.
+    """
+    logger = _state.get_logger()
+    posts = check_values(restore_nodata(round_half_away(heights), NULL_ELEVATION))
+    partial = partial_cell_indicator(posts)
+    header, sources = new_dted_header(cell, tgt_datum, abs_horiz_accuracy, metadata=metadata, partial_cell=partial)
+
+    folder = temp_dir if temp_dir else os.path.dirname(os.path.abspath(output_file))
+    scratch = os.path.join(folder, f'.{os.path.basename(output_file)}.{token_hex(4)}.part')
+    try:
+        content = write_dted_file(scratch, header, posts)
+        _verify_dted(scratch, cell, posts)
+        os.replace(scratch, output_file)
+    finally:
+        if os.path.exists(scratch):
+            os.remove(scratch)
+
+    digest = hashlib.sha256(content).hexdigest()
+    logger.info(f'DTED header of cell {cell.cell_id} built from scratch:')
+    for line in describe_changes(None, header, sources):
+        logger.info(line)
+    logger.info(f'Wrote {output_file}: {len(content):,} bytes, SHA-256 {digest}')
+    return digest
+
+
+def _verify_dted(path: str, cell: CellGeometry, posts: np.ndarray) -> None:
+    """Raise RuntimeError unless the file at *path* validates and GDAL reads
+    *posts* and the cell's geotransform back from it."""
+    _header, issues = validate_file(path, check_data=True)
+    errors = [str(issue) for issue in issues if issue.severity == 'error']
+    if errors:
+        raise RuntimeError('The written DTED file does not validate:\n  ' + '\n  '.join(errors))
+    with gdal.config_option('DTED_VERIFY_CHECKSUM', 'YES'):
+        ds = gdal.Open(path, gdal.GA_ReadOnly)
+        try:
+            if ds is None:
+                raise RuntimeError('GDAL cannot open the written DTED file')
+            band = ds.GetRasterBand(1)
+            values = band.ReadAsArray()
+            geotransform = ds.GetGeoTransform()
+        finally:
+            band = None
+            ds = None
+    if not np.array_equal(values, posts):
+        raise RuntimeError('GDAL does not read back the heights that were written')
+    if tuple(geotransform) != cell.geotransform:
+        raise RuntimeError(f'GDAL reads the geotransform {geotransform}, not the cell\'s {cell.geotransform}')

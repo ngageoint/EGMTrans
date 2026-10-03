@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import stat
+import string
 from dataclasses import dataclass
 
 from osgeo import gdal
@@ -21,6 +22,7 @@ from osgeo import gdal
 from egmtrans import _state
 from egmtrans.config import (
     AUXILIARY_LAYER_CODES,
+    DTED_EXTENSIONS,
     INVALID_CHARACTERS,
     INVALID_FILENAME_SUBSTRINGS,
     SUPPORTED_EXTENSIONS,
@@ -46,14 +48,77 @@ class IOPaths:
             to write (already joined with the input's basename if the caller
             supplied a folder).  When *mode* is ``'folder'`` it is the folder.
         mode: ``'file'`` for a single transform, ``'folder'`` for a batch run.
-        log_path: Where the transform log belongs.  Derived, never created —
+        log_path: Where the transform log belongs.  Derived, never created --
             the caller decides whether logging is enabled.
+        output_folder: The folder the outputs go to: the output folder of a
+            batch run, or the folder of the single output file.
+        dted_level: The DTED level GeoTIFF inputs are converted to, if any.
+        output_derived: Whether the single output file's name was derived
+            from the input's (the caller gave a folder), so a naming preset
+            may still rename a converted cell.
     """
 
     input_path: str
     output_path: str
     mode: str
     log_path: str
+    output_folder: str = ''
+    dted_level: int | None = None
+    output_derived: bool = False
+
+
+# Output names of converted cells: presets by name, or a template with the
+# placeholders {stem} (the input's name without extension), {dir} (the
+# input's folder relative to the input folder), {cell} (N49E006), {lat}
+# (N49), {lon} (E006) and {level}. The extension is appended.
+DTED_NAMING_PRESETS = {'stem': '{dir}/{stem}', 'cell': '{cell}', 'dted': '{lon}/{lat}'}
+DTED_NAMING_PLACEHOLDERS = ('stem', 'dir', 'cell', 'lat', 'lon', 'level')
+
+
+def dted_naming_template(naming: str) -> str:
+    """The template behind a ``--dted-naming`` value: a preset's, or the value itself.
+
+    Raises:
+        ValueError: If the template uses an unknown placeholder or is malformed.
+    """
+    template = DTED_NAMING_PRESETS.get(naming, naming)
+    try:
+        fields = [name for _, name, _, _ in string.Formatter().parse(template) if name is not None]
+    except ValueError as e:
+        raise ValueError(f'--dted-naming {naming!r} is not a valid template: {e}') from e
+    unknown = sorted(set(fields) - set(DTED_NAMING_PLACEHOLDERS))
+    if unknown:
+        raise ValueError(
+            f'--dted-naming {naming!r} uses {", ".join("{" + u + "}" for u in unknown)}; the placeholders are '
+            + ', '.join('{' + p + '}' for p in DTED_NAMING_PLACEHOLDERS)
+            + f' and the presets {", ".join(DTED_NAMING_PRESETS)}'
+        )
+    if not fields and not template.strip():
+        raise ValueError('--dted-naming needs a name')
+    return template
+
+
+def dted_output_name(naming: str, input_file: str, input_root: str, cell_id: str, level: int) -> str:
+    """The output path, relative to the output folder, of the DTED cell
+    *cell_id* made from *input_file* under the ``--dted-naming`` value.
+
+    Raises:
+        ValueError: If the template is invalid or the name leaves the output folder.
+    """
+    template = dted_naming_template(naming)
+    stem = os.path.splitext(os.path.basename(input_file))[0]
+    folder = os.path.relpath(os.path.dirname(os.path.abspath(input_file)), os.path.abspath(input_root))
+    folder = '' if folder == os.curdir else folder.replace(os.sep, '/')
+    lat, lon = cell_id[:3], cell_id[3:]
+    name = template.format(stem=stem, dir=folder, cell=cell_id, lat=lat, lon=lon, level=level)
+    name = '/'.join(part for part in name.split('/') if part)  # a blank {dir} leaves no empty folder
+    if not name:
+        raise ValueError(f'--dted-naming {naming!r} gives an empty name for {cell_id}')
+    name = f'{name}.dt{level}'
+    normalized = os.path.normpath(name)
+    if normalized.startswith(os.pardir) or os.path.isabs(normalized) or normalized.startswith(('/', '\\')):
+        raise ValueError(f'--dted-naming {naming!r} names {name!r}, which leaves the output folder')
+    return normalized.replace(os.sep, '/')
 
 
 def derive_log_path(output_path: str, mode: str) -> str:
@@ -73,7 +138,7 @@ def derive_log_path(output_path: str, mode: str) -> str:
     return os.path.join(folder, f'{os.path.basename(folder)}_transform.log')
 
 
-def resolve_io_paths(input_path: str, output_path: str) -> IOPaths:
+def resolve_io_paths(input_path: str, output_path: str, *, dted_level: int | None = None) -> IOPaths:
     """Decide whether *output_path* names a file or a folder, and resolve both.
 
     Classification, in order:
@@ -81,19 +146,23 @@ def resolve_io_paths(input_path: str, output_path: str) -> IOPaths:
     1. An existing directory is always a folder (so folder names containing
        dots keep working).
     2. Otherwise a supported raster extension means a file.
-    3. Otherwise a folder — with a warning if the name carries some other
+    3. Otherwise a folder -- with a warning if the name carries some other
        extension, since that is more likely a typo than an intent.
 
     A file input written to a folder output is resolved to
     ``<folder>/<input basename>``, so callers always receive a concrete file
-    path in :attr:`IOPaths.output_path`.
+    path in :attr:`IOPaths.output_path`; with *dted_level*, a GeoTIFF file
+    input becomes ``<folder>/<input stem>.dtN``.
 
     Raises:
         ValueError: If either path is empty, the input does not exist, the
-            output basename is not a legal filename, or a folder of DEMs was
-            aimed at a single output file.
+            output basename is not a legal filename, a folder of DEMs was
+            aimed at a single output file, or *dted_level* contradicts the
+            output file's extension.
     """
     logger = _state.get_logger()
+    if dted_level is not None and dted_level not in (0, 1, 2):
+        raise ValueError(f'The DTED level must be 0, 1 or 2, not {dted_level}')
 
     if not input_path or not str(input_path).strip():
         raise ValueError('An input path is required.')
@@ -138,9 +207,18 @@ def resolve_io_paths(input_path: str, output_path: str) -> IOPaths:
 
     if output_is_file:
         mode, resolved_output = 'file', output_path
+        if dted_level is not None:
+            extension = os.path.splitext(output_name)[1].lower()
+            if extension not in DTED_EXTENSIONS:
+                raise ValueError(f'A DTED level was given, but the output {output_name} is not a DTED file')
+            if extension != f'.dt{dted_level}':
+                raise ValueError(f'The output {output_name} is not DTED level {dted_level}')
     elif input_is_file:
         mode = 'file'
-        resolved_output = os.path.join(output_path, os.path.basename(input_path))
+        name = os.path.basename(input_path)
+        if dted_level is not None and not name.lower().endswith(DTED_EXTENSIONS):
+            name = f'{os.path.splitext(name)[0]}.dt{dted_level}'
+        resolved_output = os.path.join(output_path, name)
     else:
         mode, resolved_output = 'folder', output_path
 
@@ -149,6 +227,9 @@ def resolve_io_paths(input_path: str, output_path: str) -> IOPaths:
         output_path=resolved_output,
         mode=mode,
         log_path=derive_log_path(resolved_output, mode),
+        output_folder=resolved_output if mode == 'folder' else os.path.dirname(resolved_output) or os.curdir,
+        dted_level=dted_level,
+        output_derived=mode == 'file' and not output_is_file,
     )
 
 
