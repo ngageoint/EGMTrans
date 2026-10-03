@@ -1,4 +1,4 @@
-"""The ``dted-header`` and ``dted-index`` subcommands.
+"""The ``dted-header``, ``dted-index`` and ``dted-selftest`` subcommands.
 
     egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH]
                          [--zero-based] [--check-data] [--strict]
@@ -6,6 +6,7 @@
                          | --from-footprints FILE [--cell-field NAME]) [--profile FILE]
                          [--level N] [--product NAME] [--update]
     egmtrans dted-index validate INDEX [--profile FILE] [--level N]
+    egmtrans dted-selftest [--keep FOLDER] [--print-reference]
 
 Reports go to stdout (or ``--out``), log messages to stderr, so a JSON or
 CSV report can be piped. Exit codes: 0 clean, 1 findings or failures, 2 usage.
@@ -26,7 +27,7 @@ from egmtrans.dted.profile import load_profile
 from egmtrans.dted.report import FORMATS, build_report, render_report
 from egmtrans.dted.validate import count, validate_file
 
-SUBCOMMANDS = ('dted-header', 'dted-index')
+SUBCOMMANDS = ('dted-header', 'dted-index', 'dted-selftest')
 
 
 def _stderr_logger() -> logging.Logger:
@@ -84,6 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument('index', metavar='INDEX', help='Index to check (.gpkg or .parquet)')
     validate.add_argument('--profile', metavar='FILE', help='Product profile to check alongside')
     validate.add_argument('--level', type=int, choices=(0, 1, 2), help='DTED level the index must be for')
+
+    selftest = subparsers.add_parser(
+        'dted-selftest', help='Convert built-in synthetic tiles to DTED and compare the bytes with the reference.',
+        description='Builds two synthetic tiles, converts them to DTED2, DTED1 and DTED0 from EGM2008 to EGM96 '
+                    'and compares the SHA-256 of every header and record block with the pinned reference. A match '
+                    'shows this host reproduces the reference bytes. The geoid grids must be present.',
+    )
+    selftest.add_argument('--keep', metavar='FOLDER',
+                          help='Write the tiles and the DTED files to this folder and keep them')
+    selftest.add_argument('--print-reference', action='store_true',
+                          help='Print the hashes as the REFERENCE mapping of egmtrans.dted.selftest')
     return parser
 
 
@@ -190,6 +202,40 @@ def run_index_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 1 if errors else 0
 
 
+def run_selftest(args: argparse.Namespace, logger: logging.Logger) -> int:
+    from egmtrans.cli import versions_line
+    from egmtrans.config import verify_grids
+    from egmtrans.dted.selftest import SOURCE_DATUM, TARGET_DATUM, reference_text
+    from egmtrans.dted.selftest import run_selftest as run
+
+    logger.info(versions_line())
+    try:
+        verify_grids(SOURCE_DATUM, TARGET_DATUM)
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        return 2
+    try:
+        result = run(args.keep, keep=bool(args.keep))
+    except Exception as e:
+        logger.error(f'The self-test could not run: {e}')
+        return 1
+    for item in result.items:
+        if item.expected is None:
+            state = 'no reference'
+        else:
+            state = 'matches the reference' if item.ok else 'DIFFERS from the reference'
+        logger.info(f'{item.name}: header {item.header[:16]}..., records {item.records[:16]}...: {state}')
+    if args.print_reference:
+        sys.stdout.write(reference_text(result) + '\n')
+    if args.keep:
+        logger.info(f'Files kept under {result.folder}')
+    if result.ok:
+        logger.info('Self-test passed: this host reproduces the reference bytes.')
+        return 0
+    logger.error('Self-test FAILED: this host does not reproduce the reference bytes.')
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run a subcommand; returns the exit code."""
     parser = build_parser()
@@ -197,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
     logger = _stderr_logger()
     if args.command == 'dted-header':
         return run_header(args, logger)
+    if args.command == 'dted-selftest':
+        return run_selftest(args, logger)
     if args.index_command == 'build':
         return run_index_build(args, logger)
     return run_index_validate(args, logger)

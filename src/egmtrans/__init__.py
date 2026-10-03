@@ -1,8 +1,8 @@
-"""EGMTrans — Vertical datum transformation tool for DEMs."""
+"""EGMTrans: vertical datum transformation tool for DEMs."""
 
 from egmtrans._version import __version__
 from egmtrans.batch import BatchResult, run_batch
-from egmtrans.cli import process_file, str2bool
+from egmtrans.cli import process_file, str2bool, versions_line
 from egmtrans.config import (
     DATUM_MAPPING,
     DTED_EXTENSIONS,
@@ -16,6 +16,7 @@ from egmtrans.file_utils import (
     copy_as_writable,
     copy_folder_structure,
     derive_log_path,
+    dted_naming_template,
     ensure_writable,
     find_dems,
     is_valid_dem,
@@ -44,6 +45,8 @@ __all__ = [
     "str2bool",
     "IOPaths",
     "resolve_io_paths",
+    "dted_naming_template",
+    "versions_line",
     "derive_log_path",
     "prepare_output_target",
     "ensure_writable",

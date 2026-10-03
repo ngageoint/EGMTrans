@@ -107,10 +107,12 @@ class TileAnalysis:
     geotransform: tuple[float, float, float, float, float, float]
     rows: int
     cols: int
-    is_dted: bool
+    is_dted: bool  # the output holds whole meters: DTED in, or a DTED cell out
     edges: dict[str, EdgeRecord] = field(default_factory=dict)
     patches: dict[int, PatchStats] = field(default_factory=dict)
     error: str | None = None
+    cell: object | None = None  # the DTED cell a converted tile is written as
+    array_crc: int | None = None  # CRC-32 of the heights, for pass 2 to check
 
     @property
     def name(self) -> str:
@@ -218,13 +220,14 @@ class TileLevels:
     *levels* holds the merged level of every edge-touching label that is
     water; *not_water* the edge-touching labels the merge decided are not
     (their patches are left as terrain); *expected_counts* the post count of
-    every edge-touching label when the tile was analyzed, so pass 2 can check
-    it saw the same input.
+    every edge-touching label when the tile was analyzed, and *array_crc* the
+    CRC-32 of the heights then, so pass 2 can check it saw the same input.
     """
 
     levels: dict[int, float] = field(default_factory=dict)
     expected_counts: dict[int, int] = field(default_factory=dict)
     not_water: set[int] = field(default_factory=set)
+    array_crc: int | None = None
 
     def override_array(self, max_label: int) -> np.ndarray:
         """A dense float array indexed by label, NaN where there is no override."""
@@ -251,7 +254,7 @@ class WaterLevelTable:
     """Levels exported by an earlier run, looked up by edge crossing.
 
     A partial run matches its own crossings against the table by the side and
-    coordinate of the edge line, the input height (to 1 cm either way), and an
+    coordinate of the edge line, the input height in whole centimeters, and an
     overlap of the along-edge intervals.
     """
 
@@ -265,11 +268,13 @@ class WaterLevelTable:
             self._index[(row.side, _line_key(row.line), row.height_cm)].append(row)
 
     def lookup(self, side: str, line: float, height_cm: int) -> list[TableRow]:
+        # The line coordinate is a float and may land in a neighboring key;
+        # the height is a whole number of centimeters and must match exactly,
+        # as it does when patches are joined across a seam.
         key = _line_key(line)
         found = []
         for k in (key - 1, key, key + 1):
-            for h in (height_cm - 1, height_cm, height_cm + 1):
-                found.extend(self._index.get((side, k, h), []))
+            found.extend(self._index.get((side, k, height_cm), []))
         return found
 
 
@@ -384,6 +389,8 @@ def edge_patch_stats(
                 continue
             i, j = edge_post(side, position, rows, cols)
             stats[label] = PatchStats(
+                # The arithmetic of flattening.height_centimeters: the product
+                # in double precision, halves to even.
                 height_cm=int(round(float(input_array[i, j]) * 100)),
                 min_value=float(levels[label]),
                 count=int(counts[label]),
@@ -558,7 +565,8 @@ def merge_patches(
     """Join edge-touching patches across seams and give each water body one level.
 
     Two patches are joined when a matched pair of posts on a seam carries their
-    labels and their input heights agree within 1 cm.  A body is water when at
+    labels and their input heights are the same whole centimeter, the rule that
+    makes a patch within a tile.  A body is water when at
     least *min_containment* of its boundary, summed over all its parts, lies
     above it; the decision is made for the whole body so that the two sides of
     a seam agree.  The level of a water body is the minimum over its members
@@ -588,7 +596,10 @@ def merge_patches(
             pa, pb = a.patches.get(la), b.patches.get(lb)
             if pa is None or pb is None:
                 continue
-            if abs(pa.height_cm - pb.height_cm) <= 1:
+            # Exact, as within a tile. A tolerance of 1 cm here was not
+            # transitive: which patches ended in one body, and the height the
+            # body was filed under, depended on the order of the members.
+            if pa.height_cm == pb.height_cm:
                 sets.union((seam.a, la), (seam.b, lb))
             else:
                 height_conflicts.append(
@@ -692,4 +703,117 @@ def format_boundary_report(bodies: list[WaterBody], tiles: list[TileAnalysis], l
     for body in bodies:
         for note in body.notes:
             lines.append(f"  note: water body at {body.height_cm / 100:.2f} m: {note}")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Seam check of the written DTED outputs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SeamCheck:
+    """The shared posts of two DTED outputs along one seam, read back from the files."""
+
+    a_name: str
+    a_side: str
+    b_name: str
+    b_side: str
+    shared: int
+    differing: int
+    max_difference: int
+
+    @property
+    def clean(self) -> bool:
+        return self.differing == 0
+
+
+def coincident_posts(
+    frame_a: tuple[float, float, float, int], frame_b: tuple[float, float, float, int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Index pairs of the posts that two edges (``(across, along0, step, length)``
+    frames of :func:`_edge_frames`) have at the same along-edge coordinate."""
+    _, along_a, step_a, length_a = frame_a
+    _, along_b, step_b, length_b = frame_b
+    # Walk the coarser edge and look for each of its posts on the finer one.
+    if abs(step_a) < abs(step_b):
+        b_idx, a_idx = coincident_posts(frame_b, frame_a)
+        return a_idx, b_idx
+    k = np.arange(length_a)
+    coordinates = along_a + k * step_a
+    m = (coordinates - along_b) / step_b
+    m_round = np.rint(m)
+    near = (np.abs(m - m_round) <= EDGE_TOLERANCE_FRACTION) & (m_round >= 0) & (m_round < length_b)
+    return k[near].astype(np.int64), m_round[near].astype(np.int64)
+
+
+def compare_seams(tiles: list[TileAnalysis], seams: list[Seam], outputs: dict[int, str]) -> list[SeamCheck]:
+    """Compare the shared posts of every seam between two DTED outputs that exist.
+
+    *outputs* maps tile ids to the DTED files written for them. The edge
+    profiles are read from the files (:func:`egmtrans.dted.records.read_edges`),
+    so the check covers what was written, converted cells and DTED-to-DTED
+    outputs alike, at whatever level each file has.
+    """
+    from egmtrans.dted.header import cell_geometry_of, read_header
+    from egmtrans.dted.records import read_edges
+
+    by_id = {t.tile_id: t for t in tiles}
+    sides = {'N': 'north', 'S': 'south', 'W': 'west', 'E': 'east'}
+    edges: dict[int, tuple[dict[str, np.ndarray], dict[str, tuple]]] = {}
+
+    def load(tile_id: int):
+        if tile_id in edges:
+            return edges[tile_id]
+        path = outputs.get(tile_id)
+        if not path or not os.path.isfile(path) or not path.lower().endswith(('.dt0', '.dt1', '.dt2')):
+            edges[tile_id] = None
+            return None
+        header = read_header(path)
+        cell = cell_geometry_of(header, os.path.splitext(path)[1])
+        if cell is None:
+            edges[tile_id] = None
+            return None
+        profiles = read_edges(path)
+        frames = _edge_frames(cell.geotransform, cell.lat_points, cell.lon_lines)
+        edges[tile_id] = (profiles, frames)
+        return edges[tile_id]
+
+    checks: list[SeamCheck] = []
+    for seam in seams:
+        a, b = load(seam.a), load(seam.b)
+        if a is None or b is None:
+            continue
+        a_idx, b_idx = coincident_posts(a[1][seam.a_side], b[1][seam.b_side])
+        if a_idx.size == 0:
+            continue
+        values_a = a[0][sides[seam.a_side]][a_idx].astype(np.int64)
+        values_b = b[0][sides[seam.b_side]][b_idx].astype(np.int64)
+        difference = np.abs(values_a - values_b)
+        checks.append(SeamCheck(
+            by_id[seam.a].name if seam.a in by_id else os.path.basename(outputs[seam.a]), seam.a_side,
+            by_id[seam.b].name if seam.b in by_id else os.path.basename(outputs[seam.b]), seam.b_side,
+            int(a_idx.size), int(np.count_nonzero(difference)), int(difference.max()) if difference.size else 0,
+        ))
+    return checks
+
+
+def format_seam_report(checks: list[SeamCheck], limit: int = 100) -> list[str]:
+    """Lines describing the seam checks: every seam with a differing post, and a summary."""
+    if not checks:
+        return []
+    lines: list[str] = []
+    bad = [c for c in checks if not c.clean]
+    for check in bad[:limit]:
+        lines.append(
+            f'  Seam {check.a_name}:{check.a_side} / {check.b_name}:{check.b_side}: {check.shared:,} shared posts, '
+            f'{check.differing:,} differ, up to {check.max_difference} m'
+        )
+    if len(bad) > limit:
+        lines.append(f'  ... and {len(bad) - limit} more')
+    shared = sum(c.shared for c in checks)
+    lines.insert(0, (
+        f'Seam check of the DTED outputs: {len(checks)} seam(s), {shared:,} shared posts, '
+        f'{len(bad)} seam(s) with posts that differ.'
+    ))
     return lines

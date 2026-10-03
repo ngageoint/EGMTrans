@@ -61,8 +61,12 @@ sha256sum datums/us_nga_egm08_1.tif
   `schema.py`: every read is a bounded slice, every write is a fixed-length
   field checked for length and printable ASCII, and the encoder refuses to
   overwrite a file that does not carry a DTED data record after its header.
-  The record checker (`validate.py`) reads the elevation records with numpy
-  slices of known length. The optional index and profile are read with GDAL
+  The elevation records are read and written by `records.py` with numpy
+  slices of fixed length: every value is range-checked and cast to an
+  integer before it is encoded, and a DTED file made from scratch is written
+  under a temporary name, verified (header, records, checksums, and GDAL
+  reading it back) and only then renamed to its output name. The optional
+  index and profile are read with GDAL
   (GeoPackage), `pyarrow` (GeoParquet) and `tomllib` (TOML); XML sidecars read
   during an index build are refused when they declare a DOCTYPE or entities,
   and are parsed with entity resolution and network access off.

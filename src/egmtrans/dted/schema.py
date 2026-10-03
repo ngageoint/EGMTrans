@@ -32,6 +32,11 @@ RECORD_TITLES = {
 DATA_RECORD_SENTINEL = 0xAA
 DATA_RECORD_OVERHEAD = 12  # sentinel (1) + block count (3) + lon count (2) + lat count (2) + checksum (4)
 NULL_ELEVATION = -32767
+# The data record notes: the 16-bit signed-magnitude value allows +/-32,767 m,
+# "however in practice, the terrain elevation values shall not exceed
+# +9,000 meters or -12,000 meters".
+ELEVATION_MIN = -12000
+ELEVATION_MAX = 9000
 
 # Accuracy subregions inside the ACC record (3.13.5.1): up to nine, 284
 # characters each, starting at character 58; the last 87 characters are reserved.

@@ -40,6 +40,7 @@ EGM2008 to EGM96.
 
 ```bat
 REM One 0.4-arc-second GeoTIFF tile, plus the DTED2 and DTED1 made from it
+REM (EGMTrans makes them itself: egmtrans -i tile.tif -o out.dt2 -s EGM2008 -t EGM96 --dted-profile ...)
 python benchmarks\benchmark_tiles.py ^
     D:\data\tiles\N06E126_DEM.tif ^
     D:\data\dted\e126\n06.dt2 D:\data\dted1\e126\n06.dt1 ^

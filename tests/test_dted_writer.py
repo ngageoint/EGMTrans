@@ -25,6 +25,16 @@ FIXTURE = os.path.join(os.path.dirname(__file__), 'data', 'srtm_n03e008_header.b
 PROFILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'samples', 'dted_profile_example.toml')
 
 
+def level_0_profile(folder: str) -> str:
+    """A copy of the sample profile for DTED0, which the test tiles are."""
+    with open(PROFILE) as handle:
+        text = handle.read().replace('dted_level = 2', 'dted_level = 0')
+    path = os.path.join(folder, 'profile_level0.toml')
+    with open(path, 'w') as handle:
+        handle.write(text)
+    return path
+
+
 @pytest.fixture
 def profile():
     return load_profile(PROFILE)
@@ -78,6 +88,101 @@ def test_required_fields_and_conflicts(profile, log_lines):
                                 derived=DerivedFields(vertical_datum='E96'))
     assert header['dsi.vertical_datum'] == 'E96'
     assert any("vertical_datum is 'E08' in the profile but the output is 'E96'" in line for line in log_lines)
+
+
+REQUIRED = ('security_code', 'data_edition', 'match_merge_version', 'producer_code', 'compilation_date',
+            'abs_horiz_acc', 'abs_vert_acc', 'rel_horiz_acc', 'rel_vert_acc')
+
+
+@pytest.mark.parametrize('column', REQUIRED)
+def test_every_required_field_needs_a_source_from_scratch(profile, column):
+    """The spec fill (NA, 0000) is not a value for a required field: without a
+    source the write stops, naming the field."""
+    del profile.product[column]
+    with pytest.raises(HeaderAssemblyError, match=f'{column} is required and nothing supplies it'):
+        assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(None, [], profile),
+                        derived=DerivedFields(vertical_datum='E96'))
+    # An explicit NA from the index counts, and so does the command line for the horizontal accuracy.
+    if column in ('abs_horiz_acc', 'abs_vert_acc', 'rel_horiz_acc', 'rel_vert_acc'):
+        row = new_row('N03E008', **{column: None})
+        header, sources = assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(row, [], profile),
+                                          derived=DerivedFields(vertical_datum='E96'))
+        assert header[f'acc.{column}'] == 'NA  ' and sources[f'acc.{column}'] == 'index'
+    if column == 'abs_horiz_acc':
+        header, sources = assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(None, [], profile),
+                                          derived=DerivedFields(vertical_datum='E96'), cli_abs_horiz_accuracy=30)
+        assert header['acc.abs_horiz_acc'] == '0030' and sources['acc.abs_horiz_acc'] == 'command line'
+    # With a base header the input is the authority, gaps included.
+    base = new_header(cell_geometry(8, 3, 2))
+    base.set('dsi.vertical_datum', 'MSL')
+    assemble_header(cell_geometry(8, 3, 2), base=base, derived=DerivedFields(vertical_datum='E96'))
+
+
+def test_another_level_in_the_row_or_the_profile_is_refused(profile):
+    row = new_row('N03E008', dted_level=1)
+    with pytest.raises(HeaderAssemblyError, match='index row is for DTED level 1; cell N03E008 .* at level 2'):
+        assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(row, [], profile),
+                        derived=DerivedFields(vertical_datum='E96'))
+    with pytest.raises(HeaderAssemblyError, match='profile is for DTED level 2; cell N03E008 .* at level 0'):
+        assemble_header(cell_geometry(8, 3, 0), metadata=DtedMetadata(None, [], profile),
+                        derived=DerivedFields(vertical_datum='E96'))
+    # A row that does not say, and a profile that does not say, pass.
+    assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(new_row('N03E008'), [], profile),
+                    derived=DerivedFields(vertical_datum='E96'))
+    del profile.product['dted_level']
+    assemble_header(cell_geometry(8, 3, 0), metadata=DtedMetadata(None, [], profile),
+                    derived=DerivedFields(vertical_datum='E96'))
+
+
+def test_bad_values_are_reported_with_their_column(profile):
+    profile.product['data_edition'] = 'x'
+    with pytest.raises(HeaderAssemblyError, match=r"data_edition \(profile\): 'x' cannot be written"):
+        assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(None, [], profile),
+                        derived=DerivedFields(vertical_datum='E96'))
+
+
+def test_validator_warnings_on_a_new_header_are_logged(profile, log_lines):
+    profile.product['producer_code'] = '12NGA'  # no FIPS country code
+    profile.product['product_spec'] = 'PRF89020A'
+    header, _ = assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(None, [], profile),
+                                derived=DerivedFields(vertical_datum='E08'))
+    warnings = [issue for issue in validate_header(header) if issue.severity == 'warning']
+    assert warnings, 'the test profile makes no warning'
+    for issue in warnings:
+        assert any(line == f'DTED header of cell N03E008: {issue}' for line in log_lines)
+
+
+def test_subregion_rings_are_normalized(profile):
+    from egmtrans.dted.writer import normalize_ring
+
+    clockwise = [(3.0, 8.0), (4.0, 8.0), (4.0, 8.5), (3.0, 8.5)]
+    assert normalize_ring(clockwise) == clockwise
+    assert normalize_ring(clockwise + [clockwise[0]]) == clockwise, 'the closing vertex is dropped'
+    assert normalize_ring(list(reversed(clockwise))) == clockwise, 'a counterclockwise ring is reversed'
+    assert normalize_ring(clockwise[2:] + clockwise[:2]) == clockwise, 'the ring starts at the southwest'
+    assert normalize_ring([(3.0, 8.5), (3.0, 8.0), (4.0, 8.0)]) == [(3.0, 8.0), (4.0, 8.0), (3.0, 8.5)]
+    subregions = [
+        {'cell_id': 'N03E008', 'seq': 1, 'abs_horiz_acc': 12, 'abs_vert_acc': 6, 'rel_horiz_acc': None,
+         'rel_vert_acc': 8, 'outline': [(4.0, 8.5), (4.0, 8.0), (3.0, 8.0), (3.0, 8.5), (4.0, 8.5)]},
+        {'cell_id': 'N03E008', 'seq': 2, 'abs_horiz_acc': 20, 'abs_vert_acc': 10, 'rel_horiz_acc': None,
+         'rel_vert_acc': 12, 'outline': [(3.0, 8.5), (4.0, 8.5), (4.0, 9.0), (3.0, 9.0)]},
+    ]
+    header, _ = assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(new_row('N03E008'), subregions, profile),
+                                derived=DerivedFields(vertical_datum='E96'))
+    outline = parse_header(encode_header(header)).subregions()[0].decoded_outline()
+    assert [(pytest.approx(lat), pytest.approx(lon)) for lat, lon in clockwise] == outline
+
+
+def test_describe_a_header_built_from_scratch(profile):
+    row = new_row('N03E008', producer_code='GEBGIC', abs_horiz_acc=None)
+    header, sources = assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(row, [], profile),
+                                      derived=DerivedFields(vertical_datum='E96'), cli_abs_horiz_accuracy=5)
+    lines = describe_changes(None, header, sources)
+    assert lines[0].startswith('Header fields by source: ')
+    assert "    dsi.producer_code: 'GEBGIC  ' (index)" in lines
+    assert "    acc.abs_horiz_acc: 'NA  ' (index)" in lines
+    assert "    dsi.digitizing_system: 'TandemXTDF' (profile)" in lines
+    assert not any('(derived)' in line or '(default)' in line for line in lines[1:])
 
 
 def test_subregions_from_the_index_set_both_flags(profile):
@@ -149,7 +254,11 @@ def test_update_dted_header_in_a_file(tmp_dir, profile, log_lines):
 
     index_path = os.path.join(tmp_dir, 'index.gpkg')
     write_index(index_path, {'N06E126': new_row('N06E126', data_edition=3, abs_vert_acc=7, rel_vert_acc=None)}, level=0)
+    # The sample profile is for level 2; a profile for another level is refused.
     source = DtedMetadataSource.load(index_path, PROFILE)
+    with pytest.raises(HeaderAssemblyError, match='profile is for DTED level 2'):
+        update_dted_header(path, 'EGM2008', metadata=source.for_cell('N06E126'))
+    source = DtedMetadataSource.load(index_path, level_0_profile(tmp_dir))
     update_dted_header(path, 'EGM2008', metadata=source.for_cell('N06E126'))
     final = read_header(path)
     assert final['dsi.vertical_datum'] == 'E08'

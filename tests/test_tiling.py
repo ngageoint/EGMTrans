@@ -167,9 +167,31 @@ class TestMerge:
         assert len(bodies) == 2
         assert any("kept separate" in note for body in bodies for note in body.notes)
 
-        a, b = self._pair(height_b=15001)  # within the 1 cm labeling tolerance
+        # One centimeter apart is another body across a seam, as it is another
+        # patch within a tile.
+        a, b = self._pair(height_b=15001)
         _, bodies = merge_patches([a, b], find_seams([a, b]))
-        assert len(bodies) == 1
+        assert len(bodies) == 2
+
+    def test_one_centimeter_steps_do_not_chain(self):
+        """A 1 cm tolerance joined 150.00 to 150.01 and 150.01 to 150.02 but not
+        150.00 to 150.02, so the body, and the height it was filed under,
+        depended on the order of the tiles."""
+        def run(order):
+            tiles = [
+                _tile(1, _band(2), GT_A, {2: (15000, 149.6, 10)}),
+                _tile(2, _band(3), GT_SHARED_EAST, {3: (15001, 149.4, 15)}),
+                _tile(3, _band(4), (7.5, 1.0, 0.0, 4.5, 0.0, -1.0), {4: (15002, 149.2, 12)}),  # x = 8..12
+            ]
+            tiles = [tiles[i] for i in order]
+            _, bodies = merge_patches(tiles, find_seams(tiles))
+            return sorted((b.height_cm, b.level, b.posts, tuple(b.members)) for b in bodies)
+
+        results = [run(order) for order in ([0, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0])]
+        assert all(r == results[0] for r in results)
+        assert results[0] == [
+            (15000, 149.6, 10, ((1, 2),)), (15001, 149.4, 15, ((2, 3),)), (15002, 149.2, 12, ((3, 4),)),
+        ]
 
     def test_merge_is_independent_of_tile_order(self):
         def run(order):
@@ -321,11 +343,28 @@ class TestWaterLevelTable:
         _, bodies = merge_patches([tile], [], table)
         assert bodies[0].level == 149.6
 
-    def test_lookup_tolerates_a_centimeter_and_a_line_rounding(self):
+    def test_lookup_needs_the_exact_centimeter_and_tolerates_a_line_rounding(self):
         table = WaterLevelTable([TableRow(15000, 149.0, 1, 1, "E", 4.0, 1.0, 3.5)], "EGM2008", "EGM96")
-        assert table.lookup("E", 4.0 + 5e-7, 15001)
+        assert table.lookup("E", 4.0 + 5e-7, 15000)
+        assert not table.lookup("E", 4.0, 15001)
         assert not table.lookup("E", 4.01, 15000)
-        assert not table.lookup("E", 4.0, 15003)
+
+    def test_exported_height_reads_back_as_the_same_centimeter(self, tmp_path):
+        """The table stores the height with two decimals; reading it back must
+        give the centimeter it was written from, or an exact lookup would miss."""
+        from egmtrans.batch import read_water_levels, write_water_levels
+        from egmtrans.tiling import Crossing
+
+        heights = [-4321, -1, 0, 1, 29, 57, 15000, 15001, 123457, 884899]
+        bodies = [
+            WaterBody(height_cm=h, level=h / 100 - 0.4, posts=20, members=[(1, 2)],
+                      crossings=[Crossing(1, "E", 4.0, 1.0, 3.5)])
+            for h in heights
+        ]
+        path = str(tmp_path / "levels.csv")
+        write_water_levels(path, bodies, "EGM2008", "EGM96")
+        table = read_water_levels(path, "EGM2008", "EGM96")
+        assert [row.height_cm for row in table.rows] == heights
 
 
 class TestDisjointSet:

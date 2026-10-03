@@ -228,6 +228,88 @@ def test_uncontained_flat_area_is_left_as_terrain(tmp_dir, log_lines):
     assert np.unique(read_band(out_all)[70:100, 20:60]).size == 1
 
 
+def _write_float_tile(path, dem, nodata=None):
+    from osgeo import gdal, osr
+
+    rows, cols = dem.shape
+    ds = gdal.GetDriverByName("GTiff").Create(path, cols, rows, 1, gdal.GDT_Float32)
+    ds.SetGeoTransform((126.30, 0.01, 0.0, 7.90, 0.0, -0.01))
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.GetRasterBand(1).WriteArray(dem)
+    if nodata is not None:
+        ds.GetRasterBand(1).SetNoDataValue(nodata)
+    ds = None
+    return path
+
+
+@requires_grids
+def test_enclosed_low_spot_beside_a_lake_is_raised_and_reported(tmp_dir, log_lines):
+    """A few posts below the lake beside them, enclosed by higher ground, come
+    out at the lake's level and in the mask; an outlet to lower water does not."""
+    from osgeo import gdal
+
+    rows = cols = 40
+    i, j = np.mgrid[0:rows, 0:cols]
+    dem = (200.0 + i + 0.37 * j).astype(np.float32)
+    dem[20:30, 20:30] = 150.0                 # the lake
+    dem[30, 25] = 149.5                       # one post under its south shore
+    dem[18:20, 22:25] = 147.0 + 0.01 * np.arange(6).reshape(2, 3)   # six posts on its north shore
+    dem[5:10, 5:10] = 120.0                   # a lower lake ...
+    dem[np.arange(10, 20), np.arange(10, 20)] = 149.0 - 0.01 * np.arange(10)  # ... with a channel to it
+    src = _write_float_tile(os.path.join(tmp_dir, "spots.tif"), dem)
+    out = os.path.join(tmp_dir, "spots_egm96.tif")
+
+    transform_vertical_datum(src, out, "EGM2008", "EGM96", True, True, 16, "bilinear", save_log=False)
+
+    with gdal.Open(out) as ds:
+        result = ds.GetRasterBand(1).ReadAsArray()
+    level = result[20, 20]
+    assert np.all(result[20:30, 20:30] == level)
+    assert result[30, 25] == level and np.all(result[18:20, 22:25] == level)
+    # The channel keeps its own transformed values.
+    egm96 = create_datum_array(src, "EGM96", "bilinear", tmp_dir, tmp_dir)
+    egm2008 = create_datum_array(src, "EGM2008", "bilinear", tmp_dir, tmp_dir)
+    channel = (np.arange(10, 20), np.arange(10, 20))
+    expected = np.round(dem[channel].astype(np.float64) - (egm96 - egm2008)[channel], 2)
+    assert np.allclose(result[channel], expected, atol=0.006), "the outlet channel was raised"
+    with gdal.Open(os.path.join(tmp_dir, "spots_egm96_mask.tif")) as ds:
+        mask = ds.GetRasterBand(1).ReadAsArray()
+    assert mask[30, 25] == mask[20, 20] and np.all(mask[18:20, 22:25] == mask[20, 20])
+    assert np.all(mask[np.arange(10, 20), np.arange(10, 20)] == 0)
+    text = "\n".join(log_lines)
+    assert "Raised 2 enclosed low spot(s) of 7 posts beside water bodies" in text
+    # Up to 3 m less what the correction varies across the lake, at the post's center.
+    assert "Raised 6 post(s) by up to 2." in text and "(longitude 126.545000, latitude 7.715000)" in text
+
+
+@requires_grids
+def test_whole_meter_data_raises_no_low_spot(tmp_dir, log_lines):
+    """On DTED, and on a float tile of whole meters, a post below a plateau is terrain."""
+    from egmtrans.io import round_half_away
+    from tests.conftest import read_band, write_dted
+
+    posts = 121
+    i, j = np.mgrid[0:posts, 0:posts]
+    dem = (500 + 3 * i + 5 * j).astype(np.int16)
+    dem[30:90, 20:100] = 150
+    dem[90, 50] = 149
+    src = write_dted(os.path.join(tmp_dir, "n06e126.dt0"), dem, 126, 6)
+    out = os.path.join(tmp_dir, "n06e126_egm96.dt0")
+    transform_vertical_datum(src, out, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False)
+    result = read_band(out)
+    # The post below the lake is rounded on its own, like any land post.
+    egm96 = create_datum_array(src, "EGM96", "bilinear", tmp_dir, tmp_dir)
+    egm2008 = create_datum_array(src, "EGM2008", "bilinear", tmp_dir, tmp_dir)
+    assert result[90, 50] == round_half_away(149 - (egm96 - egm2008)[90, 50])
+
+    tile = _write_float_tile(os.path.join(tmp_dir, "whole.tif"), dem[:40, :40].astype(np.float32))
+    out_tile = os.path.join(tmp_dir, "whole_egm96.tif")
+    transform_vertical_datum(tile, out_tile, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False)
+    assert not any("low spot" in line for line in log_lines)
+
+
 @requires_grids
 def test_all_ocean_rows_stay_at_zero(tmp_dir):
     """Whole rows of ocean must come out at 0 m, not as voids.

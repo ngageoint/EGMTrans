@@ -211,3 +211,53 @@ class TestCopyAsWritable:
         # shutil.copy would silently write into the directory instead.
         with pytest.raises(IsADirectoryError):
             copy_as_writable(src, dst)
+
+
+class TestDtedLevelPaths:
+    """resolve_io_paths with a DTED level, and the naming of converted cells."""
+
+    def test_geotiff_file_to_folder_takes_the_level_extension(self, tmp_path):
+        src = tmp_path / 'TDF_N50W001_01_DEM.tif'
+        src.write_bytes(b'')
+        paths = resolve_io_paths(str(src), str(tmp_path / 'out'), dted_level=2)
+        assert paths.mode == 'file' and paths.output_path.endswith('TDF_N50W001_01_DEM.dt2')
+        assert paths.output_folder == str(tmp_path / 'out') and paths.dted_level == 2
+        dted = tmp_path / 'n50w001.dt1'
+        dted.write_bytes(b'')
+        paths = resolve_io_paths(str(dted), str(tmp_path / 'out'), dted_level=2)
+        assert paths.output_path.endswith('n50w001.dt1'), 'a DTED input keeps its name and level'
+
+    def test_a_level_against_an_output_file_of_another_kind_is_an_error(self, tmp_path):
+        src = tmp_path / 'tile.tif'
+        src.write_bytes(b'')
+        with pytest.raises(ValueError, match='not a DTED file'):
+            resolve_io_paths(str(src), str(tmp_path / 'out.tif'), dted_level=2)
+        with pytest.raises(ValueError, match='not DTED level 2'):
+            resolve_io_paths(str(src), str(tmp_path / 'out.dt1'), dted_level=2)
+        with pytest.raises(ValueError, match='must be 0, 1 or 2'):
+            resolve_io_paths(str(src), str(tmp_path / 'out.dt2'), dted_level=3)
+        paths = resolve_io_paths(str(src), str(tmp_path / 'out.dt2'), dted_level=2)
+        assert paths.mode == 'file' and paths.output_folder == str(tmp_path)
+        folder = resolve_io_paths(str(tmp_path), str(tmp_path / 'out'), dted_level=1)
+        assert folder.mode == 'folder' and folder.output_folder == str(tmp_path / 'out')
+
+    def test_naming_presets_and_templates(self):
+        from egmtrans.file_utils import dted_naming_template, dted_output_name
+
+        assert dted_naming_template('stem') == '{dir}/{stem}'
+        assert dted_naming_template('{cell}_v2') == '{cell}_v2'
+        with pytest.raises(ValueError, match='uses {lvl}'):
+            dted_naming_template('{lvl}')
+        with pytest.raises(ValueError, match='not a valid template'):
+            dted_naming_template('{cell')
+        root = os.path.join('data', 'tdf')
+        tile = os.path.join(root, 'band1', 'TDF_N49E006_03_DEM.tif')
+        assert dted_output_name('stem', tile, root, 'N49E006', 2) == 'band1/TDF_N49E006_03_DEM.dt2'
+        assert dted_output_name('cell', tile, root, 'N49E006', 1) == 'N49E006.dt1'
+        assert dted_output_name('dted', tile, root, 'N49E006', 0) == 'E006/N49.dt0'
+        assert dted_output_name('TDF-DTED{level}_{lon}{lat}', tile, root, 'S06E030', 2) == 'TDF-DTED2_E030S06.dt2'
+        assert dted_output_name('stem', os.path.join(root, 'a.tif'), root, 'N49E006', 2) == 'a.dt2'
+        with pytest.raises(ValueError, match='leaves the output folder'):
+            dted_output_name('../{cell}', tile, root, 'N49E006', 2)
+        with pytest.raises(ValueError, match='empty name'):
+            dted_output_name('{dir}', os.path.join(root, 'a.tif'), root, 'N49E006', 2)

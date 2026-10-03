@@ -17,14 +17,17 @@ import numpy as np
 
 from egmtrans.dted import schema
 from egmtrans.dted.header import DtedHeader, decode_accuracy, has_visible_text, parse_dms, read_header
+from egmtrans.dted.records import RecordError, read_records
 from egmtrans.dted.schema import (
     ALL_FIELDS,
     DATA_RECORD_OVERHEAD,
-    DATA_RECORD_SENTINEL,
+    ELEVATION_MAX,
+    ELEVATION_MIN,
     HEADER_LENGTH,
     LEVELS,
     MAX_SUBREGIONS,
     NA_VALUE,
+    NULL_ELEVATION,
     SUBREGION_FIELDS,
     ZONE_NAMES,
     Field,
@@ -332,64 +335,46 @@ def validate_header(
 
 def validate_records(path: str, header: DtedHeader, *, verify_checksums: bool = True) -> list[Issue]:
     """Check the elevation records that follow the header: sentinels, block
-    and line counts, checksums, and the null share against the partial cell
-    indicator. Reports the elevation range as info."""
+    and line counts, checksums, the elevation limits, and the null share
+    against the partial cell indicator. Reports the elevation range as info."""
     issues: list[Issue] = []
+    try:
+        decoded = read_records(path, header, verify_checksums=verify_checksums)
+    except RecordError as e:
+        issues.append(Issue('error', 'DATA', '', str(e)))
+        return issues
+
     lon_lines = header.interval_tenths('uhl.lon_lines')
-    lat_points = header.interval_tenths('uhl.lat_points')
-    if not lon_lines or not lat_points:
-        issues.append(Issue('error', 'DATA', '', 'the record layout cannot be read from the UHL counts'))
-        return issues
-    record_length = DATA_RECORD_OVERHEAD + 2 * lat_points
-    with open(path, 'rb') as handle:
-        handle.seek(HEADER_LENGTH)
-        data = np.frombuffer(handle.read(), dtype=np.uint8)
-    expected = lon_lines * record_length
-    if data.size != expected:
-        issues.append(Issue('error', 'DATA', '', f'{data.size:,} bytes of records; {lon_lines} records of '
-                            f'{record_length} bytes make {expected:,}'))
-        return issues
-    records = data.reshape(lon_lines, record_length)
+    if decoded.bad_sentinels:
+        issues.append(Issue('error', 'DATA', 'sentinel',
+                            f'{decoded.bad_sentinels} record(s) do not start with the 0xAA sentinel'))
+    if decoded.bad_block_counts:
+        issues.append(Issue('error', 'DATA', 'block_count',
+                            f'{decoded.bad_block_counts} record(s) have a block count out of sequence'))
+    if decoded.bad_lon_counts:
+        issues.append(Issue('error', 'DATA', 'lon_count',
+                            f'{decoded.bad_lon_counts} record(s) have a longitude count out of sequence'))
+    if decoded.bad_lat_counts:
+        issues.append(Issue('error', 'DATA', 'lat_count',
+                            f'{decoded.bad_lat_counts} record(s) do not start at latitude count 0'))
+    if decoded.bad_checksums:
+        issues.append(Issue('error', 'DATA', 'checksum',
+                            f'{decoded.bad_checksums} of {lon_lines} record checksums do not match'))
 
-    bad = int(np.count_nonzero(records[:, 0] != DATA_RECORD_SENTINEL))
-    if bad:
-        issues.append(Issue('error', 'DATA', 'sentinel', f'{bad} record(s) do not start with the 0xAA sentinel'))
-    index = np.arange(lon_lines)
-    block = (records[:, 1].astype(np.int64) << 16) | (records[:, 2].astype(np.int64) << 8) | records[:, 3]
-    bad = int(np.count_nonzero(block != index))
-    if bad:
-        issues.append(Issue('error', 'DATA', 'block_count', f'{bad} record(s) have a block count out of sequence'))
-    lon_count = (records[:, 4].astype(np.int64) << 8) | records[:, 5]
-    bad = int(np.count_nonzero(lon_count != index))
-    if bad:
-        issues.append(Issue('error', 'DATA', 'lon_count', f'{bad} record(s) have a longitude count out of sequence'))
-    lat_count = (records[:, 6].astype(np.int64) << 8) | records[:, 7]
-    bad = int(np.count_nonzero(lat_count != 0))
-    if bad:
-        issues.append(Issue('error', 'DATA', 'lat_count', f'{bad} record(s) do not start at latitude count 0'))
-
-    if verify_checksums:
-        body = records[:, :8 + 2 * lat_points].sum(axis=1, dtype=np.uint64)
-        stored = (
-            (records[:, -4].astype(np.uint64) << 24) | (records[:, -3].astype(np.uint64) << 16)
-            | (records[:, -2].astype(np.uint64) << 8) | records[:, -1].astype(np.uint64)
-        )
-        bad = int(np.count_nonzero(body != stored))
-        if bad:
-            issues.append(Issue('error', 'DATA', 'checksum', f'{bad} of {lon_lines} record checksums do not match'))
-
-    words = records[:, 8:8 + 2 * lat_points].reshape(lon_lines, lat_points, 2)
-    values = (words[:, :, 0].astype(np.int32) << 8) | words[:, :, 1].astype(np.int32)
-    nulls = values == 0xFFFF
+    values = decoded.values
+    nulls = values == NULL_ELEVATION
     null_count = int(nulls.sum())
-    total = lon_lines * lat_points
-    magnitude = values & 0x7FFF
-    signed = np.where(values & 0x8000, -magnitude, magnitude)
-    valid = signed[~nulls]
+    total = values.size
+    valid = values[~nulls]
     if valid.size:
         issues.append(Issue('info', 'DATA', 'elevations',
                             f'{int(valid.min())} to {int(valid.max())} m over {total - null_count:,} posts; '
                             f'{null_count:,} null ({100 * null_count / total:.2f}%)'))
+        outside = int(np.count_nonzero((valid < ELEVATION_MIN) | (valid > ELEVATION_MAX)))
+        if outside:
+            issues.append(Issue('warning', 'DATA', 'elevations',
+                                f'{outside:,} post(s) lie outside the {ELEVATION_MIN:,} to {ELEVATION_MAX:,} m '
+                                f'range of the specification'))
     else:
         issues.append(Issue('warning', 'DATA', 'elevations', 'every post is null'))
     partial = header['dsi.partial_cell']
