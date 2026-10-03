@@ -87,17 +87,19 @@ def convert(src, out, level, *, src_datum='EGM2008', tgt_datum='EGM2008', mask=F
     return out
 
 
+@pytest.fixture(scope='module')
+def outputs(tmp_path_factory):
+    """The feature tile converted to all three levels, with masks."""
+    folder = str(tmp_path_factory.mktemp('convert'))
+    src = write_tile(os.path.join(folder, 'tile.tif'), feature_tile())
+    files = {}
+    for level in (2, 1, 0):
+        files[level] = convert(src, os.path.join(folder, f'N85E030_{level}.dt{level}'), level, mask=True)
+    return folder, src, files
+
+
 class TestSameDatumConversion:
     """Resampling, water, low spots, rounding and the header, with no geoid grid."""
-
-    @pytest.fixture(scope='class')
-    def outputs(self, tmp_path_factory):
-        folder = str(tmp_path_factory.mktemp('convert'))
-        src = write_tile(os.path.join(folder, 'tile.tif'), feature_tile())
-        files = {}
-        for level in (2, 1, 0):
-            files[level] = convert(src, os.path.join(folder, f'N85E030_{level}.dt{level}'), level, mask=True)
-        return folder, src, files
 
     def test_header_and_records_validate(self, outputs):
         folder, src, files = outputs

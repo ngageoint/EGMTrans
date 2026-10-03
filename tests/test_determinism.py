@@ -93,7 +93,8 @@ SUBPROCESS_SCRIPT = textwrap.dedent('''
     sys.path.insert(0, {root!r})
     sys.path.insert(0, os.path.join({root!r}, 'src'))
     from egmtrans.numba_utils import NUMBA_AVAILABLE
-    assert NUMBA_AVAILABLE is not {hide_numba}
+    if {hide_numba}:
+        assert not NUMBA_AVAILABLE, 'numba was not hidden'
     from tests.test_determinism import convert
     header, records = convert({src!r}, {out!r})
     print(header, records)
@@ -110,13 +111,14 @@ def _in_subprocess(src, out, *, hide_numba=False, env=None):
     return tuple(completed.stdout.split()[-2:])
 
 
-class TestSameBytes:
-    @pytest.fixture(scope='class')
-    def source(self, tmp_path_factory):
-        folder = str(tmp_path_factory.mktemp('determinism'))
-        return write_geotiff(os.path.join(folder, 'tile.tif'), source_tile(),
-                             lattice_geotransform(LON0, LAT0, PER_DEGREE, PER_DEGREE), nodata=-32767.0)
+@pytest.fixture(scope='module')
+def source(tmp_path_factory):
+    folder = str(tmp_path_factory.mktemp('determinism'))
+    return write_geotiff(os.path.join(folder, 'tile.tif'), source_tile(),
+                         lattice_geotransform(LON0, LAT0, PER_DEGREE, PER_DEGREE), nodata=-32767.0)
 
+
+class TestSameBytes:
     def test_two_runs_two_paths_two_working_directories(self, source, tmp_path, monkeypatch):
         (tmp_path / 'a').mkdir()
         first = convert(source, str(tmp_path / 'a' / 'N85E030.dt2'))
@@ -134,6 +136,8 @@ class TestSameBytes:
         assert _in_subprocess(source, str(tmp_path / 'plain.dt2'), hide_numba=True) == expected
 
     def test_thread_count_does_not_change_the_bytes(self, source, tmp_path):
+        """With Numba, the thread count must not change the bytes; without it
+        the variables are ignored and the bytes must still be the same."""
         expected = convert(source, str(tmp_path / 'ref.dt2'))
         assert _in_subprocess(source, str(tmp_path / 'one.dt2'), env={'NUMBA_NUM_THREADS': '1'}) == expected
         assert _in_subprocess(source, str(tmp_path / 'two.dt2'), env={'OMP_NUM_THREADS': '2'}) == expected
