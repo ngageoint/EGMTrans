@@ -6,7 +6,7 @@
 # EGMTrans Tool and Explorer
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.8.1-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.9.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
