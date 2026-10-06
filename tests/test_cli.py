@@ -435,8 +435,13 @@ class TestDtedLevelFlags:
                             lattice_geotransform(30, 85, 60, 60), nodata=-32767.0)
         outdir = os.path.join(tmp_dir, "out")
         profile = os.path.join(os.path.dirname(os.path.dirname(__file__)), "samples", "dted_profile_example.toml")
-        assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "2",
-                    "--dted-naming", "cell", "--dted-profile", profile) == 0
+        argv = ["-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "2",
+                "--dted-naming", "cell", "--dted-profile", profile]
+        # The header plan is shown before anything is written; a "no" ends the run.
+        monkeypatch.setattr("builtins.input", lambda *_: "no")
+        assert _run(monkeypatch, *argv) == 1
+        assert stub_pipeline == []
+        assert _run(monkeypatch, *argv, "-y") == 0
         assert stub_pipeline[0][1] == os.path.join(outdir, "N85E030.dt2")
         assert stub_pipeline[0][0] == src
         with open(os.path.join(outdir, "tile_transform.log")) as handle:
@@ -465,3 +470,63 @@ class TestDtedLevelFlags:
         assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "2",
                     "-y") == 0
         assert stub_pipeline[0][1] == os.path.join(outdir, "n50w001.dt0")
+
+
+class TestDtedSet:
+    """--dted-set: parsed once, carried to every file; a bad one is a usage error."""
+
+    def test_overrides_reach_the_metadata(self, tmp_dir, monkeypatch):
+        import datetime as dt
+
+        seen = {}
+
+        def fake_process_file(*args, **kwargs):
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr(cli, "ensure_grids", lambda **kw: [])
+        monkeypatch.setattr(cli, "process_file", fake_process_file)
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        base = ["-i", src, "-o", os.path.join(tmp_dir, "out.dt2"), "-s", "EGM2008", "-t", "EGM96", "--yes"]
+        assert _run(monkeypatch, *base, "--dted-set", "producer_code=USNGA",
+                    "--dted-set", "compilation_date=2026-10") == 0
+        metadata = seen["dted_metadata"]
+        assert not metadata.empty
+        assert metadata.overrides == {"producer_code": "USNGA", "compilation_date": dt.date(2026, 10, 1)}
+        assert _run(monkeypatch, *base, "--dted-set", "dted_level=2") == 2
+        assert _run(monkeypatch, *base, "--dted-set", "security_code") == 2
+
+    def test_dted_to_dted_plan_asks_only_with_metadata(self, tmp_dir, monkeypatch, log_lines):
+        import numpy as np
+
+        from egmtrans.dted.writer import DtedMetadataSource, parse_overrides
+        from tests.conftest import write_dted
+
+        calls = []
+        monkeypatch.setattr(cli, "verify_grids", lambda *a: None)
+        monkeypatch.setattr(cli, "transform_vertical_datum", lambda *a, **k: calls.append(a))
+        src = write_dted(os.path.join(tmp_dir, "n06e126.dt0"), np.full((121, 121), 3, dtype=np.int16), 126, 6)
+        out = os.path.join(tmp_dir, "out.dt0")
+
+        def no_input(*_):
+            raise AssertionError("input() was called")
+
+        # Without an index, a profile or overrides there is nothing to confirm.
+        monkeypatch.setattr("builtins.input", no_input)
+        assert process_file(src, out, "EGM96", "EGM2008", False, False, 16, "bilinear",
+                            check_for_wrong_datum=False) is True
+        assert len(calls) == 1 and "DTED header plan" not in log_lines
+
+        source = DtedMetadataSource(None, None, parse_overrides(["producer_code=USNGA"]))
+        monkeypatch.setattr("builtins.input", lambda *_: "no")
+        assert process_file(src, out, "EGM96", "EGM2008", False, False, 16, "bilinear",
+                            check_for_wrong_datum=False, dted_metadata=source) is False
+        assert len(calls) == 1 and "DTED header plan" in log_lines
+        assert any("dsi.producer_code" in line and "(override)" in line for line in log_lines)
+        assert "  example: cell N06E126, n06e126.dt0 -> out.dt0" in log_lines
+        monkeypatch.setattr("builtins.input", lambda *_: "yes")
+        assert process_file(src, out, "EGM96", "EGM2008", False, False, 16, "bilinear",
+                            check_for_wrong_datum=False, dted_metadata=source) is True
+        assert len(calls) == 2

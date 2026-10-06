@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--dted-set FIELD=VALUE` (and the DTED Header Overrides table in ArcGIS Pro): write one value in every DTED header of a run, over the index row and the profile; a date accepts `today`.
+- The DTED header plan: before a run writes anything, the log shows the index, profile and overrides in use, the first cell as the example, and the source of every header field. The command line asks before going on (`-y` answers); ArcGIS Pro shows the plan first in its messages and, as soon as an index or a profile is chosen, a summary of which header fields come from where.
+- `egmtrans dted-index build --from-table FILE`: an index from any attribute table (a catalog, an export, a footprint layer). A table column named like an index column fills it, `--map` names the others, `--set` fills a column with one value, `--prefer` keeps one row per cell, and the import is reported.
+- A profile's XML mapping may list several XPaths, tried in order until one yields a value.
+
+### Changed
+
+- An index leaves out every column that is NULL in all its rows, so the profile supplies that field; a NULL among an accuracy column's values still means NA. An index built by 1.8.0 keeps its empty columns, and with it the profile's accuracies never applied; rebuild it with `dted-index build` to drop them.
+
+## [1.8.1] - 2026-10-05
+
 ### Changed
 
 - The example product profile, the README examples and the tests use the public SRTM and Copernicus samples.

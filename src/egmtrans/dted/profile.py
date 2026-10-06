@@ -19,6 +19,7 @@ tags and XML sidecars.
     gmd = "http://www.isotc211.org/2005/gmd"
     [harvest.xml.fields]
     compilation_date = "//gmd:dateStamp/gco:Date"
+    abs_vert_acc = ["//x:measured/x:le90", "//x:estimated/x:le90"]  # the first that has a value
 
     [harvest.tags.fields]
     source_version = { tag = "TIFFTAG_SOFTWARE", pattern = '([0-9]+(?:\\.[0-9A-Za-z]+)+)' }
@@ -68,16 +69,29 @@ class Profile:
 
 
 def _mapping(column: str, spec, kind: str) -> dict:
-    """Normalize a harvest mapping: a bare string, or a table with the source and an optional pattern."""
+    """Normalize a harvest mapping: a bare string, a list of XPaths tried in
+    order (XML only; the first that yields a value wins), or a table with the
+    source (a string, or for XML a list) and an optional pattern. One XPath
+    stays a string, several are a list."""
     source_key = 'xpath' if kind == 'xml' else 'tag'
+    if isinstance(spec, list) and kind == 'xml':
+        spec = {'xpath': spec}
     if isinstance(spec, str):
         return {source_key: spec, 'pattern': None}
     if isinstance(spec, dict) and source_key in spec:
         extra = set(spec) - {source_key, 'pattern'}
         if extra:
             raise ValueError(f'harvest.{kind}.fields.{column}: unknown keys {sorted(extra)}')
-        return {source_key: spec[source_key], 'pattern': spec.get('pattern')}
-    raise ValueError(f'harvest.{kind}.fields.{column} must be a string or a table with "{source_key}"')
+        source = spec[source_key]
+        if kind == 'xml' and isinstance(source, list):
+            if not source or not all(isinstance(item, str) and item.strip() for item in source):
+                raise ValueError(f'harvest.xml.fields.{column}: xpath must be a string or a list of strings')
+            source = list(source) if len(source) > 1 else source[0]
+        elif not isinstance(source, str) or not source.strip():
+            raise ValueError(f'harvest.{kind}.fields.{column}: {source_key} must be a string')
+        return {source_key: source, 'pattern': spec.get('pattern')}
+    choices = 'a string, a list of XPaths' if kind == 'xml' else 'a string'
+    raise ValueError(f'harvest.{kind}.fields.{column} must be {choices} or a table with "{source_key}"')
 
 
 def validate_product(product: dict) -> list[str]:

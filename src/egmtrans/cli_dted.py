@@ -3,8 +3,9 @@
     egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH]
                          [--zero-based] [--check-data] [--strict]
     egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH...
-                         | --from-footprints FILE [--cell-field NAME]) [--profile FILE]
-                         [--level N] [--product NAME] [--update]
+                         | --from-table FILE [--layer NAME] [--cell-field NAME]
+                           [--map INDEX_COLUMN=TABLE_COLUMN]... [--set INDEX_COLUMN=VALUE]...
+                           [--prefer TABLE_COLUMN]) [--profile FILE] [--level N] [--product NAME] [--update]
     egmtrans dted-index validate INDEX [--profile FILE] [--level N]
     egmtrans dted-selftest [--keep FOLDER] [--print-reference]
 
@@ -21,8 +22,8 @@ import os
 import sys
 
 from egmtrans import _state
-from egmtrans.dted.harvest import build_index
-from egmtrans.dted.index import read_index, validate_index
+from egmtrans.dted.harvest import build_index, parse_column_map, parse_constants
+from egmtrans.dted.index import HEADER_COLUMNS, DtedIndex, read_index, validate_index
 from egmtrans.dted.profile import load_profile
 from egmtrans.dted.report import FORMATS, build_report, render_report
 from egmtrans.dted.validate import count, validate_file
@@ -67,15 +68,27 @@ def build_parser() -> argparse.ArgumentParser:
     build = index_commands.add_parser(
         'build', help='Harvest rows into a GeoPackage or GeoParquet index.',
         description='Build (or update) an index from the headers of DTED files, from source rasters and their '
-                    'tags and XML sidecars (through the profile\'s harvest mappings), or from a footprint layer.',
+                    'tags and XML sidecars (through the profile\'s harvest mappings), or from any attribute table '
+                    '(a footprint layer, a catalog): a table column named like an index column fills it, --map '
+                    'names the others, --set fills a column with one value, and the import is reported.',
     )
     build.add_argument('--out', required=True, metavar='INDEX', help='Index to write (.gpkg or .parquet)')
     build.add_argument('--from-dted', nargs='+', metavar='PATH', default=[],
                        help='DTED files or folders whose headers become rows')
     build.add_argument('--from-rasters', nargs='+', metavar='PATH', default=[],
                        help='Source rasters (GeoTIFF) or folders; one row per cell they cover')
-    build.add_argument('--from-footprints', metavar='FILE', help='A footprint layer (any OGR format)')
-    build.add_argument('--cell-field', metavar='NAME', help='Footprint field that holds the cell id')
+    build.add_argument('--from-table', metavar='FILE',
+                       help='An attribute table (.gpkg, .parquet or any OGR format); one row per record')
+    build.add_argument('--from-footprints', metavar='FILE', help='The same as --from-table')
+    build.add_argument('--layer', metavar='NAME', help='The layer of the table to read (default: the first)')
+    build.add_argument('--cell-field', metavar='NAME',
+                       help='Table column that holds the cell id (default: a cell_id column, else the geometry)')
+    build.add_argument('--map', action='append', default=[], metavar='INDEX_COLUMN=TABLE_COLUMN',
+                       help='Fill an index column from a table column of another name (may be repeated)')
+    build.add_argument('--set', action='append', default=[], metavar='INDEX_COLUMN=VALUE',
+                       help='Fill an index column with one value for every row of the table (may be repeated)')
+    build.add_argument('--prefer', metavar='TABLE_COLUMN',
+                       help='When several rows share a cell, keep the one with the greatest value here')
     build.add_argument('--profile', metavar='FILE', help='Product profile (TOML) with the harvest mappings')
     build.add_argument('--level', type=int, choices=(0, 1, 2), help='DTED level the index is for')
     build.add_argument('--product', metavar='NAME', help='Product name recorded in the index meta table')
@@ -140,9 +153,30 @@ def run_header(args: argparse.Namespace, logger: logging.Logger) -> int:
     return exit_code
 
 
+def supply_lines(index: DtedIndex, profile) -> list[str]:
+    """Which required header columns the index lacks, split by whether the profile supplies them."""
+    absent = [column.name for column in HEADER_COLUMNS if column.required and column.name not in index.columns]
+    if not absent:
+        return ['Every required header column is in the index.']
+    product = profile.product if profile is not None else {}
+    from_profile = [name for name in absent if name in product]
+    from_nothing = [name for name in absent if name not in product]
+    lines = []
+    if from_profile:
+        lines.append('Required header columns the profile supplies: ' + ', '.join(from_profile))
+    if from_nothing:
+        lines.append('Required header columns nothing supplies yet (a profile, or --dted-set at run time, must): '
+                     + ', '.join(from_nothing))
+    return lines
+
+
 def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
-    if not (args.from_dted or args.from_rasters or args.from_footprints):
-        logger.error('Give at least one source: --from-dted, --from-rasters or --from-footprints')
+    table = args.from_table or args.from_footprints
+    if not (args.from_dted or args.from_rasters or table):
+        logger.error('Give at least one source: --from-dted, --from-rasters or --from-table')
+        return 2
+    if (args.map or args.set or args.prefer or args.layer) and not table:
+        logger.error('--map, --set, --prefer and --layer go with --from-table')
         return 2
     profile = None
     if args.profile:
@@ -152,9 +186,16 @@ def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
             logger.error(str(e))
             return 2
     try:
+        column_map = parse_column_map(args.map)
+        constants = parse_constants(args.set)
+    except ValueError as e:
+        logger.error(str(e))
+        return 2
+    try:
         index = build_index(
-            args.out, from_dted=args.from_dted, from_rasters=args.from_rasters, from_footprints=args.from_footprints,
-            cell_field=args.cell_field, profile=profile, level=args.level, update=args.update, product=args.product,
+            args.out, from_dted=args.from_dted, from_rasters=args.from_rasters, from_table=table,
+            cell_field=args.cell_field, layer=args.layer, column_map=column_map, constants=constants,
+            prefer=args.prefer, profile=profile, level=args.level, update=args.update, product=args.product,
         )
     except (OSError, ValueError, RuntimeError) as e:
         logger.error(f'Index not written: {e}')
@@ -165,6 +206,8 @@ def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
     for issue in issues:
         logger.log(logging.ERROR if issue.severity == 'error' else logging.WARNING if issue.severity == 'warning'
                    else logging.INFO, str(issue))
+    for line in supply_lines(index, profile):
+        logger.info(line)
     return 1 if count(issues, 'error') else 0
 
 

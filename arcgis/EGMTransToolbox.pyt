@@ -28,6 +28,54 @@ sys.path.append(parent_dir)
 import EGMTrans
 reload(EGMTrans)  # refresh changes if the Python script was altered
 
+# The DTED metadata of the parameters as they stand, kept between validation
+# calls so the index and the profile are not reloaded on every edit of the
+# dialog. One entry: the key is the files' paths and times, the level, the
+# fallback accuracy and the override rows.
+_METADATA_CACHE = {}
+
+
+def _override_pairs(parameter):
+    """The (field, value) pairs of the DTED Header Overrides table, blank rows left out."""
+    pairs = []
+    for row in parameter.values or []:
+        cells = list(row) if isinstance(row, (list, tuple)) else [row]
+        field_name = str(cells[0] if cells and cells[0] is not None else "").strip()
+        value = cells[1] if len(cells) > 1 and cells[1] is not None else ""
+        if field_name:
+            pairs.append((field_name, str(value)))
+    return pairs
+
+
+def _file_key(path):
+    if not path:
+        return None
+    try:
+        return (path, os.path.getmtime(path))
+    except OSError:
+        return (path, None)
+
+
+def _dted_metadata_for(parameters):
+    """The run's DTED metadata (index, profile and overrides), its coverage of
+    the header fields and its validation issues, for the parameters as they
+    stand. Raises ValueError or OSError when a file or an override is wrong."""
+    index = parameters[13].valueAsText or None
+    profile = parameters[14].valueAsText or None
+    level = int(parameters[15].valueAsText) if parameters[15].valueAsText else None
+    abs_horiz = parameters[6].value
+    pairs = tuple(_override_pairs(parameters[17]))
+    key = (_file_key(index), _file_key(profile), level, abs_horiz, pairs)
+    if _METADATA_CACHE.get("key") == key:
+        return _METADATA_CACHE["value"]
+    overrides = EGMTrans.parse_overrides(pairs)
+    source = EGMTrans.DtedMetadataSource.load(index, profile, overrides)
+    issues = source.validate(level) if not source.empty else []
+    coverage = source.coverage(level, abs_horiz) if not source.empty else None
+    _METADATA_CACHE["key"] = key
+    _METADATA_CACHE["value"] = (source, coverage, issues)
+    return _METADATA_CACHE["value"]
+
 
 def _warn_if_stale():
     """ArcGIS Pro reloads the shim, not the package: a session that loaded an
@@ -220,6 +268,27 @@ class Tool:
         dted_naming.value = "stem"
         params.append(dted_naming)
 
+        dted_overrides = arcpy.Parameter(
+            displayName="DTED Header Overrides (a header field and the value to write in every cell)",
+            name="dted_overrides",
+            datatype="GPValueTable",
+            parameterType="Optional",
+            direction="Input")
+        dted_overrides.columns = [["GPString", "Header field"], ["GPString", "Value"]]
+        dted_overrides.filters[0].type = "ValueList"
+        dted_overrides.filters[0].list = list(EGMTrans.HEADER_FIELD_NAMES)
+        params.append(dted_overrides)
+
+        # Display only: validation writes the summary of the header fields here.
+        dted_summary = arcpy.Parameter(
+            displayName="DTED Header Fields (from the index, the profile and the overrides; read only)",
+            name="dted_summary",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        dted_summary.enabled = False
+        params.append(dted_summary)
+
         output_layer = arcpy.Parameter(
             displayName="Output Raster Layer",
             name="output_layer",
@@ -235,10 +304,56 @@ class Tool:
         return True
 
     def updateParameters(self, parameters):
-        """Modify the values and properties of parameters before internal
-        validation is performed.  This method is called whenever a parameter
-        has been changed."""
+        """Fill the read-only summary of the DTED header fields from the index,
+        the profile and the overrides as they are chosen."""
+        try:
+            if not (parameters[13].valueAsText or parameters[14].valueAsText or _override_pairs(parameters[17])):
+                if parameters[18].value:
+                    parameters[18].value = ""
+                return
+            source, coverage, _issues = _dted_metadata_for(parameters)
+            summary = coverage.summary() if coverage is not None else source.describe()
+        except Exception as e:  # validation must never take the dialog down
+            summary = f"not readable: {e}"
+        if parameters[18].valueAsText != summary:
+            parameters[18].value = summary
         return
+
+    def _check_dted_metadata(self, parameters, converting):
+        """Errors and warnings on the DTED index, profile and override parameters.
+
+        *converting* says whether a header is made from scratch, when every
+        required field needs a source; a DTED-to-DTED run takes them from the
+        input's header."""
+        index_given = bool(parameters[13].valueAsText)
+        profile_given = bool(parameters[14].valueAsText)
+        pairs = _override_pairs(parameters[17])
+        if not (index_given or profile_given or pairs):
+            return
+        try:
+            EGMTrans.parse_overrides(pairs)
+        except ValueError as e:
+            parameters[17].setErrorMessage(str(e))
+            return
+        try:
+            _source, coverage, issues = _dted_metadata_for(parameters)
+        except Exception as e:
+            parameters[13 if index_given else 14].setErrorMessage(str(e))
+            return
+        for issue in issues:
+            if issue.severity == "error":
+                parameters[13 if issue.record == "INDEX" else 14].setErrorMessage(str(issue))
+        if coverage is None:
+            return
+        if coverage.missing_required and converting:
+            parameters[14 if (profile_given or not index_given) else 13].setErrorMessage(
+                "Nothing supplies the required header field(s) " + ", ".join(coverage.missing_required)
+                + ": add them to the profile, the index or the overrides."
+            )
+        if coverage.null_accuracy_cells and index_given:
+            parameters[13].setWarningMessage(
+                f"{coverage.null_accuracy_cells} cell(s) of the index have a NULL accuracy; the header will say NA."
+            )
 
     def updateMessages(self, parameters):
         """Modify the messages created by internal validation for each tool
@@ -273,6 +388,10 @@ class Tool:
         containment = parameters[12].value
         if containment is not None and not 0.0 <= containment <= 1.0:
             parameters[12].setErrorMessage("Minimum Containment must be between 0 and 1.")
+        try:
+            self._check_dted_metadata(parameters, writes_dted and not input_value.lower().endswith(dted_extensions))
+        except Exception as e:  # a failure here would disable Run with no explanation
+            parameters[14].setErrorMessage(f"The DTED metadata could not be checked: {e}")
         return
 
     def execute(self, parameters, messages):
@@ -301,6 +420,11 @@ class Tool:
         dted_profile = parameters[14].valueAsText
         dted_level = int(parameters[15].valueAsText) if parameters[15].valueAsText else None
         dted_naming = parameters[16].valueAsText or "stem"
+        try:
+            overrides = EGMTrans.parse_overrides(_override_pairs(parameters[17]))
+        except ValueError as e:
+            arcpy.AddError(f"DTED Header Overrides: {e}")
+            return
 
         # Resolve input/output and derive the log path with the same helper the
         # CLI uses, so the two entry points cannot disagree about file vs. folder.
@@ -315,7 +439,7 @@ class Tool:
 
         # The DTED metadata index and profile, checked before anything is written.
         try:
-            dted_metadata = EGMTrans.DtedMetadataSource.load(dted_index, dted_profile)
+            dted_metadata = EGMTrans.DtedMetadataSource.load(dted_index, dted_profile, overrides)
         except (OSError, ValueError, RuntimeError) as e:
             arcpy.AddError(str(e))
             return
@@ -356,6 +480,9 @@ class Tool:
         arcpy.AddMessage(f"DTED Product Profile: {dted_profile}")
         arcpy.AddMessage(f"DTED Level: {dted_level}")
         arcpy.AddMessage(f"DTED Output Naming: {dted_naming}")
+        arcpy.AddMessage("DTED Header Overrides: " + (", ".join(f"{k}={v}" for k, v in overrides.items()) or "none"))
+        if not dted_metadata.empty:
+            arcpy.AddMessage(f"DTED header fields: {dted_metadata.coverage(dted_level, abs_horiz_accuracy).summary()}")
         arcpy.AddMessage(f'{"="*80}\n')
 
         # Download geoid grid files on first run if they are missing.

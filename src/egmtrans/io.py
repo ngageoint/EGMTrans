@@ -22,7 +22,14 @@ from egmtrans.dted.header import CellGeometry, DtedHeader, read_header, write_he
 from egmtrans.dted.records import check_values, partial_cell_indicator, write_dted_file
 from egmtrans.dted.schema import NULL_ELEVATION
 from egmtrans.dted.validate import validate_file, validate_header
-from egmtrans.dted.writer import DerivedFields, DtedMetadata, assemble_header, cell_of_header, describe_changes
+from egmtrans.dted.writer import (
+    DerivedFields,
+    DtedMetadata,
+    DtedMetadataSource,
+    assemble_header,
+    cell_of_header,
+    describe_changes,
+)
 
 
 def apply_scale_factor(
@@ -185,14 +192,7 @@ def update_dted_header(
             cannot be completed (:class:`~egmtrans.dted.writer.HeaderAssemblyError`).
     """
     logger = _state.get_logger()
-    dted_code = _dted_code(tgt_datum)
-
-    base = read_header(output_file)
-    cell = cell_of_header(base, os.path.splitext(output_file)[1])
-    header, sources = assemble_header(
-        cell, base=base, metadata=metadata, derived=DerivedFields(vertical_datum=dted_code),
-        cli_abs_horiz_accuracy=abs_horiz_accuracy,
-    )
+    base, cell, header, sources = _assemble_from_file(output_file, tgt_datum, abs_horiz_accuracy, metadata)
     try:
         write_header(output_file, header)
     except OSError as e:
@@ -207,6 +207,45 @@ def update_dted_header(
     for issue in validate_header(header, extension=os.path.splitext(output_file)[1]):
         if issue.severity in ('error', 'warning'):
             logger.warning(f'DTED header: {issue}')
+
+
+def _assemble_from_file(path: str, tgt_datum: str, abs_horiz_accuracy: int | None, metadata: DtedMetadata | None):
+    """The header a DTED-to-DTED transform writes for the file at *path*, with
+    the file's own header as the base: (base, cell, header, sources)."""
+    dted_code = _dted_code(tgt_datum)
+    base = read_header(path)
+    cell = cell_of_header(base, os.path.splitext(path)[1])
+    header, sources = assemble_header(
+        cell, base=base, metadata=metadata, derived=DerivedFields(vertical_datum=dted_code),
+        cli_abs_horiz_accuracy=abs_horiz_accuracy,
+    )
+    return base, cell, header, sources
+
+
+def preview_dted_header(
+    input_file: str,
+    tgt_datum: str,
+    abs_horiz_accuracy: int | None = None,
+    *,
+    source: DtedMetadataSource | None = None,
+) -> tuple[DtedHeader, CellGeometry, DtedHeader, dict[str, str]]:
+    """The dry run of :func:`update_dted_header`: the header a DTED-to-DTED
+    transform of *input_file* would write, as (base, cell, header, sources),
+    with the cell's metadata resolved from *source* (the run's index, profile
+    and overrides) when one is given.
+
+    Raises:
+        OSError: If the file cannot be read.
+        ValueError: If the header has no readable origin, the target datum has
+            no DTED code, or the header cannot be completed.
+        LookupError: If the index has no row for the cell.
+    """
+    header = read_header(input_file)
+    cell_id = header.cell_id
+    if cell_id is None:
+        raise ValueError('The DTED header has no readable origin, so its index row cannot be found')
+    metadata = source.for_cell(cell_id) if source is not None else None
+    return _assemble_from_file(input_file, tgt_datum, abs_horiz_accuracy, metadata)
 
 
 def _dted_code(tgt_datum: str) -> str:

@@ -4,12 +4,14 @@
    origin, intervals, counts, corners, series, vertical and horizontal datum,
    partial cell indicator, the multiple-accuracy flags, the UHL copies of the
    DSI security code and the ACC vertical accuracy): never overridable;
-2. the cell's row in the metadata index (a NULL accuracy means NA);
-3. the product profile's constants;
-4. the base header (the input DTED file's, for a DTED-to-DTED transform);
-5. the command line's absolute horizontal accuracy, which fills the field
+2. the run's overrides (``--dted-set FIELD=VALUE``, or the toolbox's table);
+3. the cell's row in the metadata index (a NULL accuracy means NA; a column
+   the index does not have falls through);
+4. the product profile's constants;
+5. the base header (the input DTED file's, for a DTED-to-DTED transform);
+6. the command line's absolute horizontal accuracy, which fills the field
    only when the base header, or the spec fill, left it NA;
-6. the spec fill (NA, 0000, blanks).
+7. the spec fill (NA, 0000, blanks).
 
 With a base header the input is the authority, gaps included. Built from
 scratch, every required field must come from the index, the profile or the
@@ -21,6 +23,7 @@ the output keeps the derived code.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 from dataclasses import dataclass, field
 
@@ -41,6 +44,8 @@ from egmtrans.dted.index import (
     HEADER_COLUMNS,
     INDEX_COLUMNS,
     DtedIndex,
+    check_value,
+    parse_date,
     read_index,
     validate_index,
 )
@@ -53,6 +58,73 @@ class HeaderAssemblyError(ValueError):
     """The header cannot be completed from the sources at hand."""
 
 
+OVERRIDE_SOURCE = 'override'
+HEADER_FIELD_NAMES: tuple[str, ...] = tuple(column.name for column in HEADER_COLUMNS)
+
+
+def parse_override(name: str, text: str, *, today: dt.date | None = None):
+    """The typed value of one header override, from the field's name and its text.
+
+    *name* must be a header column that the writer fills (``dted_level``, the
+    catalog columns and the datum checks are refused). The text is read with
+    the column's type: an integer (an accuracy also takes ``NA``), a date as
+    ``YYYY-MM``, ``YYYY-MM-DD`` or ``today`` (*today* when given, so a whole
+    run shares one date), or text as it is (an empty text blanks the field).
+
+    Raises:
+        ValueError: If the field cannot be overridden or the text does not fit it.
+    """
+    column = COLUMNS_BY_NAME.get(name)
+    if column is None:
+        raise ValueError(f'{name!r} is not an index column')
+    if name == 'dted_level':
+        raise ValueError('dted_level is not a header field; use --dted-level (or the DTED Level parameter)')
+    if column.dted_key is None:
+        raise ValueError(f'{name} is a catalog column, not a header field')
+    if column.check_only:
+        raise ValueError(f'{name} is derived from the output and cannot be set')
+    if column.type == 'date':
+        clean = text.strip()
+        value = (today or dt.date.today()) if clean.lower() == 'today' else parse_date(clean)
+    elif column.type == 'int':
+        clean = text.strip()
+        if name in ACCURACY_COLUMNS and clean.upper() == 'NA':
+            value = None
+        else:
+            try:
+                value = int(clean)
+            except ValueError:
+                raise ValueError(f'{name}: {text!r} is not an integer') from None
+    else:
+        value = text
+    problem = check_value(column, value)
+    if problem:
+        raise ValueError(f'{name}: {problem}')
+    return value
+
+
+def parse_overrides(pairs, *, today: dt.date | None = None) -> dict[str, object]:
+    """Header overrides from ``FIELD=VALUE`` strings or ``(field, value)`` pairs, keyed by field.
+
+    Raises:
+        ValueError: On a malformed pair, a repeated field, or a value
+            :func:`parse_override` refuses.
+    """
+    overrides: dict[str, object] = {}
+    for pair in pairs or ():
+        if isinstance(pair, str):
+            if '=' not in pair:
+                raise ValueError(f'{pair!r} is not FIELD=VALUE')
+            name, text = pair.split('=', 1)
+        else:
+            name, text = pair
+        name = str(name).strip()
+        if name in overrides:
+            raise ValueError(f'{name} is given twice')
+        overrides[name] = parse_override(name, str(text), today=today)
+    return overrides
+
+
 @dataclass
 class DtedMetadata:
     """What the assembler gets for one cell."""
@@ -60,29 +132,61 @@ class DtedMetadata:
     row: dict | None = None
     subregions: list[dict] = field(default_factory=list)
     profile: Profile | None = None
+    overrides: dict[str, object] = field(default_factory=dict)
 
     @property
     def has_index_row(self) -> bool:
         return self.row is not None
 
 
-class DtedMetadataSource:
-    """The index and the profile named for a run, resolved per cell."""
+@dataclass
+class MetadataCoverage:
+    """Which header fields the run's sources supply, for the plan and the toolbox."""
 
-    def __init__(self, index: DtedIndex | None = None, profile: Profile | None = None):
+    cells: int
+    level: int | None
+    from_index: list[str]
+    partly_from_index: dict[str, int]
+    from_profile: list[str]
+    overrides: list[str]
+    missing_required: dict[str, int]
+    null_accuracy_cells: int
+
+    def summary(self) -> str:
+        parts = [f'{self.cells:,} cell(s)' if self.cells else 'no index',
+                 f'level {self.level}' if self.level is not None else 'any level']
+        index_part = list(self.from_index) + [f'{name} (NULL in {n:,})' for name, n in self.partly_from_index.items()]
+        if index_part:
+            parts.append('from the index: ' + ', '.join(index_part))
+        if self.from_profile:
+            parts.append('from the profile: ' + ', '.join(self.from_profile))
+        if self.overrides:
+            parts.append('overridden: ' + ', '.join(self.overrides))
+        parts.append('missing: ' + (', '.join(self.missing_required) if self.missing_required else 'none'))
+        return '; '.join(parts)
+
+
+class DtedMetadataSource:
+    """The index, the profile and the overrides named for a run, resolved per cell."""
+
+    def __init__(self, index: DtedIndex | None = None, profile: Profile | None = None,
+                 overrides: dict[str, object] | None = None):
         self.index = index
         self.profile = profile
+        self.overrides: dict[str, object] = dict(overrides or {})
 
     @classmethod
-    def load(cls, index_path: str | None, profile_path: str | None) -> DtedMetadataSource:
-        """Load the index and the profile; either may be absent."""
+    def load(cls, index_path: str | None, profile_path: str | None,
+             overrides: dict[str, object] | None = None) -> DtedMetadataSource:
+        """Load the index and the profile; either may be absent. *overrides* are
+        already parsed (:func:`parse_overrides`)."""
         index = read_index(index_path) if index_path else None
         profile = load_profile(profile_path) if profile_path else None
-        return cls(index, profile)
+        return cls(index, profile, overrides)
 
     @property
     def empty(self) -> bool:
-        return self.index is None and self.profile is None
+        return self.index is None and self.profile is None and not self.overrides
 
     @property
     def level(self) -> int | None:
@@ -109,11 +213,11 @@ class DtedMetadataSource:
             LookupError: If an index is loaded but has no row for the cell.
         """
         if self.index is None:
-            return DtedMetadata(None, [], self.profile)
+            return DtedMetadata(None, [], self.profile, self.overrides)
         row = self.index.get(cell_id)
         if row is None:
             raise LookupError(f'The index {os.path.basename(self.index.path)} has no row for cell {cell_id}')
-        return DtedMetadata(row, self.index.subregions_of(cell_id), self.profile)
+        return DtedMetadata(row, self.index.subregions_of(cell_id), self.profile, self.overrides)
 
     def describe(self) -> str:
         parts = []
@@ -121,7 +225,49 @@ class DtedMetadataSource:
             parts.append(f'index {os.path.basename(self.index.path)} ({len(self.index)} cells)')
         if self.profile is not None:
             parts.append(f'profile {os.path.basename(self.profile.path)}')
-        return ' and '.join(parts) if parts else 'no index or profile'
+        if self.overrides:
+            parts.append(f'{len(self.overrides)} override(s): ' + ', '.join(
+                f'{name}={_override_text(name, value)}' for name, value in self.overrides.items()))
+        return ', '.join(parts) if parts else 'no index or profile'
+
+    def coverage(self, level: int | None = None, cli_abs_horiz_accuracy: int | None = None) -> MetadataCoverage:
+        """Which header fields the index, the profile and the overrides supply
+        for a header built from scratch, and which required ones nothing does."""
+        rows = list(self.index.rows.values()) if self.index is not None else []
+        present = self.index.columns if self.index is not None else set()
+        product = self.profile.product if self.profile is not None else {}
+        from_index, partly, from_profile, overridden, missing = [], {}, [], [], {}
+        for column in HEADER_COLUMNS:
+            name = column.name
+            if name in self.overrides:
+                overridden.append(name)
+                continue
+            nulls = sum(1 for row in rows if row.get(name) is None) if name in present else None
+            if nulls == 0:
+                from_index.append(name)
+                continue
+            if nulls is not None:
+                partly[name] = nulls
+                if name in ACCURACY_COLUMNS:
+                    continue  # a NULL accuracy is an explicit NA
+            if name in product:
+                from_profile.append(name)
+            elif column.required and not (name == 'abs_horiz_acc' and cli_abs_horiz_accuracy is not None):
+                missing[name] = nulls if nulls is not None else (len(rows) or 1)
+        null_cells = sum(
+            1 for row in rows if any(name in row and row[name] is None for name in ACCURACY_COLUMNS)
+        )
+        if level is None:
+            level = self.index.level if self.index is not None and self.index.level is not None else self.level
+        return MetadataCoverage(len(rows), level, from_index, partly, from_profile, overridden, missing, null_cells)
+
+
+def _override_text(name: str, value) -> str:
+    if value is None:
+        return 'NA'
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    return repr(value) if isinstance(value, str) and (value == '' or value != value.strip()) else str(value)
 
 
 @dataclass
@@ -275,6 +421,9 @@ def assemble_header(
         for key in ('acc.subregions', 'acc.outline_flag', 'uhl.multiple_accuracy'):
             sources[key] = 'index' if subregions else 'derived'
 
+    for name, value in metadata.overrides.items():
+        _apply(header, sources, name, value, OVERRIDE_SOURCE)
+
     for key, raw in cell.header_values().items():
         header.set_raw(key, raw)
         sources[key] = 'derived'
@@ -330,6 +479,29 @@ def assemble_header(
             if issue.severity == 'warning':
                 logger.warning(f'DTED header of cell {cell.cell_id}: {issue}')
     return header, sources
+
+
+def header_plan_lines(
+    describe: str,
+    cell_id: str,
+    input_file: str,
+    output_file: str,
+    header: DtedHeader,
+    sources: dict[str, str],
+    *,
+    base: DtedHeader | None = None,
+    more: int = 0,
+) -> list[str]:
+    """The log block shown before a run writes DTED headers: what the run's
+    sources are, which file stands as the example, and, for a header built
+    from scratch, every supplied field with its source (for a DTED-to-DTED
+    rewrite, every field that changes)."""
+    example = f'  example: cell {cell_id}, {os.path.basename(input_file)} -> {os.path.basename(output_file)}'
+    if more:
+        example += f' (and {more} more)'
+    lines = ['DTED header plan', f'  metadata: {describe}', example]
+    lines.extend(describe_changes(base, header, sources))
+    return lines
 
 
 def describe_changes(before: DtedHeader | None, after: DtedHeader, sources: dict[str, str]) -> list[str]:

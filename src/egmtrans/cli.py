@@ -37,7 +37,7 @@ from egmtrans.crs import standardize_srs
 from egmtrans.download import ensure_grids
 from egmtrans.dted.header import CellGeometry, read_header
 from egmtrans.dted.validate import count as count_issues
-from egmtrans.dted.writer import DtedMetadataSource
+from egmtrans.dted.writer import DtedMetadataSource, header_plan_lines, parse_overrides
 from egmtrans.file_utils import (
     DTED_NAMING_PRESETS,
     IOPaths,
@@ -139,7 +139,8 @@ def confirm(question: str, assume_yes: bool = False) -> bool:
         raise NonInteractiveError(question)
     try:
         answer = input(f"{question} (yes/no): ").strip()
-    except EOFError as e:
+    except (EOFError, OSError) as e:
+        # EOFError: stdin at end. OSError: a captured or invalid stdin.
         raise NonInteractiveError(question) from e
     return str2bool(answer)
 
@@ -345,6 +346,7 @@ def process_file(
     dted_metadata: DtedMetadataSource | None = None,
     *,
     dted_cell: CellGeometry | None = None,
+    dted_plan: bool = True,
 ) -> bool:
     """Process a single file for vertical datum transformation, or convert a
     GeoTIFF cell to DTED.
@@ -386,6 +388,9 @@ def process_file(
             header of a DTED output (``--dted-index``, ``--dted-profile``).
         dted_cell: The cell of a GeoTIFF written as DTED, when a batch run
             names it; found from the raster otherwise.
+        dted_plan: Log the DTED header plan (the example header and the
+            source of every supplied field) and, in CLI mode, ask before
+            going on. A batch run shows the plan once itself and passes False.
 
     Returns:
         ``True`` if the file was transformed, ``False`` if the transformation
@@ -454,20 +459,44 @@ def process_file(
         )
         return False
 
+    source = dted_metadata if dted_metadata is not None and not dted_metadata.empty else None
+    plan = None
     if cell is not None and tile_levels is None:
         # The batch run checked its cells before writing anything; a single
         # conversion checks its own header now, before the datum prompts.
         from egmtrans.io import new_dted_header
 
-        source = dted_metadata if dted_metadata is not None and not dted_metadata.empty else None
         try:
             metadata = source.for_cell(cell.cell_id) if source is not None else None
-            new_dted_header(cell, target_datum, abs_horiz_accuracy, metadata=metadata)
+            header, sources = new_dted_header(cell, target_datum, abs_horiz_accuracy, metadata=metadata)
         except (ValueError, LookupError) as e:
             logger.error(
                 f'The DTED header of cell {cell.cell_id} cannot be completed: {e}\n'
                 f'A DTED cell made from GeoTIFF needs --dted-profile and/or --dted-index.\nAborting transformation.'
             )
+            return False
+        plan = (cell.cell_id, None, header, sources)
+    elif input_is_dted and output_is_dted and source is not None and tile_levels is None and dted_plan:
+        # A DTED-to-DTED rewrite with an index, a profile or overrides: show
+        # what they change before the file is touched.
+        from egmtrans.io import preview_dted_header
+
+        try:
+            base, cell_geometry, header, sources = preview_dted_header(
+                input_file, target_datum, abs_horiz_accuracy, source=source,
+            )
+        except (OSError, ValueError, LookupError) as e:
+            logger.error(f'The DTED header of {os.path.basename(input_file)} cannot be completed: {e}\n'
+                         f'Aborting transformation.')
+            return False
+        plan = (cell_geometry.cell_id, base, header, sources)
+    if plan is not None and dted_plan:
+        cell_id, base, header, sources = plan
+        describe = source.describe() if source is not None else 'no index or profile'
+        for line in header_plan_lines(describe, cell_id, input_file, output_file, header, sources, base=base):
+            logger.info(line)
+        if not arc_mode and not confirm('Write the DTED header as planned?', assume_yes):
+            logger.error('Aborting transformation.')
             return False
 
     if not check_file_datum(input_file, output_file, source_datum, arc_mode, assume_yes, prompt=check_for_wrong_datum):
@@ -559,8 +588,9 @@ def main() -> None:
     )
     parser.add_argument(
         "-y", "--yes", action="store_true",
-        help="Proceed without asking when the file's vertical datum disagrees with -s, or when "
-             "-s equals -t for a GeoTIFF. Needed for unattended runs such as a container.",
+        help="Proceed without asking when the file's vertical datum disagrees with -s, when "
+             "-s equals -t for a GeoTIFF, or after the DTED header plan. Needed for unattended runs "
+             "such as a container.",
     )
     parser.add_argument(
         "--context", action="append", default=[], metavar="FOLDER",
@@ -599,6 +629,12 @@ def main() -> None:
              + ", or a template with {stem}, {dir}, {cell}, {lat}, {lon} and {level}; the extension is added "
              "(default: stem).",
     )
+    parser.add_argument(
+        "--dted-set", action="append", default=[], metavar="FIELD=VALUE",
+        help="Write this value in every DTED header, over the index row and the profile (may be repeated). "
+             "FIELD is a header column of the index (producer_code, compilation_date, abs_horiz_acc, ...); "
+             "an accuracy takes NA, a date takes YYYY-MM, YYYY-MM-DD or today.",
+    )
 
     args = parser.parse_args()
 
@@ -618,7 +654,11 @@ def main() -> None:
         if path and not os.path.isfile(path):
             parser.error(f"{option} file does not exist: {path}")
     try:
-        dted_metadata = DtedMetadataSource.load(args.dted_index, args.dted_profile)
+        overrides = parse_overrides(args.dted_set)
+    except ValueError as e:
+        parser.error(f"--dted-set: {e}")
+    try:
+        dted_metadata = DtedMetadataSource.load(args.dted_index, args.dted_profile, overrides)
     except (OSError, ValueError, RuntimeError) as e:
         parser.error(str(e))
 
@@ -641,6 +681,9 @@ def main() -> None:
             end_logger(save_log=args.log_file)
             sys.exit(2)
         logger.info(f"DTED header metadata: {dted_metadata.describe()}")
+        if dted_metadata.index is not None or dted_metadata.profile is not None:
+            coverage = dted_metadata.coverage(args.dted_level, args.abs_horiz_accuracy)
+            logger.info(f"DTED header fields: {coverage.summary()}")
 
     args_list = list(vars(args).items())
     for i, (arg, value) in enumerate(args_list):

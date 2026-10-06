@@ -633,3 +633,26 @@ def test_an_empty_run_never_offers_to_delete_the_input_folder(tmp_dir):
     assert not _may_offer_delete(folder, os.path.join(folder, 'sub'))
     assert not _may_offer_delete(os.path.join(folder, 'sub'), folder)
     assert _may_offer_delete(folder, os.path.join(tmp_dir, 'out'))
+
+
+@requires_grids
+class TestHeaderPlan:
+    def test_the_plan_is_shown_once_and_a_no_ends_the_run(self, tmp_dir, monkeypatch, log_lines):
+        src = os.path.join(tmp_dir, 'in')
+        lattice_tiles(src)
+        profile = _profile(tmp_dir)
+        out = os.path.join(tmp_dir, 'out')
+        monkeypatch.setattr('builtins.input', lambda *_: 'no')
+        result = _convert(src, out, profile, assume_yes=False)
+        assert result.exit_code == 1 and result.files_processed == 0
+        written = [name for _, _, files in os.walk(out) for name in files] if os.path.isdir(out) else []
+        assert not any(name.endswith('.dt2') for name in written)
+        assert log_lines.count('DTED header plan') == 1
+        assert '  example: cell N85E030, tile_85_30.tif -> tile_85_30.dt2' in log_lines
+        assert "    dsi.producer_code: 'USNGA   ' (profile)" in log_lines
+
+        monkeypatch.setattr('builtins.input', lambda *_: 'yes')
+        result = _convert(src, out, profile, assume_yes=False)
+        assert result.exit_code == 0 and result.files_processed == 1
+        assert os.path.isfile(os.path.join(out, 'tile_85_30.dt2'))
+        assert log_lines.count('DTED header plan') == 2, 'the plan is shown once per run, not once per unit'
