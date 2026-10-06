@@ -398,19 +398,19 @@ python EGMTrans.py -i "cell_18_EGM2008" -o "cell_18_EGM96" -s EGM2008 -t EGM96 -
   --water-levels "cell_17_levels.csv" -c 0.9
 ```
 
-8. Make a DTED2 cell from one TanDEM-X tile, with the header filled from a product profile:
+8. Make a DTED2 cell from one GeoTIFF tile on the whole-degree lattice, with the header filled from a product profile:
 
 ```bash
-python EGMTrans.py -i "TDF_N50W001_01_DEM.tif" -o "N50W001.dt2" -s EGM2008 -t EGM96 -y \
+python EGMTrans.py -i "N50W001_DEM.tif" -o "N50W001.dt2" -s EGM2008 -t EGM96 -y \
   --dted-profile "samples/dted_profile_example.toml"
 ```
 
-9. Make DTED2 from every tile under a folder, one file per cell named `TDF-DTED2_E006N49.dt2`, with the headers filled from the collection's index and profile, and check that this computer reproduces the reference bytes first:
+9. Make DTED2 from every tile under a folder, one file per cell named `DTED2_E006N49.dt2`, with the headers filled from the collection's index and profile, and check that this computer reproduces the reference bytes first:
 
 ```bash
 egmtrans dted-selftest
-python EGMTrans.py -i "tdf_tiles" -o "tdf_dted2" -s EGM2008 -t EGM96 -y --dted-level 2 \
-  --dted-naming "TDF-DTED{level}_{lon}{lat}" --dted-index "tdf_dted2.gpkg" --dted-profile "tdf_dted2.toml"
+python EGMTrans.py -i "tiles" -o "dted2" -s EGM2008 -t EGM96 -y --dted-level 2 \
+  --dted-naming "DTED{level}_{lon}{lat}" --dted-index "collection.gpkg" --dted-profile "collection.toml"
 ```
 
 ## Run in a Container
@@ -521,7 +521,7 @@ Findings have three severities. An error breaks readers or a mandatory rule: a w
 The geometry fields of a DTED header follow from the raster, but the accuracies (CE90 and LE90), the edition, the dates, the producer, the security markings and the free text do not, and they differ per cell. EGMTrans takes them from two files that a producer prepares once for a whole collection:
 
 - A **metadata index**, a GeoPackage (`.gpkg`) or GeoParquet (`.parquet`) file with one row per one-degree cell, keyed by `cell_id` (`N38E045`), built and checked with `egmtrans dted-index`. The index is also a catalog of the collection that other services can read, filter and style: every row carries the cell polygon.
-- A **product profile**, a TOML file of the values that are the same for every cell of a product. `samples/dted_profile_example.toml` follows a TDF-DTED2 production header.
+- A **product profile**, a TOML file of the values that are the same for every cell of a product. `samples/dted_profile_example.toml` follows the header of the public SRTM DTED2 sample in `samples/`.
 
 When a header is written, its fields are filled in order of precedence: values derived from the cell geometry, the target datum and the data (sentinels, origin, intervals, counts, corners, series, vertical and horizontal datum, partial cell indicator, the multiple-accuracy flags, the UHL copies of the security code and the vertical accuracy) can never be overridden; then the cell's index row; then the profile; then the input file's header (for a DTED input); then the `--abs_horiz_accuracy` fallback, which fills its field only when it is still NA; then the specification's fill (NA, `0000`, blanks). A cell the index does not hold stops the run before anything is written, and so does an index or profile made for another DTED level. For a DTED cell made from a GeoTIFF there is no input header: the security code, the edition, the match/merge version, the producer code, the compilation date and the four accuracies must come from the index, the profile or `--abs_horiz_accuracy`, and the run stops before writing when one of them has no source (an explicit NA counts). A `vertical_datum` or `horizontal_datum` the profile or index states for another product (`E96` in an index harvested from the EGM96 collection, for an EGM2008 output) is reported as a warning and the output keeps its own code. A NULL accuracy in the index means NA, so the profile's accuracies serve runs without an index. Every field's source is logged, the validator's warnings on the result are logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
 
@@ -549,23 +549,23 @@ Building an index:
 
 ```bash
 # Rows from the headers of an existing DTED collection (subregions included)
-egmtrans dted-index build --out tdf_dted2.gpkg --from-dted /data/dted --product TDF-DTED2
+egmtrans dted-index build --out collection.gpkg --from-dted /data/dted --product DTED2
 
 # Rows for every cell the source rasters cover, with values the profile's harvest
 # mappings pull from raster tags and XML sidecars
-egmtrans dted-index build --out tdf_dted2.parquet --from-rasters /data/tdf --profile tdf_dted2.toml
+egmtrans dted-index build --out collection.parquet --from-rasters /data/tiles --profile collection.toml
 
 # Rows from a footprint layer, then add what the DTED headers say, keeping the rest
-egmtrans dted-index build --out tdf_dted2.gpkg --from-footprints footprints.gpkg --cell-field item_name
-egmtrans dted-index build --out tdf_dted2.gpkg --from-dted /data/dted --update
+egmtrans dted-index build --out collection.gpkg --from-footprints footprints.gpkg --cell-field item_name
+egmtrans dted-index build --out collection.gpkg --from-dted /data/dted --update
 
-egmtrans dted-index validate tdf_dted2.gpkg --profile tdf_dted2.toml --level 2
+egmtrans dted-index validate collection.gpkg --profile collection.toml --level 2
 ```
 
 The profile's `[harvest.tags.fields]` map index columns to raster metadata tags and `[harvest.xml.fields]` to XPath expressions in a sidecar found through `[harvest.xml] sidecar` (`{stem}`, `{name}`, `{cell}` and `{dir}` are replaced); a mapping may be a table with a `pattern` whose first group is the value. XPath with namespaces and predicates needs `lxml`; a sidecar that declares a DOCTYPE or entities is refused. Harvested accuracies are rounded up to whole meters. Values the build cannot find stay NULL, to be filled in any GIS or with a script, and `dted-index validate` lists what is missing. Using the index:
 
 ```bash
-egmtrans -i in/N55.dt2 -o out/N55.dt2 -s EGM2008 -t EGM96 --dted-index tdf_dted2.gpkg --dted-profile tdf_dted2.toml
+egmtrans -i in/N55.dt2 -o out/N55.dt2 -s EGM2008 -t EGM96 --dted-index collection.gpkg --dted-profile collection.toml
 ```
 
 ## Creating DTED from GeoTIFF

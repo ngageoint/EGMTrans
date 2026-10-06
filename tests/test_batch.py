@@ -460,7 +460,7 @@ class TestConvertedCells:
         profile = _profile(tmp_dir)
         expected = {
             'stem': 'sub/tile_85_30.dt2', 'cell': 'N85E030.dt2', 'dted': 'E030/N85.dt2',
-            'TDF-DTED{level}_{lon}{lat}': 'TDF-DTED2_E030N85.dt2',
+            'DTED{level}_{lon}{lat}': 'DTED2_E030N85.dt2',
         }
         for naming, name in expected.items():
             out = os.path.join(tmp_dir, 'out_' + naming.replace('{', '').replace('}', '').replace('-', '_'))

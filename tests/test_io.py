@@ -173,7 +173,7 @@ class TestWriteDted:
         header = read_header(out)
         assert header['dsi.vertical_datum'] == 'E96' and header['dsi.series'] == 'DTED2'
         assert header['uhl.lon_lines'] == '0601' and header['dsi.partial_cell'] == '99'
-        assert header['acc.abs_horiz_acc'] == '0014' and header['dsi.producer_code'] == 'USNGA   '
+        assert header['acc.abs_horiz_acc'] == '0012' and header['dsi.producer_code'] == 'USCNIMA '
         _header, issues = validate_file(out, check_data=True)
         assert not [issue for issue in issues if issue.severity == 'error']
 
@@ -211,7 +211,7 @@ class TestWriteDted:
         # The dry run and the write build the same header.
         heights[5, 5] = 100.0
         header, sources = new_dted_header(cell, 'EGM2008', 7, metadata=self._metadata(level=0))
-        assert header['dsi.vertical_datum'] == 'E08' and header['acc.abs_horiz_acc'] == '0014'
+        assert header['dsi.vertical_datum'] == 'E08' and header['acc.abs_horiz_acc'] == '0012'
         assert sources['acc.abs_horiz_acc'] == 'profile'
         write_dted(out, cell, heights, 'EGM2008', 7, tmp_dir, metadata=self._metadata(level=0))
         from egmtrans.dted.header import read_header
