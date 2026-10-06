@@ -27,7 +27,7 @@ from tests.conftest import lattice_geotransform, point_geotransform
 
 # TanDEM-X posts per degree of longitude by band, with the DTED level-2
 # longitude lines of the zone the band falls in.
-TDF_BANDS = [(9000, 3601), (6000, 1801), (4500, 1801), (3000, 1201), (3000, 901), (1800, 601), (900, 601)]
+LATITUDE_BANDS = [(9000, 3601), (6000, 1801), (4500, 1801), (3000, 1201), (3000, 901), (1800, 601), (900, 601)]
 
 
 def reference_bilinear(window, rows, cols):
@@ -53,8 +53,8 @@ def reference_bilinear(window, rows, cols):
 
 
 class TestSourceGrid:
-    @pytest.mark.parametrize('per_degree', [n for n, _ in TDF_BANDS])
-    def test_tdf_spacings_are_lattices(self, per_degree):
+    @pytest.mark.parametrize('per_degree', [n for n, _ in LATITUDE_BANDS])
+    def test_band_spacings_are_lattices(self, per_degree):
         grid = SourceGrid.from_geotransform(lattice_geotransform(6, 49, per_degree, 9000), per_degree + 1, 9001)
         assert (grid.per_degree_x, grid.per_degree_y) == (per_degree, 9000)
         assert (grid.west, grid.north) == (6 * per_degree, 50 * 9000)
@@ -111,8 +111,8 @@ class TestSourceGrid:
 
 
 class TestAxisMap:
-    @pytest.mark.parametrize('per_degree,cols', TDF_BANDS)
-    def test_tdf_bands_reduce_to_halves_and_thirds(self, per_degree, cols):
+    @pytest.mark.parametrize('per_degree,cols', LATITUDE_BANDS)
+    def test_bands_reduce_to_halves_and_thirds(self, per_degree, cols):
         axis = AxisMap.between(per_degree + 1, cols)
         assert axis.denominator in (1, 2, 3)
         assert axis.lower[0] == 0 and axis.numerator[0] == 0

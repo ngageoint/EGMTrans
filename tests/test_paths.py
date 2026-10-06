@@ -217,10 +217,10 @@ class TestDtedLevelPaths:
     """resolve_io_paths with a DTED level, and the naming of converted cells."""
 
     def test_geotiff_file_to_folder_takes_the_level_extension(self, tmp_path):
-        src = tmp_path / 'TDF_N50W001_01_DEM.tif'
+        src = tmp_path / 'N50W001_DEM.tif'
         src.write_bytes(b'')
         paths = resolve_io_paths(str(src), str(tmp_path / 'out'), dted_level=2)
-        assert paths.mode == 'file' and paths.output_path.endswith('TDF_N50W001_01_DEM.dt2')
+        assert paths.mode == 'file' and paths.output_path.endswith('N50W001_DEM.dt2')
         assert paths.output_folder == str(tmp_path / 'out') and paths.dted_level == 2
         dted = tmp_path / 'n50w001.dt1'
         dted.write_bytes(b'')
@@ -250,12 +250,12 @@ class TestDtedLevelPaths:
             dted_naming_template('{lvl}')
         with pytest.raises(ValueError, match='not a valid template'):
             dted_naming_template('{cell')
-        root = os.path.join('data', 'tdf')
-        tile = os.path.join(root, 'band1', 'TDF_N49E006_03_DEM.tif')
-        assert dted_output_name('stem', tile, root, 'N49E006', 2) == 'band1/TDF_N49E006_03_DEM.dt2'
+        root = os.path.join('data', 'tiles')
+        tile = os.path.join(root, 'band1', 'N49E006_DEM.tif')
+        assert dted_output_name('stem', tile, root, 'N49E006', 2) == 'band1/N49E006_DEM.dt2'
         assert dted_output_name('cell', tile, root, 'N49E006', 1) == 'N49E006.dt1'
         assert dted_output_name('dted', tile, root, 'N49E006', 0) == 'E006/N49.dt0'
-        assert dted_output_name('TDF-DTED{level}_{lon}{lat}', tile, root, 'S06E030', 2) == 'TDF-DTED2_E030S06.dt2'
+        assert dted_output_name('DTED{level}_{lon}{lat}', tile, root, 'S06E030', 2) == 'DTED2_E030S06.dt2'
         assert dted_output_name('stem', os.path.join(root, 'a.tif'), root, 'N49E006', 2) == 'a.dt2'
         with pytest.raises(ValueError, match='leaves the output folder'):
             dted_output_name('../{cell}', tile, root, 'N49E006', 2)

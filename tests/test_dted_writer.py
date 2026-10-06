@@ -53,11 +53,11 @@ def test_profile_fills_a_header_from_scratch(profile):
     )
     assert header['uhl.lon_interval'] == '0020' and header['uhl.lon_lines'] == '1801'
     assert header['dsi.security_code'] == 'U' and header['uhl.security_code'] == 'U  '
-    assert header['dsi.security_handling'] == 'LIMITED DISTRIBUTION       '
-    assert header['dsi.producer_code'] == 'USNGA   ' and header['dsi.digitizing_system'] == 'TandemXTDF'
-    assert header['acc.abs_horiz_acc'] == '0014' and header['acc.rel_horiz_acc'] == 'NA  '
-    assert header['acc.abs_vert_acc'] == '0010' == header['uhl.abs_vert_acc']
-    assert header['dsi.compilation_date'] == '2407' and header['dsi.product_spec_date'] == '0005'
+    assert header['dsi.security_handling'] == 'PUBLIC SALE/NO RESTRICTION '
+    assert header['dsi.producer_code'] == 'USCNIMA ' and header['dsi.digitizing_system'] == 'SRTM      '
+    assert header['acc.abs_horiz_acc'] == '0012' and header['acc.rel_horiz_acc'] == 'NA  '
+    assert header['acc.abs_vert_acc'] == '0006' == header['uhl.abs_vert_acc']
+    assert header['dsi.compilation_date'] == '0002' and header['dsi.product_spec_date'] == '0005'
     assert header['dsi.vertical_datum'] == 'E96' and header['dsi.partial_cell'] == '00'
     assert sources['dsi.producer_code'] == 'profile' and sources['dsi.vertical_datum'] == 'derived'
     assert sources['uhl.abs_vert_acc'] == 'derived'
@@ -65,16 +65,16 @@ def test_profile_fills_a_header_from_scratch(profile):
 
 
 def test_index_row_overrides_profile_and_null_means_na(profile):
-    row = new_row('N50W001', producer_code='GEBGIC', abs_horiz_acc=None, compilation_date='2025-01-10',
+    row = new_row('N50W001', producer_code='USTEST', abs_horiz_acc=None, compilation_date='2025-01-10',
                   unique_ref_dsi='N50W001_01')
     header, sources = assemble_header(
         cell_geometry(-1, 50, 2), metadata=DtedMetadata(row, [], profile), derived=DerivedFields(vertical_datum='E96'),
     )
-    assert header['dsi.producer_code'] == 'GEBGIC  ' and sources['dsi.producer_code'] == 'index'
+    assert header['dsi.producer_code'] == 'USTEST  ' and sources['dsi.producer_code'] == 'index'
     assert header['acc.abs_horiz_acc'] == 'NA  ' and sources['acc.abs_horiz_acc'] == 'index'
     assert header['dsi.compilation_date'] == '2501'
     assert header['dsi.unique_ref'] == 'N50W001_01     '
-    assert header['dsi.digitizing_system'] == 'TandemXTDF' and sources['dsi.digitizing_system'] == 'profile'
+    assert header['dsi.digitizing_system'] == 'SRTM      ' and sources['dsi.digitizing_system'] == 'profile'
 
 
 def test_required_fields_and_conflicts(profile, log_lines):
@@ -174,14 +174,14 @@ def test_subregion_rings_are_normalized(profile):
 
 
 def test_describe_a_header_built_from_scratch(profile):
-    row = new_row('N03E008', producer_code='GEBGIC', abs_horiz_acc=None)
+    row = new_row('N03E008', producer_code='USTEST', abs_horiz_acc=None)
     header, sources = assemble_header(cell_geometry(8, 3, 2), metadata=DtedMetadata(row, [], profile),
                                       derived=DerivedFields(vertical_datum='E96'), cli_abs_horiz_accuracy=5)
     lines = describe_changes(None, header, sources)
     assert lines[0].startswith('Header fields by source: ')
-    assert "    dsi.producer_code: 'GEBGIC  ' (index)" in lines
+    assert "    dsi.producer_code: 'USTEST  ' (index)" in lines
     assert "    acc.abs_horiz_acc: 'NA  ' (index)" in lines
-    assert "    dsi.digitizing_system: 'TandemXTDF' (profile)" in lines
+    assert "    dsi.digitizing_system: 'SRTM      ' (profile)" in lines
     assert not any('(derived)' in line or '(default)' in line for line in lines[1:])
 
 
@@ -266,7 +266,8 @@ def test_update_dted_header_in_a_file(tmp_dir, profile, log_lines):
     # An index row's NULL accuracy means NA, whatever the profile says: the
     # profile's accuracies serve runs without an index.
     assert final['acc.rel_vert_acc'] == 'NA  ' and final['acc.abs_horiz_acc'] == 'NA  '
-    assert final['dsi.producer_code'] == 'USNGA   ' and final['dsi.security_handling'].strip() == 'LIMITED DISTRIBUTION'
+    assert final['dsi.producer_code'] == 'USCNIMA '
+    assert final['dsi.security_handling'].strip() == 'PUBLIC SALE/NO RESTRICTION'
     assert final['dsi.series'] == 'DTED0' and final['uhl.lat_points'] == '0121'
     with pytest.raises(LookupError):
         source.for_cell('N07E126')

@@ -8,9 +8,9 @@ tags and XML sidecars.
     [product]
     dted_level = 2
     security_code = "U"
-    producer_code = "USNGA"
-    digitizing_system = "TandemXTDF"
-    abs_horiz_acc = 14
+    producer_code = "USCNIMA"
+    digitizing_system = "SRTM"
+    abs_horiz_acc = 12
     rel_horiz_acc = "NA"
 
     [harvest.xml]
@@ -21,7 +21,7 @@ tags and XML sidecars.
     compilation_date = "//gmd:dateStamp/gco:Date"
 
     [harvest.tags.fields]
-    source_version = { tag = "TIFFTAG_SOFTWARE", pattern = "DEMES ([0-9.]+)" }
+    source_version = { tag = "TIFFTAG_SOFTWARE", pattern = '([0-9]+(?:\\.[0-9A-Za-z]+)+)' }
 
 Keys of ``[product]`` are index columns (see :mod:`egmtrans.dted.index`); a
 per-cell value in the index overrides the profile constant.

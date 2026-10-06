@@ -144,7 +144,7 @@ def test_cell_ids():
     assert cell_id(0, 0) == 'N00E000'
     assert parse_cell_id('s06e030') == (30, -6)
     assert parse_cell_id(' N50W001 ') == (-1, 50)
-    for bad in ('N3E8', 'N50W181', 'N91E000', '', 'TDF_N38E045'):
+    for bad in ('N3E8', 'N50W181', 'N91E000', '', 'X_N38E045'):
         with pytest.raises(ValueError):
             parse_cell_id(bad)
 

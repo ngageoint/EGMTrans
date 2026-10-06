@@ -5,30 +5,29 @@
 # any of them; a NULL accuracy in the index means NA. Keys are the index
 # column names; see "DTED Metadata Index and Profile" in the README.
 #
-# The values below follow a TDF-DTED2 production header. The free text is an
-# example only.
+# The values below follow the header of the public SRTM DTED2 sample in this
+# folder (03n008e_SRTM.dt2). The free text is an example only.
 
 schema = 1
 
 [product]
 dted_level = 2
 security_code = "U"
-security_handling = "LIMITED DISTRIBUTION"
-unique_ref_uhl = "TDF"
+security_handling = "PUBLIC SALE/NO RESTRICTION"
 data_edition = 1
 match_merge_version = "A"
-producer_code = "USNGA"
-digitizing_system = "TandemXTDF"
+producer_code = "USCNIMA"
+digitizing_system = "SRTM"
 product_spec = "PRF89020B"
 product_spec_amend = "00"
 product_spec_date = "2000-05"
 # Most products set the compilation date per cell in the index; this is the
 # fallback for cells whose row leaves it NULL.
-compilation_date = "2024-07"
-abs_horiz_acc = 14
-abs_vert_acc = 10
+compilation_date = "2000-02"
+abs_horiz_acc = 12
+abs_vert_acc = 6
 rel_horiz_acc = "NA"
-rel_vert_acc = 10
+rel_vert_acc = 8
 dsi_free_text = "Example free text comment: questions about this product go to the producer named in the DSI."
 
 # How "egmtrans dted-index build --from-rasters" fills per-cell columns from
@@ -37,11 +36,13 @@ dsi_free_text = "Example free text comment: questions about this product go to t
 
 [harvest.tags.fields]
 source_date = "TIFFTAG_DATETIME"
-source_version = { tag = "TIFFTAG_SOFTWARE", pattern = "DEMES ([0-9A-Za-z.]+)" }
+# The version number inside the software tag, whatever the software is called.
+source_version = { tag = "TIFFTAG_SOFTWARE", pattern = '([0-9]+(?:\.[0-9A-Za-z]+)+)' }
 
 [harvest.xml]
 # Relative to the raster's folder; {stem}, {name}, {cell} and {dir} are
-# replaced, and the pattern may be a glob.
+# replaced, and the pattern may be a glob. Any ISO 19139 sidecar answers the
+# XPaths below; the Copernicus metadata file in this folder is one.
 sidecar = "{stem}.xml"
 
 [harvest.xml.namespaces]

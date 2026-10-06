@@ -1,6 +1,6 @@
 # Python
 __pycache__/
-.pyHistory/
+.pyHistory
 *.pyc
 *.pyo
 *.pyd
