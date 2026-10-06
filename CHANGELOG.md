@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An index leaves out every column that is NULL in all its rows, so the profile supplies that field; a NULL among an accuracy column's values still means NA. An index built by 1.8.0 keeps its empty columns, and with it the profile's accuracies never applied; rebuild it with `dted-index build` to drop them.
 
-## [1.8.1] - 2026-10-05
+## [1.8.1] - 2026-10-06
 
 ### Changed
 
