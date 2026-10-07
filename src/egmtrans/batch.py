@@ -36,11 +36,11 @@ from dataclasses import dataclass, field
 from egmtrans import _state
 from egmtrans._version import __version__
 from egmtrans.config import DATUM_MAPPING, DTED_EXTENSIONS
-from egmtrans.dted.header import CellGeometry, read_header
-from egmtrans.dted.writer import DtedMetadataSource, HeaderAssemblyError
+from egmtrans.dted.header import CellGeometry, DtedHeader, read_header
+from egmtrans.dted.writer import DtedMetadataSource, HeaderAssemblyError, header_plan_lines
 from egmtrans.file_utils import IOPaths, copy_folder_structure, dted_output_name, find_dems, is_valid_dem
 from egmtrans.flattening import DEFAULT_CONTAINMENT
-from egmtrans.io import new_dted_header
+from egmtrans.io import new_dted_header, preview_dted_header
 from egmtrans.tiling import (
     SeamCheck,
     TableRow,
@@ -446,9 +446,23 @@ def run_batch(
             f"water body's level may differ at a seam."
         )
 
-    if dted_units and not _check_dted_headers(dted_units, dted_metadata, target_datum, abs_horiz_accuracy, dted_level):
-        result.exit_code = 1
-        return result
+    if dted_units:
+        ok, plan = _check_dted_headers(dted_units, dted_metadata, target_datum, abs_horiz_accuracy, dted_level)
+        if not ok:
+            result.exit_code = 1
+            return result
+        if plan is not None:
+            source = dted_metadata if dted_metadata is not None and not dted_metadata.empty else None
+            describe = source.describe() if source is not None else 'no index or profile'
+            for line in header_plan_lines(
+                describe, plan.cell_id, plan.unit.input_file, plan.unit.output_file, plan.header, plan.sources,
+                base=plan.base, more=len(dted_units) - 1,
+            ):
+                logger.info(line)
+            if not arc_mode and not cli.confirm('Write the DTED headers as planned?', assume_yes):
+                logger.error('Aborting transformation.')
+                result.exit_code = 1
+                return result
 
     table = None
     if water_levels:
@@ -545,7 +559,7 @@ def run_batch(
                     abs_horiz_accuracy, save_log,
                     check_for_wrong_datum=False, arc_mode=arc_mode, assume_yes=True,
                     tile_levels=tile_levels, min_containment=min_containment,
-                    dted_metadata=dted_metadata, dted_cell=unit.cell,
+                    dted_metadata=dted_metadata, dted_cell=unit.cell, dted_plan=False,
                 )
             except cli.NonInteractiveError:
                 raise
@@ -588,16 +602,31 @@ def run_batch(
     return result
 
 
+@dataclass
+class HeaderPlan:
+    """The first DTED output's header as the pre-flight assembled it: the
+    example a run shows before it writes anything."""
+
+    unit: WorkUnit
+    cell_id: str
+    header: DtedHeader
+    sources: dict[str, str]
+    base: DtedHeader | None = None
+
+
 def _check_dted_headers(
     dted_units: list[WorkUnit],
     dted_metadata: DtedMetadataSource | None,
     target_datum: str,
     abs_horiz_accuracy: int | None,
     dted_level: int | None,
-) -> bool:
+) -> tuple[bool, HeaderPlan | None]:
     """Before anything is written: the index and profile are for the level
-    being written, every DTED output has its index row, and every cell made
-    from scratch can have its header completed."""
+    being written, every DTED output has its index row, every cell made from
+    scratch can have its header completed, and a DTED-to-DTED rewrite with an
+    index, a profile or overrides can be assembled. Returns whether the run
+    may go on and the plan of its first DTED output (None when there is
+    nothing to show: a DTED-to-DTED run without any of the three)."""
     logger = _state.get_logger()
     source = dted_metadata if dted_metadata is not None and not dted_metadata.empty else None
     if source is not None and dted_level is not None:
@@ -606,9 +635,10 @@ def _check_dted_headers(
             for issue in errors:
                 logger.error(str(issue))
             logger.error('Aborting transformation.')
-            return False
+            return False, None
     missing = []
     problems = []
+    plan = None
     for unit in dted_units:
         if unit.cell is not None:
             cell_id = unit.cell.cell_id
@@ -623,15 +653,27 @@ def _check_dted_headers(
         if unit.cell is not None:
             try:
                 metadata = source.for_cell(cell_id) if source is not None else None
-                new_dted_header(unit.cell, target_datum, abs_horiz_accuracy, metadata=metadata)
+                header, sources = new_dted_header(unit.cell, target_datum, abs_horiz_accuracy, metadata=metadata)
             except (HeaderAssemblyError, LookupError, ValueError) as e:
                 problems.append(f'{unit.name}: {e}')
+                continue
+            if plan is None:
+                plan = HeaderPlan(unit, cell_id, header, sources)
+        elif source is not None and plan is None:
+            try:
+                base, cell, header, sources = preview_dted_header(
+                    unit.input_file, target_datum, abs_horiz_accuracy, source=source,
+                )
+            except (OSError, HeaderAssemblyError, LookupError, ValueError) as e:
+                problems.append(f'{unit.name}: {e}')
+                continue
+            plan = HeaderPlan(unit, cell.cell_id, header, sources, base)
     if missing:
         logger.error(
             f"The DTED metadata index has no row for {len(missing)} of the {len(dted_units)} DTED output(s): "
             f"{', '.join(missing[:5])}{', ...' if len(missing) > 5 else ''}.\nAborting transformation."
         )
-        return False
+        return False, None
     if problems:
         for problem in problems[:5]:
             logger.error(f'The DTED header cannot be completed for {problem}')
@@ -641,5 +683,5 @@ def _check_dted_headers(
             'A DTED cell made from GeoTIFF needs --dted-profile and/or --dted-index to fill its header.\n'
             'Aborting transformation.'
         )
-        return False
-    return True
+        return False, None
+    return True, plan

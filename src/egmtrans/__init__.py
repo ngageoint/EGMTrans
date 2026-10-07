@@ -10,7 +10,7 @@ from egmtrans.config import (
     SUPPORTED_EXTENSIONS,
     configure_gdal,
 )
-from egmtrans.dted.writer import DtedMetadataSource
+from egmtrans.dted.writer import HEADER_FIELD_NAMES, DtedMetadataSource, parse_overrides
 from egmtrans.file_utils import (
     IOPaths,
     copy_as_writable,
@@ -41,6 +41,8 @@ __all__ = [
     "run_batch",
     "BatchResult",
     "DtedMetadataSource",
+    "HEADER_FIELD_NAMES",
+    "parse_overrides",
     "TileLevels",
     "str2bool",
     "IOPaths",

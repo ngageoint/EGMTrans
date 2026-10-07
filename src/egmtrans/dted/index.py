@@ -13,7 +13,9 @@ Layers:
 In a GeoParquet index the cells are the file itself, the subregions a sibling
 ``<name>_subregions.parquet``, and the meta the file's key-value metadata.
 Dates are ISO dates in the index; the header assembler turns them into YYMM.
-A NULL accuracy means NA.
+A column that is NULL in every row is not written, so the profile supplies
+that field; a NULL among values means NA for an accuracy and "not from the
+index" for any other field.
 """
 
 from __future__ import annotations
@@ -107,6 +109,7 @@ INDEX_COLUMNS: tuple[Column, ...] = (
 COLUMNS_BY_NAME: dict[str, Column] = {column.name: column for column in INDEX_COLUMNS}
 HEADER_COLUMNS: tuple[Column, ...] = tuple(c for c in INDEX_COLUMNS if c.dted_key and not c.check_only)
 ACCURACY_COLUMNS = ('abs_horiz_acc', 'abs_vert_acc', 'rel_horiz_acc', 'rel_vert_acc')
+ALWAYS_WRITTEN = ('cell_id', 'dted_level', 'updated')
 
 SUBREGION_COLUMNS: tuple[Column, ...] = (
     Column('cell_id', 'str', None, 7, True),
@@ -301,6 +304,17 @@ def _meta_for(rows: dict[str, dict], meta: dict | None, level: int | None) -> di
     return merged
 
 
+def columns_to_write(rows: dict[str, dict]) -> tuple[Column, ...]:
+    """The index columns an index holds: the key, the level and the timestamp
+    always, any other column only when some row has a value. An absent column
+    is one the profile supplies; a NULL among values means NA (accuracies) or
+    "nothing from the index" (the rest)."""
+    return tuple(
+        column for column in INDEX_COLUMNS
+        if column.name in ALWAYS_WRITTEN or any(row.get(column.name) is not None for row in rows.values())
+    )
+
+
 def _prepare_rows(rows: dict[str, dict] | list[dict]) -> dict[str, dict]:
     """Rows keyed by upper-case cell id, values normalized, every column present."""
     if isinstance(rows, list):
@@ -367,7 +381,8 @@ def _set_ogr_field(feature, column: Column, value) -> None:
         feature.SetField(column.name, value)
 
 
-def _write_gpkg(path: str, rows: dict[str, dict], subregions: dict[str, list[dict]], meta: dict[str, str]) -> None:
+def _write_gpkg(path: str, rows: dict[str, dict], subregions: dict[str, list[dict]], meta: dict[str, str],
+                columns: tuple[Column, ...] = INDEX_COLUMNS) -> None:
     from osgeo import ogr, osr
 
     driver = ogr.GetDriverByName('GPKG')
@@ -380,7 +395,7 @@ def _write_gpkg(path: str, rows: dict[str, dict], subregions: dict[str, list[dic
     extra_columns = sorted({name for row in rows.values() for name in row} - set(COLUMNS_BY_NAME))
 
     cells = source.CreateLayer(CELLS_LAYER, srs, ogr.wkbPolygon, ['GEOMETRY_NAME=geometry'])
-    for column in INDEX_COLUMNS:
+    for column in columns:
         definition = ogr.FieldDefn(column.name, _ogr_type(column))
         if column.max_len:
             definition.SetWidth(column.max_len)
@@ -390,7 +405,7 @@ def _write_gpkg(path: str, rows: dict[str, dict], subregions: dict[str, list[dic
     layer_definition = cells.GetLayerDefn()
     for cell, row in sorted(rows.items()):
         feature = ogr.Feature(layer_definition)
-        for column in INDEX_COLUMNS:
+        for column in columns:
             _set_ogr_field(feature, column, row.get(column.name))
         for name in extra_columns:
             value = row.get(name)
@@ -510,7 +525,8 @@ def _geo_metadata(bbox: list[float]) -> dict:
     }
 
 
-def _write_parquet(path: str, rows: dict[str, dict], subregions: dict[str, list[dict]], meta: dict[str, str]) -> None:
+def _write_parquet(path: str, rows: dict[str, dict], subregions: dict[str, list[dict]], meta: dict[str, str],
+                   columns: tuple[Column, ...] = INDEX_COLUMNS) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -518,7 +534,7 @@ def _write_parquet(path: str, rows: dict[str, dict], subregions: dict[str, list[
     extra_columns = sorted({name for row in rows.values() for name in row} - set(COLUMNS_BY_NAME))
     ordered = sorted(rows)
     arrays = {column.name: pa.array([rows[c].get(column.name) for c in ordered], type=types[column.type])
-              for column in INDEX_COLUMNS}
+              for column in columns}
     for name in extra_columns:
         values = [None if rows[c].get(name) is None else str(rows[c][name]) for c in ordered]
         arrays[name] = pa.array(values, pa.string())
@@ -593,7 +609,9 @@ def write_index(
 
     *rows* map cell ids to column values (missing columns are NULL); each
     subregion is a dict with ``cell_id``, ``seq``, the four accuracies and an
-    ``outline`` of (lat, lon) pairs.
+    ``outline`` of (lat, lon) pairs. A column that is NULL in every row is
+    left out of the file (see :func:`columns_to_write`), and out of the
+    returned index.
     """
     driver = _driver_for(path)
     prepared_rows = _prepare_rows(rows)
@@ -602,15 +620,21 @@ def write_index(
         if cell not in prepared_rows:
             raise ValueError(f'Subregions for {cell}, which has no row in the index')
     table = _meta_for(prepared_rows, meta, level)
+    columns = columns_to_write(prepared_rows)
     if driver == 'gpkg':
-        _write_gpkg(path, prepared_rows, prepared_subregions, table)
+        _write_gpkg(path, prepared_rows, prepared_subregions, table, columns)
     elif _parquet_available():
-        _write_parquet(path, prepared_rows, prepared_subregions, table)
+        _write_parquet(path, prepared_rows, prepared_subregions, table, columns)
     else:
         raise RuntimeError(
             'Writing a GeoParquet index needs pyarrow (pip install pyarrow, or the egmtrans[index] extra)'
         )
-    return DtedIndex(path=path, rows=prepared_rows, subregions=prepared_subregions, meta=table)
+    written = {column.name for column in columns}
+    rows_as_written = {
+        cell: {name: value for name, value in row.items() if name in written or name not in COLUMNS_BY_NAME}
+        for cell, row in prepared_rows.items()
+    }
+    return DtedIndex(path=path, rows=rows_as_written, subregions=prepared_subregions, meta=table)
 
 
 def read_index(path: str) -> DtedIndex:

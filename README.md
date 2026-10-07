@@ -6,7 +6,7 @@
 # EGMTrans Tool and Explorer
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.8.1-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.9.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -282,6 +282,8 @@ Note: While Numba is recommended for optimal performance, EGMTrans will still fu
    - **DTED Product Profile**: A TOML file of header constants for the product; the index row overrides it field by field.
    - **DTED Level**: Write every GeoTIFF input as DTED of this level, one file per whole one-degree cell it covers; DTED inputs keep their level (see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)).
    - **DTED Output Naming**: How the cells are named under the output folder: `stem`, `cell`, `dted`, or a template.
+   - **DTED Header Overrides**: Header fields to write with one value in every cell of the run, over the index row and the profile: pick the field, type the value (an accuracy takes `NA`; a date takes `YYYY-MM`, `YYYY-MM-DD` or `today`).
+   - **DTED Header Fields**: Read only; filled as soon as an index, a profile or overrides are chosen: how many cells the index holds, which header fields come from the index, the profile and the overrides, and which required fields nothing supplies yet. The plan of the first cell is the first thing in the messages of a run.
 
 5. Click "Run" to execute the tool.
 
@@ -313,7 +315,7 @@ Arguments:
 - `-a`, `--algorithm`: Interpolation algorithm to use (optional; choices: 'bilinear', 'spline', 'delaunay', 'proj'; default: 'bilinear'). DTED output accepts only 'bilinear' (see [Interpolation Algorithms](#interpolation-algorithms)).
 - `--abs_horiz_accuracy`: A default horizontal accuracy that will be added to the output DTED file only if it is missing from the input. (Long form only – `-h` is `--help`.)
 - `-l`, `--log_file`: Whether to save the log messages to an external .log file (optional; default: True).
-- `-y`, `--yes`: Proceed without asking when the input file's vertical datum disagrees with `-s`, or when `-s` equals `-t` for a GeoTIFF (optional). Use it for unattended runs: without a terminal to answer a prompt, EGMTrans stops with exit code `2` rather than guess.
+- `-y`, `--yes`: Proceed without asking when the input file's vertical datum disagrees with `-s`, when `-s` equals `-t` for a GeoTIFF, or after the DTED header plan (optional). Use it for unattended runs: without a terminal to answer a prompt, EGMTrans stops with exit code `2` rather than guess.
 - `--context FOLDER`: A folder of neighboring tiles to analyze but not transform, so that a water body which continues into them gets the level a run including them would give it (optional; may be repeated). See [Notes](#notes).
 - `--export-water-levels FILE`: Write the level of every water body that touches a tile edge, keyed by the edge crossing, for later runs over neighboring tiles (optional).
 - `--water-levels FILE`: A table written by `--export-water-levels` in an earlier run; a water body found in it takes the table's level when that is lower than the level found in this run (optional).
@@ -321,13 +323,15 @@ Arguments:
 - `--dted-profile FILE`: A DTED product profile (TOML) of header constants; the index row overrides it field by field (optional).
 - `--dted-level N`: Write every GeoTIFF input as DTED of level `N` (0, 1 or 2), one file per whole one-degree cell it covers; DTED inputs keep their level (optional; see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)). A single GeoTIFF written to a `.dt0`, `.dt1` or `.dt2` output name needs no level.
 - `--dted-naming NAME|TEMPLATE`: How the cells made from GeoTIFF are named under the output folder: `stem` (the input's folder and name), `cell` (`N49E006.dt2`), `dted` (`E006/N49.dt2`), or a template with `{stem}`, `{dir}`, `{cell}`, `{lat}`, `{lon}` and `{level}`; the extension is added (optional; default: `stem`).
+- `--dted-set FIELD=VALUE`: Write this value in every DTED header of the run, over the index row and the profile (optional; may be repeated). `FIELD` is a header column of the index (`producer_code`, `compilation_date`, `abs_horiz_acc`, ...); an accuracy takes `NA`, a date takes `YYYY-MM`, `YYYY-MM-DD` or `today`.
 
 Three subcommands serve DTED; each has its own `--help`:
 
 ```
 egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH] [--zero-based] [--check-data] [--strict]
-egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH... | --from-footprints FILE) \
-  [--profile FILE] [--level N] [--product NAME] [--update]
+egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH... | --from-table FILE) \
+  [--layer NAME] [--cell-field NAME] [--map INDEX_COLUMN=TABLE_COLUMN]... [--set INDEX_COLUMN=VALUE]... \
+  [--prefer TABLE_COLUMN] [--profile FILE] [--level N] [--product NAME] [--update]
 egmtrans dted-index validate INDEX [--profile FILE] [--level N]
 egmtrans dted-selftest [--keep FOLDER]
 ```
@@ -523,7 +527,9 @@ The geometry fields of a DTED header follow from the raster, but the accuracies 
 - A **metadata index**, a GeoPackage (`.gpkg`) or GeoParquet (`.parquet`) file with one row per one-degree cell, keyed by `cell_id` (`N38E045`), built and checked with `egmtrans dted-index`. The index is also a catalog of the collection that other services can read, filter and style: every row carries the cell polygon.
 - A **product profile**, a TOML file of the values that are the same for every cell of a product. `samples/dted_profile_example.toml` follows the header of the public SRTM DTED2 sample in `samples/`.
 
-When a header is written, its fields are filled in order of precedence: values derived from the cell geometry, the target datum and the data (sentinels, origin, intervals, counts, corners, series, vertical and horizontal datum, partial cell indicator, the multiple-accuracy flags, the UHL copies of the security code and the vertical accuracy) can never be overridden; then the cell's index row; then the profile; then the input file's header (for a DTED input); then the `--abs_horiz_accuracy` fallback, which fills its field only when it is still NA; then the specification's fill (NA, `0000`, blanks). A cell the index does not hold stops the run before anything is written, and so does an index or profile made for another DTED level. For a DTED cell made from a GeoTIFF there is no input header: the security code, the edition, the match/merge version, the producer code, the compilation date and the four accuracies must come from the index, the profile or `--abs_horiz_accuracy`, and the run stops before writing when one of them has no source (an explicit NA counts). A `vertical_datum` or `horizontal_datum` the profile or index states for another product (`E96` in an index harvested from the EGM96 collection, for an EGM2008 output) is reported as a warning and the output keeps its own code. A NULL accuracy in the index means NA, so the profile's accuracies serve runs without an index. Every field's source is logged, the validator's warnings on the result are logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
+When a header is written, its fields are filled in order of precedence: values derived from the cell geometry, the target datum and the data (sentinels, origin, intervals, counts, corners, series, vertical and horizontal datum, partial cell indicator, the multiple-accuracy flags, the UHL copies of the security code and the vertical accuracy) can never be overridden; then the run's overrides (`--dted-set FIELD=VALUE`, or the DTED Header Overrides table in ArcGIS Pro: one value for every cell, for a date that must be today's or a producer code that has changed); then the cell's index row; then the profile; then the input file's header (for a DTED input); then the `--abs_horiz_accuracy` fallback, which fills its field only when it is still NA; then the specification's fill (NA, `0000`, blanks). A cell the index does not hold stops the run before anything is written, and so does an index or profile made for another DTED level. For a DTED cell made from a GeoTIFF there is no input header: the security code, the edition, the match/merge version, the producer code, the compilation date and the four accuracies must come from the index, the profile or `--abs_horiz_accuracy`, and the run stops before writing when one of them has no source (an explicit NA counts). A `vertical_datum` or `horizontal_datum` the profile or index states for another product (`E96` in an index harvested from the EGM96 collection, for an EGM2008 output) is reported as a warning and the output keeps its own code. A column the index does not have is supplied by the profile: an index built by `dted-index build` leaves out every column that is NULL in all its rows (an index built by 1.8.0 keeps them until it is rebuilt). A NULL among an accuracy column's values means NA; to write NA in every cell, say so in the profile (`rel_horiz_acc = "NA"`). Every field's source is logged, the validator's warnings on the result are logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
+
+Before a run writes anything, the **header plan** is logged: the index, profile and overrides in use, the first cell as the example, and every supplied field with its value and source (for a DTED-to-DTED run with an index, a profile or overrides, every field that changes). On the command line the run then asks `Write the DTED headers as planned?`; `-y` answers it. In ArcGIS Pro the plan is the first thing in the messages, and the DTED Header Fields box shows the summary as soon as an index or a profile is chosen, so a wrong value is seen before a long run starts.
 
 Index columns (layer `dted_cells`; dates are ISO dates and are written as YYMM):
 
@@ -556,16 +562,25 @@ egmtrans dted-index build --out collection.gpkg --from-dted /data/dted --product
 egmtrans dted-index build --out collection.parquet --from-rasters /data/tiles --profile collection.toml
 
 # Rows from a footprint layer, then add what the DTED headers say, keeping the rest
-egmtrans dted-index build --out collection.gpkg --from-footprints footprints.gpkg --cell-field item_name
+egmtrans dted-index build --out collection.gpkg --from-table footprints.gpkg --cell-field item_name
 egmtrans dted-index build --out collection.gpkg --from-dted /data/dted --update
+
+# Rows from any attribute table (a catalog, an export): a table column named like an index
+# column fills it, --map names the others, --set fills a column with one value, --prefer
+# keeps one row per cell, and the import is reported (what mapped, what was dropped, what
+# the profile must supply)
+egmtrans dted-index build --out collection.gpkg --from-table catalog.parquet --prefer tile_version \
+  --map compilation_date=creation_date --set security_code=U --profile collection.toml
 
 egmtrans dted-index validate collection.gpkg --profile collection.toml --level 2
 ```
 
-The profile's `[harvest.tags.fields]` map index columns to raster metadata tags and `[harvest.xml.fields]` to XPath expressions in a sidecar found through `[harvest.xml] sidecar` (`{stem}`, `{name}`, `{cell}` and `{dir}` are replaced); a mapping may be a table with a `pattern` whose first group is the value. XPath with namespaces and predicates needs `lxml`; a sidecar that declares a DOCTYPE or entities is refused. Harvested accuracies are rounded up to whole meters. Values the build cannot find stay NULL, to be filled in any GIS or with a script, and `dted-index validate` lists what is missing. Using the index:
+The profile's `[harvest.tags.fields]` map index columns to raster metadata tags and `[harvest.xml.fields]` to XPath expressions in a sidecar found through `[harvest.xml] sidecar` (`{stem}`, `{name}`, `{cell}` and `{dir}` are replaced); a mapping may be a table with a `pattern` whose first group is the value, and an XML mapping may list several XPaths, tried in order until one yields a value. XPath with namespaces and predicates needs `lxml`; a sidecar that declares a DOCTYPE or entities is refused. Harvested accuracies are rounded up to whole meters. Values the build cannot find stay NULL, to be filled in any GIS or with a script, and `dted-index validate` lists what is missing. Using the index:
 
 ```bash
 egmtrans -i in/N55.dt2 -o out/N55.dt2 -s EGM2008 -t EGM96 --dted-index collection.gpkg --dted-profile collection.toml
+egmtrans -i tiles -o dted2 -s EGM2008 -t EGM96 --dted-level 2 --dted-index collection.gpkg \
+  --dted-profile collection.toml --dted-set compilation_date=today --dted-set producer_code=USNGA
 ```
 
 ## Creating DTED from GeoTIFF

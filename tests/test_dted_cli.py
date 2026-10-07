@@ -10,6 +10,7 @@ import pytest
 
 from egmtrans import cli, cli_dted
 from egmtrans.dted.header import read_header, write_header
+from egmtrans.dted.index import read_index
 from tests.conftest import write_dted
 
 SAMPLES = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'samples')
@@ -119,3 +120,37 @@ def test_srtm_sample_is_clean(capsys):
     document = json.loads(capsys.readouterr().out)
     assert document['summary']['errors'] == 0 and document['summary']['warnings'] == 0
     assert document['summary']['cell_id'] == 'N03E008' and document['summary']['partial_cell'] == '99'
+
+
+def test_index_build_from_a_table(tmp_dir, capsys):
+    from tests.test_dted_index import _table_gpkg
+
+    table = _table_gpkg(os.path.join(tmp_dir, 'catalog.gpkg'), [
+        {'Cell_ID': 'N06E126', 'ABS_VERT_ACC': 3.0, 'data_edition': 2, 'made': '2024/07/15 10:00:00', 'ref': 'A',
+         'version': 1},
+        {'Cell_ID': 'N06E126', 'ABS_VERT_ACC': 6.0, 'data_edition': 3, 'made': '2025/01/10 00:00:00', 'ref': 'B',
+         'version': 2},
+        {'Cell_ID': 'S06E030', 'ABS_VERT_ACC': 12.4, 'data_edition': 1, 'made': '2024/01/01 00:00:00', 'ref': 'C',
+         'version': 1},
+    ])
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-table', table, '--map', 'compilation_date=made',
+                          '--set', 'security_code=U', '--prefer', 'version', '--profile', PROFILE, '--level', '2']) == 0
+    err = capsys.readouterr().err
+    assert 'Table catalog.gpkg (layer tiles): 3 row(s) read, 2 cell(s), the cell from column Cell_ID' in err
+    assert '1 cell(s) had several rows; the preferred row was kept' in err
+    assert '  abs_vert_acc <- ABS_VERT_ACC' in err and '  compilation_date <- made' in err
+    assert "  security_code = 'U' (constant)" in err
+    assert 'dropped (no index column of that name): ref, version' in err
+    assert ('Required header columns the profile supplies: match_merge_version, producer_code, abs_horiz_acc, '
+            'rel_horiz_acc, rel_vert_acc') in err
+    index = read_index(out)
+    assert 'abs_horiz_acc' not in index.columns and index.get('N06E126')['abs_vert_acc'] == 6
+    assert index.get('S06E030')['abs_vert_acc'] == 13 and index.get('S06E030')['security_code'] == 'U'
+
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-table', table, '--prefer', 'version']) == 0
+    assert 'nothing supplies yet' in capsys.readouterr().err
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-table', table]) == 1
+    assert 'share a cell' in capsys.readouterr().err
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-dted', tmp_dir, '--map', 'x=y']) == 2
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-table', table, '--set', 'cell_id=X']) == 2

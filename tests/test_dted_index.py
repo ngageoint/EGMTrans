@@ -83,7 +83,9 @@ def test_round_trip(tmp_dir, extension):
         for column, value in row.items():
             assert index.rows[cell].get(column) == value, (cell, column)
     row = index.get('s06e030')
-    assert row['compilation_date'] == dt.date(2024, 7, 15) and row['rel_horiz_acc'] is None
+    assert row['compilation_date'] == dt.date(2024, 7, 15)
+    # NULL (or NA) in every row: the column is not written, so the profile supplies the field.
+    assert 'rel_horiz_acc' not in row and 'rel_horiz_acc' not in index.columns
     assert row['extra'] == 'kept'
     assert index.get('N03E008')['maintenance_date'] == dt.date(2009, 6, 1)
     subregions = index.subregions_of('N03E008')
@@ -91,7 +93,9 @@ def test_round_trip(tmp_dir, extension):
     assert subregions[0]['rel_horiz_acc'] is None and subregions[1]['abs_horiz_acc'] == 20
     assert subregions[1]['outline'] == [(3.0, 8.5), (4.0, 8.5), (4.0, 9.0), (3.0, 9.0)]
     assert index.subregions_of('S06E030') == []
-    assert {issue.severity for issue in validate_index(index, level=2)} <= {'info'}
+    issues = validate_index(index, level=2)
+    assert {issue.severity for issue in issues} <= {'info', 'warning'}
+    assert [issue.key for issue in issues if issue.severity == 'warning'] == ['rel_horiz_acc']
 
 
 def test_write_refuses_bad_values(tmp_dir):
@@ -286,7 +290,169 @@ def test_harvest_from_footprints_and_build(tmp_dir):
     write_dted(os.path.join(folder, 'n06e126.dt0'), np.zeros((121, 121), dtype=np.int16), 126, 6)
     updated = build_index(out, from_dted=[folder], update=True, level=0)
     assert len(updated) == 2
-    assert updated.get('N06E126')['producer_code'] is None
+    assert updated.get('N06E126').get('producer_code') is None
     assert updated.get('N06E126')['source_id'] == 'N06E126_DEM'
     assert updated.get('N06E126')['source_file'].endswith('n06e126.dt0')
     assert read_index(out).level == 0
+
+
+def _table_gpkg(path, records, layer='tiles'):
+    """A GeoPackage layer whose fields come from the records' keys (text unless
+    the name says otherwise) and whose polygons are the cells named in 'Cell_ID'."""
+    from osgeo import ogr, osr
+
+    from egmtrans.dted.harvest import CELL_PATTERN
+    from egmtrans.dted.header import parse_cell_id
+
+    driver = ogr.GetDriverByName('GPKG')
+    source = driver.CreateDataSource(path)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    out = source.CreateLayer(layer, srs, ogr.wkbPolygon)
+    kinds = {'ABS_VERT_ACC': ogr.OFTReal, 'data_edition': ogr.OFTInteger, 'version': ogr.OFTInteger,
+             'made': ogr.OFTDateTime}
+    names = list(records[0])
+    for name in names:
+        out.CreateField(ogr.FieldDefn(name, kinds.get(name, ogr.OFTString)))
+    for record in records:
+        feature = ogr.Feature(out.GetLayerDefn())
+        for name in names:
+            if record.get(name) is not None:
+                feature.SetField(name, record[name])
+        match = CELL_PATTERN.search(str(record.get('Cell_ID', '')).upper())
+        if match:
+            lon0, lat0 = parse_cell_id(match.group(1))
+            ring = [(lon0, lat0), (lon0 + 1, lat0), (lon0 + 1, lat0 + 1), (lon0, lat0 + 1), (lon0, lat0)]
+            feature.SetGeometry(ogr.CreateGeometryFromWkt(
+                'POLYGON((' + ', '.join(f'{x} {y}' for x, y in ring) + '))'))
+        out.CreateFeature(feature)
+        feature = None
+    source = None
+    return path
+
+
+def test_rows_from_table_maps_names_coerces_and_prefers(tmp_dir):
+    from egmtrans.dted.harvest import parse_column_map, parse_constants, rows_from_table
+
+    path = _table_gpkg(os.path.join(tmp_dir, 'catalog.gpkg'), [
+        {'Cell_ID': 'tile N06E126 v1', 'ABS_VERT_ACC': 3.0, 'data_edition': 2, 'made': '2024/07/15 10:00:00',
+         'ref': 'A', 'version': 1},
+        {'Cell_ID': 'tile N06E126 v2', 'ABS_VERT_ACC': 6.0, 'data_edition': 3, 'made': '2025/01/10 00:00:00',
+         'ref': 'B', 'version': 2},
+        {'Cell_ID': 'tile S06E030 v1', 'ABS_VERT_ACC': 12.4, 'data_edition': 1, 'made': None, 'ref': 'C', 'version': 1},
+        {'Cell_ID': 'no cell here', 'ABS_VERT_ACC': 1.0, 'data_edition': 1, 'made': None, 'ref': 'D', 'version': 1},
+    ])
+    with pytest.raises(ValueError, match='share a cell.*--prefer'):
+        rows_from_table(path)
+    with pytest.raises(ValueError, match='--cell-field'):
+        rows_from_table(path, column_map={'cell_id': 'Cell_ID'})
+    with pytest.raises(ValueError, match='no column'):
+        rows_from_table(path, column_map=parse_column_map(['notes=missing']), prefer='version')
+    with pytest.raises(ValueError, match='--prefer nope'):
+        rows_from_table(path, prefer='nope')
+
+    imported = rows_from_table(
+        path, column_map=parse_column_map(['compilation_date=made', 'unique_ref_dsi=ref']),
+        constants=parse_constants(['security_code=U', 'producer_code=USTEST', 'rel_horiz_acc=NA']), prefer='version',
+    )
+    assert imported.cell_source == 'column Cell_ID' and imported.layer == 'tiles' and imported.rows_read == 4
+    assert imported.rows_without_cell == 1 and imported.duplicates_resolved == 1
+    assert imported.mapped == {'data_edition': 'data_edition', 'abs_vert_acc': 'ABS_VERT_ACC',
+                               'compilation_date': 'made', 'unique_ref_dsi': 'ref'}
+    assert imported.dropped == ['version'] and imported.constants['rel_horiz_acc'] is None
+    row = imported.rows['N06E126']
+    assert row['abs_vert_acc'] == 6 and row['data_edition'] == 3 and row['compilation_date'] == dt.date(2025, 1, 10)
+    assert row['unique_ref_dsi'] == 'B' and row['security_code'] == 'U' and row['producer_code'] == 'USTEST'
+    other = imported.rows['S06E030']
+    assert other['abs_vert_acc'] == 13 and other['compilation_date'] is None and other['unique_ref_dsi'] == 'C'
+
+    # A constant beats a mapped column of the same name; the cell field's text lands in source_id.
+    by_field = rows_from_table(path, cell_field='Cell_ID', constants={'data_edition': 7}, prefer='version')
+    assert by_field.rows['N06E126']['data_edition'] == 7 and by_field.rows['N06E126']['source_id'] == 'tile N06E126 v2'
+    assert 'data_edition' not in by_field.mapped
+
+    bad = _table_gpkg(os.path.join(tmp_dir, 'bad.gpkg'), [
+        {'Cell_ID': 'N06E126', 'security_code': 'X', 'ABS_VERT_ACC': 1.0, 'data_edition': 1, 'made': None,
+         'ref': 'A', 'version': 1},
+    ])
+    with pytest.raises(ValueError, match=r'row 1 \(N06E126\): security_code <- security_code: .*not one of'):
+        rows_from_table(bad)
+    with pytest.raises(ValueError, match='not an index column'):
+        parse_constants(['cell_id=N06E126'])
+    with pytest.raises(ValueError, match='INDEX_COLUMN=VALUE'):
+        parse_constants(['security_code'])
+    assert parse_constants(['compilation_date=2024-07', 'abs_vert_acc=7.2']) == {
+        'compilation_date': dt.date(2024, 7, 1), 'abs_vert_acc': 8}
+
+
+def test_rows_from_table_reads_parquet_and_the_geometry(tmp_dir):
+    pa = pytest.importorskip('pyarrow')
+    import json
+
+    import pyarrow.parquet as pq
+
+    from egmtrans.dted.harvest import rows_from_table
+
+    rings = [cell_polygon('N06E126'), cell_polygon('S06E030')]
+    table = pa.table({
+        'abs_vert_acc': pa.array([7.2, None], pa.float64()),
+        'data_edition': pa.array([1, 2], pa.int64()),
+        'compilation_date': pa.array([dt.datetime(2024, 7, 15, 10), dt.datetime(2025, 1, 1)], pa.timestamp('s')),
+        'geometry': pa.array([polygon_wkb(ring) for ring in rings], pa.binary()),
+    }).replace_schema_metadata({'geo': json.dumps({
+        'version': '1.1.0', 'primary_column': 'geometry', 'columns': {'geometry': {'encoding': 'WKB'}}})})
+    path = os.path.join(tmp_dir, 'cells.parquet')
+    pq.write_table(table, path)
+    imported = rows_from_table(path)
+    assert imported.cell_source == 'the geometry' and sorted(imported.rows) == ['N06E126', 'S06E030']
+    assert imported.rows['N06E126']['abs_vert_acc'] == 8
+    assert imported.rows['N06E126']['compilation_date'] == dt.date(2024, 7, 15)
+    assert imported.rows['S06E030']['abs_vert_acc'] is None and imported.rows['S06E030']['data_edition'] == 2
+    assert imported.dropped == [] and imported.layer is None
+
+
+@pytest.mark.parametrize('with_lxml', [True, False])
+def test_harvest_xml_tries_xpaths_in_order(tmp_dir, monkeypatch, with_lxml):
+    import sys
+
+    if with_lxml:
+        pytest.importorskip('lxml')
+    else:
+        monkeypatch.setitem(sys.modules, 'lxml', None)
+    profile_path = os.path.join(tmp_dir, 'profile.toml')
+    with open(profile_path, 'w') as handle:
+        handle.write(textwrap.dedent('''\
+            schema = 1
+            [product]
+            dted_level = 2
+            [harvest.xml]
+            sidecar = "{stem}.xml"
+            [harvest.xml.namespaces]
+            q = "urn:example:quality"
+            [harvest.xml.fields]
+            abs_vert_acc = ["//q:measured/q:le90", "//q:estimated/q:le90"]
+            source_id = { xpath = ["//q:id", "//q:name"], pattern = "tile-(.*)" }
+            notes = { xpath = ["//q:note"] }
+        '''))
+    profile = load_profile(profile_path)
+    assert profile.harvest.xml_fields['abs_vert_acc']['xpath'] == ['//q:measured/q:le90', '//q:estimated/q:le90']
+    assert profile.harvest.xml_fields['notes']['xpath'] == '//q:note'
+    cases = (
+        ('a', '<q:estimated><q:le90>3.2</q:le90></q:estimated><q:name>tile-A</q:name>', (4, 'A')),
+        ('b', '<q:measured><q:le90>2.0</q:le90></q:measured><q:estimated><q:le90>9</q:le90></q:estimated>'
+              '<q:id>tile-B</q:id>', (2, 'B')),
+        ('c', '<q:measured><q:le90></q:le90></q:measured><q:estimated><q:le90>5</q:le90></q:estimated>', (5, None)),
+    )
+    for name, body, expected in cases:
+        raster = os.path.join(tmp_dir, f'{name}_N06E126.tif')
+        write_geotiff(raster, np.zeros((121, 121), dtype=np.float32), point_geotransform(126, 6, 121), nodata=-32767)
+        with open(os.path.join(tmp_dir, f'{name}_N06E126.xml'), 'w') as handle:
+            handle.write(f'<q:root xmlns:q="urn:example:quality">{body}</q:root>')
+        row = rows_from_rasters([raster], profile)['N06E126']
+        assert (row['abs_vert_acc'], row['source_id']) == expected, name
+
+    with open(profile_path, 'w') as handle:
+        handle.write('schema = 1\n[harvest.xml.fields]\nabs_vert_acc = ["//q:a", ""]\n')
+    with pytest.raises(ValueError, match='abs_vert_acc: xpath must be'):
+        load_profile(profile_path)

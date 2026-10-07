@@ -263,9 +263,10 @@ def test_update_dted_header_in_a_file(tmp_dir, profile, log_lines):
     final = read_header(path)
     assert final['dsi.vertical_datum'] == 'E08'
     assert final['dsi.data_edition'] == '03' and final['acc.abs_vert_acc'] == '0007' == final['uhl.abs_vert_acc']
-    # An index row's NULL accuracy means NA, whatever the profile says: the
-    # profile's accuracies serve runs without an index.
-    assert final['acc.rel_vert_acc'] == 'NA  ' and final['acc.abs_horiz_acc'] == 'NA  '
+    # Accuracy columns that are NULL in every row are not in the index, so the
+    # profile supplies them; a NULL among values means NA (see
+    # test_index_row_overrides_profile_and_null_means_na).
+    assert final['acc.rel_vert_acc'] == '0008' and final['acc.abs_horiz_acc'] == '0012'
     assert final['dsi.producer_code'] == 'USCNIMA '
     assert final['dsi.security_handling'].strip() == 'PUBLIC SALE/NO RESTRICTION'
     assert final['dsi.series'] == 'DTED0' and final['uhl.lat_points'] == '0121'
@@ -273,3 +274,106 @@ def test_update_dted_header_in_a_file(tmp_dir, profile, log_lines):
         source.for_cell('N07E126')
     with pytest.raises(ValueError, match='Unsupported target datum'):
         update_dted_header(path, 'WGS84')
+
+
+def test_parse_overrides():
+    import datetime as dt
+
+    from egmtrans.dted.writer import parse_overrides
+
+    got = parse_overrides(
+        ['producer_code=USNGA', 'compilation_date=today', 'abs_horiz_acc=NA', 'data_edition=3',
+         ('dsi_free_text', 'from a pair')],
+        today=dt.date(2026, 10, 5),
+    )
+    assert got == {'producer_code': 'USNGA', 'compilation_date': dt.date(2026, 10, 5), 'abs_horiz_acc': None,
+                   'data_edition': 3, 'dsi_free_text': 'from a pair'}
+    assert parse_overrides(['compilation_date=2026-10'])['compilation_date'] == dt.date(2026, 10, 1)
+    assert parse_overrides([]) == {}
+    for bad, reason in [
+        ('dted_level=2', 'use --dted-level'), ('source_id=x', 'catalog column'), ('vertical_datum=E96', 'derived'),
+        ('abs_vert_acc=12.5', 'not an integer'), ('security_code=X', 'not one of'), ('notes', 'FIELD=VALUE'),
+        ('bogus=1', 'not an index column'), ('compilation_date=yesterday', 'not a date'),
+        ('producer_code=TOOLONGPRODUCER', 'longer than'),
+    ]:
+        with pytest.raises(ValueError, match=reason):
+            parse_overrides([bad])
+    with pytest.raises(ValueError, match='given twice'):
+        parse_overrides(['data_edition=1', 'data_edition=2'])
+
+
+def test_overrides_beat_the_index_and_the_profile(profile):
+    import datetime as dt
+
+    from egmtrans.dted.writer import parse_overrides
+
+    row = new_row('N50W001', producer_code='USTEST', abs_horiz_acc=None, compilation_date='2025-01-10')
+    overrides = parse_overrides(
+        ['producer_code=USNGA', 'abs_horiz_acc=9', 'compilation_date=today', 'rel_vert_acc=NA'],
+        today=dt.date(2026, 10, 5),
+    )
+    source = DtedMetadataSource(None, profile, overrides)
+    assert not source.empty and '4 override(s): producer_code=USNGA' in source.describe()
+    assert DtedMetadataSource(None, None, overrides).empty is False and DtedMetadataSource().empty is True
+    header, sources = assemble_header(
+        cell_geometry(-1, 50, 2), metadata=DtedMetadata(row, [], profile, overrides),
+        derived=DerivedFields(vertical_datum='E96'),
+    )
+    assert header['dsi.producer_code'] == 'USNGA   ' and sources['dsi.producer_code'] == 'override'
+    assert header['acc.abs_horiz_acc'] == '0009' and sources['acc.abs_horiz_acc'] == 'override'
+    assert header['dsi.compilation_date'] == '2610' and sources['dsi.compilation_date'] == 'override'
+    assert header['acc.rel_vert_acc'] == 'NA  ' and sources['acc.rel_vert_acc'] == 'override'
+    assert header['dsi.digitizing_system'] == 'SRTM      ' and sources['dsi.digitizing_system'] == 'profile'
+    # Overrides alone do not complete a header: the other required fields still need a source.
+    with pytest.raises(HeaderAssemblyError, match='security_code is required'):
+        assemble_header(cell_geometry(-1, 50, 2), metadata=DtedMetadata(None, [], None, {'producer_code': 'USNGA'}),
+                        derived=DerivedFields(vertical_datum='E96'))
+
+
+def test_overrides_apply_to_a_dted_file(tmp_dir):
+    from egmtrans.dted.writer import parse_overrides
+
+    path = write_dted(os.path.join(tmp_dir, 'n06e126.dt0'), np.full((121, 121), 5, dtype=np.int16), 126, 6)
+    source = DtedMetadataSource(None, None, parse_overrides(['producer_code=USNGA', 'dsi_free_text=rewritten']))
+    update_dted_header(path, 'EGM96', metadata=source.for_cell('N06E126'))
+    after = read_header(path)
+    assert after['dsi.producer_code'] == 'USNGA   ' and after['dsi.free_text'].strip() == 'rewritten'
+    assert after['dsi.vertical_datum'] == 'E96'
+
+
+def test_coverage_and_plan_lines(tmp_dir, profile):
+    from egmtrans.dted.writer import header_plan_lines, parse_overrides
+
+    index_path = os.path.join(tmp_dir, 'index.gpkg')
+    write_index(index_path, {
+        'N03E008': new_row('N03E008', security_code='U', data_edition=2, abs_vert_acc=7, compilation_date='2024-07'),
+        'N04E008': new_row('N04E008', security_code='U', data_edition=3, abs_vert_acc=None, compilation_date='2024-08'),
+    }, level=2)
+    source = DtedMetadataSource.load(index_path, PROFILE, parse_overrides(['producer_code=USNGA']))
+    coverage = source.coverage(2)
+    assert coverage.cells == 2 and coverage.level == 2
+    assert coverage.from_index == ['security_code', 'data_edition', 'compilation_date']
+    assert coverage.partly_from_index == {'abs_vert_acc': 1} and coverage.null_accuracy_cells == 1
+    assert coverage.overrides == ['producer_code']
+    assert coverage.from_profile == ['security_handling', 'match_merge_version', 'product_spec', 'product_spec_amend',
+                                     'product_spec_date', 'digitizing_system', 'abs_horiz_acc', 'rel_horiz_acc',
+                                     'rel_vert_acc', 'dsi_free_text']
+    assert coverage.missing_required == {}
+    summary = coverage.summary()
+    assert summary.startswith(
+        '2 cell(s); level 2; from the index: security_code, data_edition, compilation_date, abs_vert_acc (NULL in 1)')
+    assert 'overridden: producer_code' in summary and summary.endswith('missing: none')
+    # Without the profile, the required fields the index and the overrides do not cover are missing.
+    bare = DtedMetadataSource(source.index, None, source.overrides).coverage(2, cli_abs_horiz_accuracy=5)
+    assert bare.missing_required == {'match_merge_version': 2, 'rel_horiz_acc': 2, 'rel_vert_acc': 2}
+    assert bare.summary().endswith('missing: match_merge_version, rel_horiz_acc, rel_vert_acc')
+
+    header, sources = assemble_header(cell_geometry(8, 3, 2), metadata=source.for_cell('N03E008'),
+                                      derived=DerivedFields(vertical_datum='E96'))
+    lines = header_plan_lines(source.describe(), 'N03E008', 'in/tile.tif', 'out/N03E008.dt2', header, sources, more=1)
+    assert lines[0] == 'DTED header plan'
+    assert lines[1] == ('  metadata: index index.gpkg (2 cells), profile dted_profile_example.toml, '
+                        '1 override(s): producer_code=USNGA')
+    assert lines[2] == '  example: cell N03E008, tile.tif -> N03E008.dt2 (and 1 more)'
+    assert lines[3].startswith('Header fields by source: ')
+    assert "    dsi.producer_code: 'USNGA   ' (override)" in lines and "    acc.abs_vert_acc: '0007' (index)" in lines
