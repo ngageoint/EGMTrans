@@ -26,6 +26,7 @@ from egmtrans.dted.index import (
     new_row,
     parse_polygon_wkb,
     polygon_wkb,
+    polygon_wkt,
     read_index,
     validate_index,
     write_index,
@@ -147,6 +148,81 @@ def test_polygon_helpers():
     ring = cell_polygon('S06E030')
     assert ring == [(30, -6), (31, -6), (31, -5), (30, -5), (30, -6)]
     assert parse_polygon_wkb(polygon_wkb(ring)) == ring[:-1]
+
+
+def _plain_parquet(path, columns, metadata=None):
+    """A GeoParquet file another tool wrote: the columns given, cell polygons, the geo metadata."""
+    pa = pytest.importorskip('pyarrow')
+    import json
+
+    import pyarrow.parquet as pq
+
+    cells = columns['cell_id']
+    arrays = {name: pa.array(values) for name, values in columns.items()}
+    arrays['geometry'] = pa.array([polygon_wkb(cell_polygon(cell)) for cell in cells], pa.binary())
+    geo = {'version': '1.1.0', 'primary_column': 'geometry', 'columns': {'geometry': {'encoding': 'WKB'}}}
+    pq.write_table(pa.table(arrays).replace_schema_metadata({'geo': json.dumps(geo), **(metadata or {})}), path)
+    return path
+
+
+@pytest.mark.parametrize('reader', ['pyarrow', 'gdal'])
+def test_a_file_that_is_not_an_index_is_refused_with_what_it_holds(tmp_dir, monkeypatch, reader):
+    from osgeo import ogr
+
+    if reader == 'gdal' and ogr.GetDriverByName('Parquet') is None:
+        pytest.skip('this GDAL has no Parquet driver')
+    layers = _table_gpkg(os.path.join(tmp_dir, 'catalog.gpkg'), [{'Cell_ID': 'N06E126', 'version': 1}])
+    # A catalog: one row per tile version, none of its columns a header field.
+    catalog = _plain_parquet(os.path.join(tmp_dir, 'catalog.parquet'),
+                             {'tile_id': ['T_N06E126_01'], 'cell_id': ['N06E126'], 'tile_version': [1]})
+    table = _plain_parquet(os.path.join(tmp_dir, 'table.parquet'), {'cell_id': ['N06E126'], 'security_code': ['U']})
+    footprints = os.path.join(tmp_dir, 'footprints.parquet')
+    write_index(footprints, {'N06E126': new_row('N06E126', source_id='N06E126_DEM')}, level=2)
+    if reader == 'gdal':
+        monkeypatch.setattr('egmtrans.dted.index._parquet_available', lambda: False)
+
+    with pytest.raises(ValueError, match=r'^catalog\.gpkg is not a DTED metadata index: it has no dted_cells layer '
+                                         r'\(its layers: tiles\)\. "egmtrans dted-index build --from-table"'):
+        read_index(layers)
+    with pytest.raises(ValueError, match=r'^catalog\.parquet is not a DTED metadata index: it has neither the '
+                                         r'index metadata nor a header column '
+                                         r'\(its columns: tile_id, cell_id, tile_version\)'):
+        read_index(catalog)
+    # A table with header columns but no index metadata is read as before.
+    assert read_index(table).get('N06E126')['security_code'] == 'U'
+    # An index without header columns (built from a footprint layer) has the index metadata.
+    index = read_index(footprints)
+    assert len(index) == 1 and index.level == 2 and index.meta['generator'].startswith('EGMTrans')
+
+
+@pytest.mark.parametrize('extension', FORMATS)
+def test_several_rows_for_one_cell_are_an_error(tmp_dir, extension):
+    path = os.path.join(tmp_dir, f'index.{extension}')
+    write_index(path, sample_rows(), level=2)
+    if extension == 'gpkg':
+        from osgeo import ogr
+
+        source = ogr.Open(path, 1)
+        layer = source.GetLayerByName('dted_cells')
+        feature = ogr.Feature(layer.GetLayerDefn())
+        feature.SetField('cell_id', 'N03E008')
+        feature.SetField('data_edition', 7)
+        feature.SetGeometry(ogr.CreateGeometryFromWkt(polygon_wkt(cell_polygon('N03E008'))))
+        layer.CreateFeature(feature)
+        feature = source = None
+    else:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(path)
+        pq.write_table(pa.concat_tables([table, table.slice(0, 1)]), path)
+    index = read_index(path)
+    assert index.duplicates == {'N03E008': 2} and len(index) == 2
+    errors = [issue for issue in validate_index(index, level=2) if issue.severity == 'error']
+    assert [(issue.key, issue.message) for issue in errors] == [
+        ('cell_id', '1 cell(s) have several rows: N03E008 (2 rows); an index holds one row per cell')]
+    with pytest.raises(ValueError, match=r'several rows for 1 cell\(s\) \(N03E008\)'):
+        build_index(path, from_dted=[], update=True)
 
 
 def test_profile_example_and_errors(tmp_dir):
