@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 TEXT_SUFFIXES = (".py", ".pyt", ".xml", ".md", ".sh", ".toml", ".yml", ".yaml", ".txt", ".dockerignore")
 TEXT_NAMES = ("Dockerfile",)
-SKIP_PREFIXES = ("samples/", "img/", "crs/", "datums/", "EGMTrans_Explorer")
+SKIP_PREFIXES = ("img/", "crs/", "datums/", "EGMTrans_Explorer")
 SKIP_FILES = ("LICENSE", ".pyHistory", "tests/test_spelling.py")
 
 BRITISH = [

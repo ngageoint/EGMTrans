@@ -1,0 +1,79 @@
+# EGMTrans DTED product profile: the header values that are the same for every
+# cell of ONE product. Copy this file, replace every <...> placeholder with the
+# product's own value, and give the result to --dted-profile (or the DTED
+# Product Profile parameter in ArcGIS Pro). A profile that still holds a
+# placeholder is refused, so nothing of this template can reach a header.
+#
+# Keys are the columns of the DTED metadata index (see docs/dted_index.md);
+# a cell's row in the index overrides any of them, field by field. Dates are
+# written as YYMM and must fall in 1980-2079. Sections refer to MIL-PRF-89020B.
+
+schema = 1
+
+[product]
+# 0, 1 or 2: the level this profile is for.
+dted_level = 2
+
+# Security classification code: U, R, C or S (UHL 33, DSI 4).
+security_code = "<U, R, C or S>"
+# Security control and release markings, two characters or blank (DSI 5-6), and
+# the handling description, up to 27 characters (DSI 7-33). Remove a key to
+# leave the field blank.
+security_control = "<two characters, or remove this line>"
+security_handling = "<handling description, up to 27 characters>"
+
+# Unique reference numbers: UHL 36-47 (12 characters, may be blank) and
+# DSI 65-79 (15 characters; zero filled when nothing supplies it).
+unique_ref_uhl = "<up to 12 characters, or remove this line>"
+
+# Data edition 1-99 and match/merge version A-Z (DSI 88-90; 3.13.4.1 d, e).
+data_edition = 1
+match_merge_version = "A"
+
+# Producer code (DSI 103-110; 3.13.4.1 i): the two-letter FIPS 10-4 country
+# code of the producing nation first (US, UK, GM, FR, SP, NL, NO, IT, BE ...;
+# not the ISO code: AU is Austria, GB is Gabon, SE is Seychelles, CH is China
+# in FIPS 10-4), then up to six characters of the producer's own.
+producer_code = "<two FIPS 10-4 letters, then up to six characters>"
+
+# Digitizing or collection system, up to 10 characters (DSI 150-159).
+digitizing_system = "<up to 10 characters>"
+
+# Product specification: PRF89020B for this specification (DSI 127-141).
+product_spec = "PRF89020B"
+product_spec_amend = "00"
+product_spec_date = "2000-05"
+
+# Compilation date, YYYY-MM (DSI 160-163). Usually per cell in the index; this
+# is the fallback for a cell whose row leaves it NULL.
+compilation_date = "<YYYY-MM>"
+
+# Accuracies in whole meters, or "NA" (ACC 4-19): absolute horizontal (CE90),
+# absolute vertical (LE90), relative horizontal, relative vertical. Usually the
+# absolute vertical accuracy comes per cell from the index.
+abs_horiz_acc = "<whole meters, or NA>"
+abs_vert_acc = "<whole meters, or NA>"
+rel_horiz_acc = "<whole meters, or NA>"
+rel_vert_acc = "<whole meters, or NA>"
+
+# Free text of up to 156 characters (DSI 493-648). Remove the key to leave it blank.
+dsi_free_text = "<free text, or remove this line>"
+
+# The harvest mappings are optional: "egmtrans dted-index build --from-rasters"
+# uses them to fill per-cell index columns from raster tags and XML sidecars.
+# Remove this part when the index comes from a catalog export.
+
+[harvest.tags.fields]
+source_date = "TIFFTAG_DATETIME"
+
+[harvest.xml]
+# Relative to the raster's folder; {stem}, {name}, {cell} and {dir} are replaced.
+sidecar = "{stem}.xml"
+
+[harvest.xml.namespaces]
+gmd = "http://www.isotc211.org/2005/gmd"
+gco = "http://www.isotc211.org/2005/gco"
+
+[harvest.xml.fields]
+source_id = "//gmd:fileIdentifier/gco:CharacterString"
+compilation_date = "//gmd:identificationInfo//gmd:CI_Citation/gmd:date/gmd:CI_Date/gmd:date/gco:Date"

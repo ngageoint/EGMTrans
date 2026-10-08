@@ -14,6 +14,9 @@ from typing import TypedDict
 
 SUPPORTED_EXTENSIONS = ('.tif', '.tiff', '.dt0', '.dt1', '.dt2')
 DTED_EXTENSIONS = ('.dt0', '.dt1', '.dt2')
+# The root folder of a standard DTED delivery (MIL-PRF-89020B 3.10.7.2:
+# "\DTED\E127\N38.dt1"), spelled as the specification spells it.
+DTED_ROOT = 'DTED'
 DTED_NODATA = -32767  # MIL-PRF-89020B void value; DTED bands are Int16
 INVALID_CHARACTERS = '<>:"/\\|?*'
 # Matched anywhere in the lower-cased filename.
@@ -105,6 +108,23 @@ def get_datums_dir() -> str:
 def get_crs_dir() -> str:
     """Return the path to the ``crs/`` directory containing the local PROJ database."""
     return os.path.join(BASE_PATH, 'crs')
+
+
+# The one vertical datum DTED is written in. MIL-PRF-89020B 3.2.2: "Vertical
+# Datum shall be Mean Sea Level (MSL) as determined by the Earth Gravitational
+# Model (EGM) 1996"; 3.13.4.1 m knows the codes MSL and E96 only. E08 stays in
+# DATUM_MAPPING so that EGM2008 DTED made by earlier versions can be read.
+DTED_TARGET_DATUM = 'EGM96'
+
+
+def dted_target_problem(target_datum: str) -> str | None:
+    """Why *target_datum* cannot be the datum of a DTED output, or None for EGM96."""
+    if target_datum == DTED_TARGET_DATUM:
+        return None
+    return (
+        f'DTED is written in EGM96 only: MIL-PRF-89020B 3.2.2 names mean sea level as determined by EGM96 as '
+        f'the vertical datum, not {target_datum}. Choose EGM96 as the target datum, or write GeoTIFF.'
+    )
 
 
 def required_grids(src_datum: str, tgt_datum: str) -> list[str]:
@@ -202,7 +222,6 @@ def configure_gdal() -> None:
       ``proj.db`` is used instead.
     - Sets ``GDAL_CACHEMAX`` to 512 MB for faster I/O with temporary files.
     - Suppresses GDAL FutureWarnings and enables GDAL exceptions.
-    - Prevents ArcPy from creating ``.aux.xml`` sidecar files.
     """
     from osgeo import gdal
 
@@ -219,5 +238,3 @@ def configure_gdal() -> None:
     # guards with `if ds is None` — such a check would be unreachable, and the
     # GDAL exception message is more informative than anything we could raise.
     gdal.UseExceptions()
-
-    os.environ["ARCPY_NO_AUX_XML"] = "TRUE"

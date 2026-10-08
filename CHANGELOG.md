@@ -7,11 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `egmtrans dmed` and the Build DMED tool write the DMED volume file of a DTED delivery (MIL-PRF-89020B 3.9.5): the bounding rectangle, then for every cell its edition, match/merge version and the minimum, maximum, mean and standard deviation of each 15-minute area. `--check` compares an existing DMED with the cells.
+- A DTED0 cell is written with its `.avg`, `.min` and `.max` companion files (3.9.3), computed from the DTED1 grid of the same run; the header report accepts them.
+- The toolbox's Output Format (DTED2, DTED1, DTED0 or GeoTIFF) replaces the DTED Level parameter and refreshes the dialog: for a DTED format the Target Datum and Interpolation Algorithm lists hold EGM96 and bilinear only, the DTED parameters apply, and a DTED file input selects its own level; a file name that contradicts the format, a DTED input at another level, and a source datum the input's header contradicts are reported before Run.
+- DTED Output Naming is a dropdown (DTED standard, Cell name, Input name, Custom template) with a Naming Template box, and a message shows where a cell would be written.
+- `--skip-existing` (Skip Existing Cells in the toolbox): a planned output that already exists and verifies is left alone, so a cancelled or failed run can be rerun without redoing the cells it wrote. Cancel in ArcGIS Pro, and Ctrl-C in a terminal, stop a run between cells.
+- The producer nation code is checked against the FIPS 10-4 country codes: an unknown code is a warning, and the ISO codes that are other countries in FIPS 10-4 (AU, GB, SE, CH, DE) are warned about with both readings.
+- A product profile template, `docs/dted_profile_template.toml`, whose placeholders are refused until they are filled.
+- Reference pages under `docs/` for the metadata index, water bodies, the interpolation algorithms, the Explorer and reproducibility.
+
+### Changed
+
+- DTED is written in EGM96 only, as MIL-PRF-89020B 3.2.2 requires; an EGM2008 target, which earlier versions allowed, is refused before anything runs. Reading EGM2008 (`E08`) DTED stays.
+- DTED made from GeoTIFF lands in the standard tree by default, `DTED/E006/N49.dt2`; `--dted-naming stem` gives the old layout. Masks are named for their source tile and sit beside their cell.
+- A DTED input must be at the level given with `--dted-level`; it was kept at its own level without notice.
+- The README is organized bottom line up front: quick starts for ArcGIS Pro and the command line, recipes, offline setup, then reference; the long reference material moved to `docs/`.
+- The toolbox labels are short, with the explanations in the help popups, and the DTED parameters form one group; the help files match the toolbox.
+- The log file is appended, with a banner per run, and written in UTF-8.
+
 ### Fixed
 
 - A DTED metadata index with several rows for one cell is an error; one of the rows was used without notice.
 - A GeoParquet file with neither the index metadata nor a header column, such as a catalog, is refused as a DTED metadata index; it was read as one, and every header field came from the profile. A GeoPackage without the `dted_cells` layer is refused with a message that lists its layers.
 - Without pyarrow, the metadata of a GeoParquet index (its level) is read through GDAL.
+- The toolbox fetches only the geoid grids a run needs, so a closed network that holds the two one-arc-minute grids runs offline.
+- An output folder inside the input folder is refused; the run copied its own outputs without end.
+- Every input's vertical datum is compared with the source datum before anything is written, and a context tile in another datum is left out; only the first file was checked.
+- Outputs that a rerun will replace are listed first; a cell that fails leaves no earlier file under its name; the DEMs of the input tree and their pyramid sidecars are no longer copied before the transform, and an interrupted write leaves no partial file under a final name.
+- A drive or share root is accepted as the output folder.
+- Files that cannot be read and folders that cannot be listed are reported and counted instead of skipped as "not a DEM".
+- `--export-water-levels` is checked before the run; a water-level table re-saved by a spreadsheet (byte order mark, semicolons, decimal commas) is accepted or told what is wrong.
+- The toolbox messages say when a run stopped before writing, tracebacks go to the log file, metadata errors land on the parameter concerned, a cleared Minimum Patch Size falls back to the default, and a DTED output is not added to the map (a layer locked it and wrote a sidecar).
+- A download that gets no answer times out instead of hanging ArcGIS Pro.
+- A blank producer code no longer counts as supplied; a date outside 1980-2079, which the header cannot carry, is refused; a GeoTIFF without a declared NoData value that holds -9999 or values at or below -12,000 m is refused for DTED (a mask band is honored); the level a file name claims is checked when the file is written; the DSI unique reference is zero filled when nothing supplies it; cells a raster covers only in part are listed.
+- Without flattening, or with WGS84 as either datum, the context folder and the water-level table are reported as ignored instead of read.
+
+### Removed
+
+- The sample data.
+- The `ARCPY_NO_AUX_XML` setting, which nothing read.
 
 ## [1.9.0] - 2026-10-06
 
@@ -167,7 +203,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI auto-download of geoid grids: both `egmtrans` and `python EGMTrans.py` now fetch any missing grid files from GitHub Releases on first run, matching the behavior previously available only in the ArcGIS Pro toolbox.
 - `tests/test_accuracy.py`: numerical regression tests that pin `create_datum_array` output at six global control points (Atlantic, Washington DC, Cape Town, Mt Everest, New Guinea, central Greenland) against the real geoid grids, plus a full round-trip EGM96 → EGM2008 → EGM96 sanity check. Tests skip cleanly if the grid files are absent.
 - `SECURITY.md` documenting the HTTPS + SHA-256 grid download model, network egress expectations, and the static attack surface.
-- `CONTRIBUTING.md` covering dev setup, test/lint commands, and the commit attribution rule for AI assistants.
 - GitHub Actions CI (`.github/workflows/ci.yml`) running `ruff check` and `pytest` on Python 3.11 and 3.12 against a cached copy of the geoid grids.
 - README "Grid provenance" subsection explaining how the 1-arc-minute grids were computed directly from the EGM96/EGM2008 spherical harmonic coefficients via NGA's Fortran executables (`hsynth_WGS84`, `f477_bin`, `clenqt_bin`) and validated against Nikolaos Pavlis's 1-arc-minute reference binary.
 

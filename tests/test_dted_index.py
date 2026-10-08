@@ -35,7 +35,7 @@ from egmtrans.dted.profile import load_profile
 from tests.conftest import point_geotransform, write_dted, write_geotiff
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'data', 'srtm_n03e008_header.bin')
-PROFILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'samples', 'dted_profile_example.toml')
+PROFILE = os.path.join(os.path.dirname(__file__), 'data', 'dted_profile.toml')
 
 
 def _parquet_possible():
@@ -359,7 +359,7 @@ def test_harvest_from_footprints_and_build(tmp_dir):
     index = build_index(out, from_footprints=footprints, cell_field='item_name', profile=load_profile(PROFILE),
                         product='DTED2')
     assert len(index) == 2 and index.level == 2 and index.meta['product'] == 'DTED2'
-    assert index.meta['profile'] == 'dted_profile_example.toml'
+    assert index.meta['profile'] == 'dted_profile.toml'
 
     folder = os.path.join(tmp_dir, 'dted')
     os.makedirs(folder)
@@ -532,3 +532,31 @@ def test_harvest_xml_tries_xpaths_in_order(tmp_dir, monkeypatch, with_lxml):
         handle.write('schema = 1\n[harvest.xml.fields]\nabs_vert_acc = ["//q:a", ""]\n')
     with pytest.raises(ValueError, match='abs_vert_acc: xpath must be'):
         load_profile(profile_path)
+
+
+def test_header_dates_keep_to_the_readers_century_but_catalog_dates_do_not():
+    assert '1980-2079' in check_value(COLUMNS_BY_NAME['compilation_date'], '1975-06')
+    assert '1980-2079' in check_value(COLUMNS_BY_NAME['maintenance_date'], dt.date(2080, 1, 1))
+    assert check_value(COLUMNS_BY_NAME['compilation_date'], '2024-07') is None
+    assert check_value(COLUMNS_BY_NAME['source_date'], '1975-06') is None, 'a catalog date may hold any year'
+
+
+def test_a_blank_required_value_is_null_and_reported(tmp_dir):
+    from egmtrans.dted.index import normalize_value
+
+    column = COLUMNS_BY_NAME['producer_code']
+    assert normalize_value(column, '   ') is None and normalize_value(column, 'USNGA') == 'USNGA'
+    assert normalize_value(COLUMNS_BY_NAME['dsi_free_text'], '   ') == '   ', 'optional text keeps its blanks'
+    index = DtedIndex(path='<memory>', rows={
+        'N06E126': new_row('N06E126', security_code='U', data_edition=1, match_merge_version='A',
+                           compilation_date='2024-07', producer_code='  ', abs_horiz_acc=3, abs_vert_acc=3,
+                           rel_horiz_acc=3, rel_vert_acc=3),
+        'N06E127': new_row('N06E127', security_code='U', data_edition=1, match_merge_version='A',
+                           compilation_date='2024-07', producer_code=None, abs_horiz_acc=3, abs_vert_acc=3,
+                           rel_horiz_acc=3, rel_vert_acc=3),
+    })
+    issues = validate_index(index)
+    blank = [issue for issue in issues if issue.key == 'producer_code' and 'NULL or blank' in issue.message]
+    assert len(blank) == 1 and blank[0].severity == 'warning'
+    assert 'N06E126' in blank[0].message and 'N06E127' in blank[0].message
+    assert 'the profile must supply it' in blank[0].message

@@ -14,20 +14,19 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil
 import sys
-import time
 
 from osgeo import gdal
 
 from egmtrans import _state
 from egmtrans._version import __version__
 from egmtrans.arcpy_compat import init_arcpy
-from egmtrans.batch import plan_units, run_batch
+from egmtrans.batch import plan_units, run_batch, writable_file_problem
 from egmtrans.cli_dted import SUBCOMMANDS
 from egmtrans.config import (
     DTED_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    dted_target_problem,
     get_datums_dir,
     normalize_datum,
     required_grids,
@@ -39,6 +38,7 @@ from egmtrans.dted.header import CellGeometry, read_header
 from egmtrans.dted.validate import count as count_issues
 from egmtrans.dted.writer import DtedMetadataSource, header_plan_lines, parse_overrides
 from egmtrans.file_utils import (
+    DEFAULT_DTED_NAMING,
     DTED_NAMING_PRESETS,
     IOPaths,
     dted_naming_template,
@@ -47,7 +47,7 @@ from egmtrans.file_utils import (
     resolve_io_paths,
 )
 from egmtrans.flattening import DEFAULT_CONTAINMENT
-from egmtrans.logging_setup import end_logger, setup_logger
+from egmtrans.logging_setup import end_logger, log_traceback, setup_logger
 from egmtrans.numba_utils import NUMBA_AVAILABLE
 from egmtrans.tiling import TileLevels
 from egmtrans.transform import transform_vertical_datum
@@ -145,34 +145,6 @@ def confirm(question: str, assume_yes: bool = False) -> bool:
     return str2bool(answer)
 
 
-def delete_output_directory(output_dir: str, max_retries: int = 3, retry_delay: float = 1.0) -> bool:
-    """Safely delete an output directory with retry mechanism.
-
-    Shuts down the logger first so file handles are released, then retries
-    deletion up to *max_retries* times with a delay between attempts (GDAL
-    and ArcPy may not release handles immediately).
-
-    Returns:
-        True if deletion succeeded, False if all attempts failed.
-    """
-    logger = _state.get_logger()
-    end_logger()
-
-    for attempt in range(max_retries):
-        try:
-            time.sleep(retry_delay)
-            shutil.rmtree(output_dir)
-            print("Output directory was deleted.")
-            return True
-        except Exception as e:
-            logger.error(f"Attempt {attempt + 1} of {max_retries} failed: Could not delete output directory: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-
-    logger.error(f"All {max_retries} attempts to delete the output directory failed.")
-    return False
-
-
 def _configure_runtime(arc_mode: bool) -> None:
     """Set up logging, the ArcGIS mode flag and ArcPy once per run."""
     logger = _state.get_logger()
@@ -186,6 +158,23 @@ def _configure_runtime(arc_mode: bool) -> None:
         log_numba_availability()
     elif not NUMBA_AVAILABLE:
         logger.warning("Numba is not available. Processing will be slower.")
+
+
+def file_datum_of(input_file: str) -> str | None:
+    """The vertical datum *input_file* declares: EGM96 or EGM2008 from the DSI
+    code of a DTED header (MSL counts as EGM96; read from the raw bytes, since
+    GDAL would answer from a stale ``.aux.xml`` sidecar), or the name of a
+    GeoTIFF's vertical CRS; None when it declares none.
+
+    Raises:
+        OSError, ValueError, RuntimeError: If the file cannot be opened or read.
+    """
+    if input_file.lower().endswith(DTED_EXTENSIONS):
+        code = read_header(input_file).stripped('dsi.vertical_datum')
+        return 'EGM96' if code in ('E96', 'MSL') else 'EGM2008' if code == 'E08' else None
+    with gdal.Open(input_file, gdal.GA_ReadOnly) as input_ds:
+        projection = input_ds.GetProjection()
+    return standardize_srs(projection).GetAttrValue('VERT_CS')
 
 
 def check_file_datum(
@@ -213,26 +202,10 @@ def check_file_datum(
 
     # gdal.UseExceptions() is on, so a failed open raises rather than returning None.
     try:
-        with gdal.Open(input_file, gdal.GA_ReadOnly) as input_ds:
-            projection = input_ds.GetProjection()
-    except RuntimeError as e:
-        logger.error(f'Failed to open input file {input_file}: {e}')
+        file_datum = file_datum_of(input_file)
+    except (OSError, ValueError, RuntimeError) as e:
+        logger.error(f'Failed to read the vertical datum of {input_file}: {e}')
         return False
-    logger.debug(f"Input file's projection: {projection}")
-    src_srs = standardize_srs(projection)
-    logger.debug(f"Input file's SRS: {src_srs}")
-
-    if input_file.lower().endswith(DTED_EXTENSIONS):
-        # From the raw header: GDAL would answer from a .aux.xml sidecar if one
-        # is there, and a stale sidecar can say anything.
-        try:
-            code = read_header(input_file).stripped('dsi.vertical_datum')
-        except (OSError, ValueError) as e:
-            logger.error(f'Failed to read the DTED header of {input_file}: {e}')
-            return False
-        file_datum = 'EGM96' if code in ('E96', 'MSL') else 'EGM2008' if code == 'E08' else None
-    else:
-        file_datum = src_srs.GetAttrValue('VERT_CS')
     logger.info(f"Input file header's vertical datum: {file_datum}")
 
     if file_datum and source_datum not in file_datum and prompt:
@@ -347,6 +320,7 @@ def process_file(
     *,
     dted_cell: CellGeometry | None = None,
     dted_plan: bool = True,
+    mask_file: str | None = None,
 ) -> bool:
     """Process a single file for vertical datum transformation, or convert a
     GeoTIFF cell to DTED.
@@ -355,7 +329,7 @@ def process_file(
     :func:`~egmtrans.transform.transform_vertical_datum`:
 
     1. Validates file format and accessibility.
-    2. Checks datum compatibility (DTED cannot target WGS84, etc.), that a
+    2. Checks datum compatibility (DTED is written in EGM96 only), that a
        DTED output uses the bilinear algorithm (see :data:`DTED_REQUIRES_BILINEAR`),
        and that a DTED input is not written at another level.
     3. For a GeoTIFF written as DTED, finds the cell to convert
@@ -391,6 +365,8 @@ def process_file(
         dted_plan: Log the DTED header plan (the example header and the
             source of every supplied field) and, in CLI mode, ask before
             going on. A batch run shows the plan once itself and passes False.
+        mask_file: Where the flat mask goes; the default name otherwise
+            (see :func:`~egmtrans.file_utils.mask_output_name`).
 
     Returns:
         ``True`` if the file was transformed, ``False`` if the transformation
@@ -406,6 +382,11 @@ def process_file(
 
     if not is_valid_dem(input_file):
         logger.error(f"Skipping {os.path.basename(input_file)} as it's not a DEM.\n")
+        return False
+    if min_patch_size is None or int(min_patch_size) < 1:
+        logger.error(
+            f'The minimum patch size must be at least 1 post, not {min_patch_size!r}.\nAborting transformation.'
+        )
         return False
 
     input_is_dted = input_file.lower().endswith(DTED_EXTENSIONS)
@@ -431,9 +412,11 @@ def process_file(
         logger.error(f'{e}\nAborting transformation.')
         return False
 
-    if output_is_dted and target_datum == 'WGS84':
-        logger.error('DTED data can only be in EGM2008 or EGM96, not WGS84.\nAborting transformation.')
-        return False
+    if output_is_dted:
+        problem = dted_target_problem(target_datum)
+        if problem:
+            logger.error(f'{problem}\nAborting transformation.')
+            return False
 
     if output_is_dted and algorithm != 'bilinear':
         message = (
@@ -504,6 +487,10 @@ def process_file(
 
     if (source_datum == 'WGS84' or target_datum == 'WGS84') and flatten:
         logger.info("Flattening is not supported for WGS84 ellipsoid height transforms. Proceeding without flattening.")
+        if create_mask:
+            logger.warning(
+                'No mask is written for a WGS84 transform: nothing is flattened, so there is nothing to mask.'
+            )
         flatten = False
 
     if not check_same_datum(input_file, source_datum, target_datum, arc_mode, assume_yes, converting=cell is not None):
@@ -514,10 +501,11 @@ def process_file(
             input_file, output_file, source_datum, target_datum,
             flatten, create_mask, min_patch_size, algorithm,
             abs_horiz_accuracy, save_log, tile_levels=tile_levels, min_containment=min_containment,
-            dted_metadata=dted_metadata, cell=cell,
+            dted_metadata=dted_metadata, cell=cell, mask_file=mask_file,
         )
     except Exception as e:
         logger.error(f"Transformation failed: {e}.")
+        log_traceback()
         return False
 
     return True
@@ -552,7 +540,7 @@ def main() -> None:
     )
     parser.add_argument(
         "-t", "--target_datum", required=True, type=datum_arg,
-        help="Target vertical datum (WGS84, EGM96, or EGM2008)",
+        help="Target vertical datum (WGS84, EGM96, or EGM2008; DTED output is EGM96 only)",
     )
     parser.add_argument(
         "-f", "--flatten", required=False, type=str2bool, nargs='?', const=True, default=True,
@@ -594,8 +582,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--context", action="append", default=[], metavar="FOLDER",
-        help="Folder of neighboring tiles to analyze but not transform, so that a water body which "
-             "continues into them gets the level a run including them would give it. May be repeated.",
+        help="Additional tiles that constrain the input: read and analyzed with it, never processed or written, "
+             "so that a water body which continues into them gets the level a run including them would give "
+             "it. Use it for neighbors produced in another run; the input's own tiles are always analyzed "
+             "together, tiles that are also in the input are skipped, and the tiles must be in the source "
+             "datum. May be repeated.",
     )
     parser.add_argument(
         "--water-levels", metavar="FILE",
@@ -618,16 +609,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--dted-level", type=int, choices=[0, 1, 2], default=None,
-        help="Write every GeoTIFF input as DTED of this level, one file per whole one-degree cell it covers "
-             "(DTED inputs keep their level). The GeoTIFF must lie on the whole-degree lattice, as TanDEM-X "
-             "tiles do. A .dt0/.dt1/.dt2 output name for a single GeoTIFF needs no level.",
+        help="Write every GeoTIFF input as DTED of this level, one file per whole one-degree cell it covers; "
+             "a DTED input must be at this level. The GeoTIFF must lie on the whole-degree lattice, as "
+             "TanDEM-X tiles do. A .dt0/.dt1/.dt2 output name for a single GeoTIFF needs no level.",
     )
     parser.add_argument(
-        "--dted-naming", default="stem", metavar="NAME|TEMPLATE",
-        help="How DTED cells made from GeoTIFF are named under the output folder: "
+        "--dted-naming", default=DEFAULT_DTED_NAMING, metavar="NAME|TEMPLATE",
+        help="How DTED cells made from GeoTIFF are laid out under the output folder: "
              + ", ".join(f"'{k}' ({v})" for k, v in DTED_NAMING_PRESETS.items())
              + ", or a template with {stem}, {dir}, {cell}, {lat}, {lon} and {level}; the extension is added "
-             "(default: stem).",
+             f"(default: {DEFAULT_DTED_NAMING}, the standard DTED/E006/N49.dt2 tree of MIL-PRF-89020B 3.10.7.2).",
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Leave a planned output that already exists and verifies as finished alone, so a cancelled or "
+             "failed run can be rerun without redoing the cells it wrote.",
     )
     parser.add_argument(
         "--dted-set", action="append", default=[], metavar="FIELD=VALUE",
@@ -650,6 +646,10 @@ def main() -> None:
             parser.error(f"--context folder does not exist: {folder}")
     if args.water_levels and not os.path.isfile(args.water_levels):
         parser.error(f"--water-levels file does not exist: {args.water_levels}")
+    if args.export_water_levels:
+        problem = writable_file_problem(args.export_water_levels, "--export-water-levels")
+        if problem:
+            parser.error(problem)
     for option, path in (("--dted-index", args.dted_index), ("--dted-profile", args.dted_profile)):
         if path and not os.path.isfile(path):
             parser.error(f"{option} file does not exist: {path}")
@@ -661,6 +661,18 @@ def main() -> None:
         dted_metadata = DtedMetadataSource.load(args.dted_index, args.dted_profile, overrides)
     except (OSError, ValueError, RuntimeError) as e:
         parser.error(str(e))
+    # DTED is written in EGM96 only (MIL-PRF-89020B 3.2.2): said before anything
+    # runs when the arguments already show that DTED will be written. A folder
+    # of DTED inputs is caught by the batch planner.
+    writes_dted = (
+        paths.dted_level is not None
+        or paths.input_path.lower().endswith(DTED_EXTENSIONS)
+        or paths.output_path.lower().endswith(DTED_EXTENSIONS)
+    )
+    if writes_dted:
+        problem = dted_target_problem(args.target_datum)
+        if problem:
+            parser.error(problem)
 
     try:
         prepare_output_target(paths)
@@ -724,6 +736,15 @@ def main() -> None:
         )
         end_logger(save_log=args.log_file)
         sys.exit(2)
+    except KeyboardInterrupt:
+        logger.error("Stopped by the user.")
+        end_logger(save_log=args.log_file)
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"EGMTrans stopped: {e}")
+        log_traceback()
+        end_logger(save_log=args.log_file)
+        sys.exit(1)
 
     if exit_code:
         logger.error("Processing completed with errors.")
@@ -731,19 +752,6 @@ def main() -> None:
         logger.info("Processing completed.")
     end_logger(save_log=args.log_file)
     sys.exit(exit_code)
-
-
-def _may_offer_delete(input_path: str, output_path: str) -> bool:
-    """Whether deleting the output folder after an empty run could not touch
-    the inputs: never when the two folders are the same or one holds the other."""
-    source = os.path.normcase(os.path.abspath(input_path))
-    target = os.path.normcase(os.path.abspath(output_path))
-    try:
-        if os.path.commonpath([source, target]) in (source, target):
-            return False
-    except ValueError:
-        return True
-    return True
 
 
 def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) -> int:
@@ -768,39 +776,14 @@ def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) 
             context_folders=args.context, water_levels=args.water_levels,
             export_water_levels=args.export_water_levels, min_containment=args.containment,
             dted_metadata=getattr(args, 'dted_metadata', None),
-            dted_level=paths.dted_level, dted_naming=args.dted_naming,
+            dted_level=paths.dted_level, dted_naming=args.dted_naming, skip_existing=args.skip_existing,
         )
         exit_code = result.exit_code
 
-        if paths.mode == 'folder' and result.files_processed == 0 and _may_offer_delete(args.input, args.output):
+        if paths.mode == 'folder' and result.files_processed == 0 and not result.skipped_existing:
             logger.info(
-                f"NOTE: No DEM under {args.input} was transformed. The output directory "
-                f"{args.output} holds at most copies of the other files."
+                f"No DEM under {args.input} was transformed. The output folder {args.output} keeps the log of "
+                f"this run and whatever it held before."
             )
-            if _state.get_arc_mode():
-                success = delete_output_directory(args.output, 3, 1.0)
-                if success:
-                    logger.info("Output directory deleted successfully.")
-                else:
-                    logger.error("Failed to delete output directory.")
-            else:
-                # --yes covers the datum prompts only: deleting a folder needs a human answer.
-                try:
-                    delete = confirm("Do you wish to delete the output directory?")
-                except NonInteractiveError:
-                    delete = False
-                if delete:
-                    success = delete_output_directory(args.output, 3, 1.0)
-                    if success:
-                        print("Output directory deleted successfully.")
-                        logger.info("Output directory deleted successfully.")
-                    else:
-                        print("Failed to delete output directory.")
-                        logger.info("Failed to delete output directory.")
-                else:
-                    print("Output directory with copied files was retained, but files were not transformed.")
-                    logger.info(
-                        "Output directory with copied files was retained, but files were not transformed."
-                    )
 
     return exit_code

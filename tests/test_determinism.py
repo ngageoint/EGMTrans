@@ -23,16 +23,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PER_DEGREE = 300
 LON0, LAT0 = 30, 85
 
-# Pinned on the reference host: the same-datum conversion of source_tile()
-# (resampling, water, low spots, rounding and the header, with no geoid grid)
-# and the EGM2008 to EGM96 conversion. Regenerate them with the self-test's
-# reference whenever the conversion is meant to change.
+# Pinned on the reference host: the same-datum (EGM96 to EGM96) conversion of
+# source_tile() (resampling, water, low spots, rounding and the header, with
+# no geoid grid) and the EGM2008 to EGM96 conversion; the header is the same
+# in both, since both are written as E96. Regenerate them by running convert()
+# on source_tile() whenever the conversion is meant to change.
 PINNED_SAME_DATUM = (
-    'a7e77798fe5df0b5912218317b398cda081d81f13e80cd63412cb4c59658a62e',
+    'ae88b8fa87e3fa3787dd25f3c0af53fb7365d2ad5fb6bd2188735a83ba65efef',
     'dc3c290867199adea673864d154fc666ae6e60355cb67705f623707882ac2855',
 )
 PINNED_WITH_SHIFT = (
-    '3902ab6c42d4b4a6bbb9cc44121870761d3c832032528dc767b39a82b8c7fd31',
+    'ae88b8fa87e3fa3787dd25f3c0af53fb7365d2ad5fb6bd2188735a83ba65efef',
     'a56c15daded8594d18ddbc58ad7a1a7ba7755f94d87d718199d4f30a57ed3859',
 )
 
@@ -76,7 +77,7 @@ def metadata(level=2):
     return DtedMetadataSource(None, Profile(path='<test>', product=product, harvest=HarvestConfig()))
 
 
-def convert(src, out, level=2, src_datum='EGM2008', tgt_datum='EGM2008'):
+def convert(src, out, level=2, src_datum='EGM96', tgt_datum='EGM96'):
     transform_vertical_datum(
         src, out, src_datum, tgt_datum, True, False, 400, 'bilinear', None, False,
         dted_metadata=metadata(level), cell=CellGeometry(level, LON0, LAT0),
@@ -161,9 +162,9 @@ class TestWithGrids:
         transform._verified_grids.clear()
         monkeypatch.setattr(transform, 'verify_checksum', lambda path, expected: False)
         with pytest.raises(ValueError, match='does not match its published checksum'):
-            convert(source, str(tmp_path / 'N85E030.dt2'), tgt_datum='EGM96')
+            convert(source, str(tmp_path / 'N85E030.dt2'), src_datum='EGM2008', tgt_datum='EGM96')
         assert not os.path.exists(tmp_path / 'N85E030.dt2')
         transform._verified_grids.clear()
         monkeypatch.undo()
-        header, records = convert(source, str(tmp_path / 'N85E030.dt2'), tgt_datum='EGM96')
+        header, records = convert(source, str(tmp_path / 'N85E030.dt2'), src_datum='EGM2008', tgt_datum='EGM96')
         assert (header, records) == PINNED_WITH_SHIFT

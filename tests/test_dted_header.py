@@ -252,3 +252,18 @@ def test_write_header_guards_the_data_sentinel(tmp_dir, srtm_bytes):
         handle.write(b'UHL1' * 10)
     with pytest.raises(ValueError, match='too short'):
         read_header(short)
+
+
+def test_dates_outside_the_readers_century_are_refused():
+    assert to_yymm('1980-01') == '8001' and to_yymm('2079-12') == '7912'
+    assert yymm_to_iso('8001') == '1980-01' and yymm_to_iso('7912') == '2079-12'
+    for value in ('1975-06', '2080-01', dt.date(2207, 1, 1), '1899-12-31'):
+        with pytest.raises(ValueError, match='1980-2079'):
+            to_yymm(value)
+    assert yymm_to_iso('7506') == '2075-06', 'the reader is unchanged: it assumes the century'
+
+
+def test_the_dsi_unique_reference_is_zero_filled_by_default():
+    header = new_header(cell_geometry(6, 49, 2))
+    assert header['dsi.unique_ref'] == '0' * 15 and header['uhl.unique_ref'] == ' ' * 12
+    assert not any(issue.key == 'unique_ref' for issue in validate_header(header))

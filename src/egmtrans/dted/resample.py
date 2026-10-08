@@ -125,6 +125,22 @@ class SourceGrid:
             for lon0 in range(lon_first, lon_last + 1)
         ]
 
+    def partial_cells(self) -> list[tuple[int, int]]:
+        """Every whole-degree cell ``(lon0, lat0)`` the raster touches without
+        posts on all four of its edges, north to south and west to east: the
+        cells :meth:`cells` leaves out, so a run can say so."""
+        whole = set(self.cells())
+        lon_first = self.west // self.per_degree_x
+        lon_last = -(-self.east // self.per_degree_x) - 1
+        lat_first = self.south // self.per_degree_y
+        lat_last = -(-self.north // self.per_degree_y) - 1
+        return [
+            (lon0, lat0)
+            for lat0 in range(lat_last, lat_first - 1, -1)
+            for lon0 in range(lon_first, lon_last + 1)
+            if (lon0, lat0) not in whole
+        ]
+
     def window(self, lon0: int, lat0: int) -> tuple[slice, slice]:
         """The row and column slices of the cell's posts, edges included.
 

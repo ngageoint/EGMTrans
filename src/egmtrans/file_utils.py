@@ -15,6 +15,7 @@ import re
 import shutil
 import stat
 import string
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from osgeo import gdal
@@ -23,6 +24,7 @@ from egmtrans import _state
 from egmtrans.config import (
     AUXILIARY_LAYER_CODES,
     DTED_EXTENSIONS,
+    DTED_ROOT,
     INVALID_CHARACTERS,
     INVALID_FILENAME_SUBSTRINGS,
     SUPPORTED_EXTENSIONS,
@@ -70,9 +72,19 @@ class IOPaths:
 # Output names of converted cells: presets by name, or a template with the
 # placeholders {stem} (the input's name without extension), {dir} (the
 # input's folder relative to the input folder), {cell} (N49E006), {lat}
-# (N49), {lon} (E006) and {level}. The extension is appended.
-DTED_NAMING_PRESETS = {'stem': '{dir}/{stem}', 'cell': '{cell}', 'dted': '{lon}/{lat}'}
+# (N49), {lon} (E006) and {level}. The extension is appended. The default,
+# 'dted', is the layout MIL-PRF-89020B 3.10.7.2 prescribes for a delivery:
+# a DTED root, one folder per longitude (E006) and the cell named for its
+# southwest latitude (N49.dt2), so \DTED\E006\N49.dt2.
+DTED_NAMING_PRESETS = {'stem': '{dir}/{stem}', 'cell': '{cell}', 'dted': 'DTED/{lon}/{lat}'}
 DTED_NAMING_PLACEHOLDERS = ('stem', 'dir', 'cell', 'lat', 'lon', 'level')
+DEFAULT_DTED_NAMING = 'dted'
+# Sidecars of a DEM that describe its pyramids or statistics: wrong beside a
+# transformed output, so a folder run does not carry them over.
+DEM_SIDECAR_SUFFIXES = ('.aux.xml', '.ovr', '.rrd', '.aux')
+# The DTED0 companion files (MIL-PRF-89020B 3.9.3): statistics in the source
+# datum, so a datum transform cannot carry them over either.
+DTED0_COMPANION_SUFFIXES = ('.avg', '.min', '.max')
 
 
 def dted_naming_template(naming: str) -> str:
@@ -98,9 +110,15 @@ def dted_naming_template(naming: str) -> str:
     return template
 
 
-def dted_output_name(naming: str, input_file: str, input_root: str, cell_id: str, level: int) -> str:
+def dted_output_name(
+    naming: str, input_file: str, input_root: str, cell_id: str, level: int, *, output_root: str | None = None
+) -> str:
     """The output path, relative to the output folder, of the DTED cell
     *cell_id* made from *input_file* under the ``--dted-naming`` value.
+
+    When the name starts with the ``DTED`` root and *output_root* is itself
+    a folder named ``DTED``, that first segment is dropped: the delivery
+    gets one root, never ``DTED/DTED``.
 
     Raises:
         ValueError: If the template is invalid or the name leaves the output folder.
@@ -111,7 +129,13 @@ def dted_output_name(naming: str, input_file: str, input_root: str, cell_id: str
     folder = '' if folder == os.curdir else folder.replace(os.sep, '/')
     lat, lon = cell_id[:3], cell_id[3:]
     name = template.format(stem=stem, dir=folder, cell=cell_id, lat=lat, lon=lon, level=level)
-    name = '/'.join(part for part in name.split('/') if part)  # a blank {dir} leaves no empty folder
+    parts = [part for part in name.split('/') if part]  # a blank {dir} leaves no empty folder
+    if (
+        len(parts) > 1 and parts[0].upper() == DTED_ROOT and output_root
+        and os.path.basename(os.path.normpath(output_root)).upper() == DTED_ROOT
+    ):
+        parts = parts[1:]
+    name = '/'.join(parts)
     if not name:
         raise ValueError(f'--dted-naming {naming!r} gives an empty name for {cell_id}')
     name = f'{name}.dt{level}'
@@ -119,6 +143,37 @@ def dted_output_name(naming: str, input_file: str, input_root: str, cell_id: str
     if normalized.startswith(os.pardir) or os.path.isabs(normalized) or normalized.startswith(('/', '\\')):
         raise ValueError(f'--dted-naming {naming!r} names {name!r}, which leaves the output folder')
     return normalized.replace(os.sep, '/')
+
+
+def mask_output_name(
+    output_file: str, source_file: str | None = None, cell_id: str | None = None, *, several_cells: bool = False
+) -> str:
+    """The path of the flat mask written beside *output_file*.
+
+    A DTED cell made from a GeoTIFF (*source_file* and *cell_id* given) gets
+    ``<source stem>_mask.tif``, or ``<source stem>_<cell>_mask.tif`` when the
+    source covers *several_cells*: a name that stays unique when the masks
+    are taken out of the DTED tree, where every longitude folder holds an
+    ``N49.dt2``. Every other output gets ``<output stem>_mask.tif``.
+    """
+    folder = os.path.dirname(output_file)
+    if source_file is not None and cell_id is not None:
+        stem = os.path.splitext(os.path.basename(source_file))[0]
+        if several_cells:
+            stem = f'{stem}_{cell_id}'
+    else:
+        stem = os.path.splitext(os.path.basename(output_file))[0]
+    return os.path.join(folder, f'{stem}_mask.tif')
+
+
+def folder_within(inner: str, outer: str) -> bool:
+    """True when *inner* is *outer* or lies anywhere under it."""
+    inner = os.path.normcase(os.path.abspath(inner))
+    outer = os.path.normcase(os.path.abspath(outer))
+    try:
+        return os.path.commonpath([inner, outer]) == outer
+    except ValueError:  # different drives
+        return False
 
 
 def derive_log_path(output_path: str, mode: str) -> str:
@@ -135,7 +190,9 @@ def derive_log_path(output_path: str, mode: str) -> str:
         return f'{base}_transform.log'
 
     folder = os.path.normpath(output_path)
-    return os.path.join(folder, f'{os.path.basename(folder)}_transform.log')
+    # A drive or share root has no name of its own.
+    name = os.path.basename(folder) or 'egmtrans'
+    return os.path.join(folder, f'{name}_transform.log')
 
 
 def resolve_io_paths(input_path: str, output_path: str, *, dted_level: int | None = None) -> IOPaths:
@@ -177,8 +234,16 @@ def resolve_io_paths(input_path: str, output_path: str, *, dted_level: int | Non
 
     output_path = os.path.normpath(output_path)
     output_name = os.path.basename(output_path)
-    if not is_valid_filename(output_name):
+    if not os.path.isdir(output_path) and not is_valid_filename(output_name):
+        # An existing folder needs no name check: a drive or share root
+        # (E:\, \\nas\dted) has an empty basename and is a fine output folder.
         raise ValueError(f'Invalid output name: {output_name!r}')
+
+    if input_is_folder and folder_within(output_path, input_path):
+        raise ValueError(
+            f'The output folder {output_path} lies inside the input folder {input_path}, so the run would read '
+            f'its own outputs. Choose an output folder outside the input folder.'
+        )
 
     if os.path.isdir(output_path):
         output_is_file = False
@@ -312,14 +377,33 @@ def copy_as_writable(src: str, dst: str) -> str:
     return dst
 
 
-def copy_folder_structure(input_folder: str, output_folder: str) -> None:
-    """Recursively copy the folder structure and all files from *input_folder*.
+def _sidecar_of(name: str, dems: set[str], suffixes: tuple[str, ...]) -> bool:
+    """True when *name* carries one of *suffixes* on the name or stem of one of *dems* (lower-cased names)."""
+    lower = name.lower()
+    for suffix in suffixes:
+        if not lower.endswith(suffix):
+            continue
+        base = lower[: -len(suffix)]
+        if base in dems or any(os.path.splitext(dem)[0] == base for dem in dems):
+            return True
+    return False
 
-    Non-DEM auxiliary files (metadata, overviews, etc.) are copied alongside
-    the DEMs so that the output directory mirrors the input layout.  The DEMs
-    themselves are later overwritten by the transformed versions, so every copy
-    is made writable regardless of the source's permissions.
+
+def copy_folder_structure(input_folder: str, output_folder: str, *, skip: Iterable[str] = ()) -> list[str]:
+    """Recursively copy the folder structure and the auxiliary files from *input_folder*.
+
+    The DEMs named in *skip* (the files the run transforms) are not copied,
+    and neither are their pyramid and statistics sidecars (``.ovr``,
+    ``.rrd``, ``.aux``, ``.aux.xml``), which would describe the source
+    beside a transformed output, nor the DTED0 companion files (``.avg``,
+    ``.min``, ``.max``) beside a ``.dt0`` input, whose statistics are in the
+    source datum; those are returned so the run can say so. Everything else
+    (metadata, licenses, other files) is copied so that the output mirrors
+    the input layout, and every copy is made writable regardless of the
+    source's permissions.
     """
+    skipped = {os.path.normcase(os.path.abspath(path)) for path in skip}
+    companions: list[str] = []
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     for root, dirs, files in os.walk(input_folder):
@@ -328,30 +412,54 @@ def copy_folder_structure(input_folder: str, output_folder: str) -> None:
                 os.path.join(output_folder, os.path.relpath(os.path.join(root, d), input_folder)),
                 exist_ok=True,
             )
+        dems_here = {
+            f.lower() for f in files if os.path.normcase(os.path.abspath(os.path.join(root, f))) in skipped
+        }
+        dted0_here = {dem for dem in dems_here if dem.endswith('.dt0')}
         for f in files:
-            destination = os.path.join(
-                output_folder, os.path.relpath(os.path.join(root, f), input_folder)
-            )
-            shutil.copy2(os.path.join(root, f), destination)
+            source = os.path.join(root, f)
+            if os.path.normcase(os.path.abspath(source)) in skipped or _sidecar_of(f, dems_here, DEM_SIDECAR_SUFFIXES):
+                continue
+            if _sidecar_of(f, dted0_here, DTED0_COMPANION_SUFFIXES):
+                companions.append(source)
+                continue
+            destination = os.path.join(output_folder, os.path.relpath(source, input_folder))
+            shutil.copy2(source, destination)
             ensure_writable(destination)
+    return companions
 
 
-def find_dems(folder: str) -> list[str]:
+def find_dems(folder: str, *, skipped: list[tuple[str, str]] | None = None) -> list[str]:
     """Every DEM under *folder*, in a sorted walk so a run is the same on every OS.
 
     Files with a supported extension that are not DEMs (masks, orthos,
-    TanDEM-X auxiliary layers) are logged and left out.
+    TanDEM-X auxiliary layers) are logged and left out. A file that could not
+    be opened, or a folder that could not be read, is logged as a warning
+    and recorded in *skipped* as ``(path, reason)`` when a list is given,
+    so a run can say how many files it never saw.
     """
     logger = _state.get_logger()
     found = []
-    for root, dirs, files in os.walk(folder):
+
+    def unreadable(error: OSError) -> None:
+        reason = f'could not be read: {error.strerror or error}'
+        logger.warning(f'Folder {error.filename} {reason}; the DEMs under it are not in this run.')
+        if skipped is not None:
+            skipped.append((error.filename, reason))
+
+    for root, dirs, files in os.walk(folder, onerror=unreadable):
         dirs.sort()
         for name in sorted(files):
             if not name.lower().endswith(SUPPORTED_EXTENSIONS):
                 continue
             path = os.path.join(root, name)
-            if is_valid_dem(path):
+            problem = dem_problem(path)
+            if problem is None:
                 found.append(path)
+            elif problem.startswith('could not be opened'):
+                logger.warning(f'Skipping {name}: it {problem}')
+                if skipped is not None:
+                    skipped.append((path, problem))
             else:
                 # Not a DEM (mask, ortho, TanDEM-X auxiliary). Skip it rather
                 # than aborting the batch; the plain copy stays in the output.
@@ -369,8 +477,8 @@ def is_valid_filename(filename: str) -> bool:
     )
 
 
-def is_valid_dem(input_file: str) -> bool:
-    """Validate if a file is a valid single-band Digital Elevation Model.
+def dem_problem(input_file: str) -> str | None:
+    """Why *input_file* is not a usable single-band DEM, or None when it is.
 
     Rejects orthophotos and mask files by name (``INVALID_FILENAME_SUBSTRINGS``)
     and TanDEM-X/DGED auxiliary layers (AMP, EDM, HEM, WBM, ...) whose code
@@ -379,24 +487,31 @@ def is_valid_dem(input_file: str) -> bool:
     Float32 bands with the same georeferencing.  Then opens the file with GDAL
     (DTED included) and requires exactly one band that stores heights (a Byte
     or UInt16 band is a mask or amplitude layer whatever it is called) and a
-    geotransform, so the tile can be placed against its neighbors.
+    geotransform, so the tile can be placed against its neighbors. A file
+    that cannot be opened (truncated, unreadable, a path too long) gives a
+    reason starting with "could not be opened", so callers can tell it from
+    a file that is not a DEM.
     """
     filename = os.path.basename(input_file)
     lower_filename = filename.lower()
 
     if any(keyword in lower_filename for keyword in INVALID_FILENAME_SUBSTRINGS):
-        return False
+        return 'is named like a mask or an image'
     if _AUXILIARY_LAYER_TOKEN.search(os.path.splitext(filename)[0]):
-        return False
+        return 'is named like an auxiliary layer'
     try:
         with gdal.Open(input_file, gdal.GA_ReadOnly) as ds:
             if ds.RasterCount != 1:
-                return False
+                return f'has {ds.RasterCount} bands, not one'
             if ds.GetRasterBand(1).DataType not in ELEVATION_DATA_TYPES:
-                return False
+                return 'has a band type that does not hold heights'
             if ds.GetGeoTransform(can_return_null=True) is None:
-                return False
-    except Exception:
-        return False
+                return 'has no georeferencing'
+    except Exception as e:
+        return f'could not be opened: {str(e).strip() or type(e).__name__}'
+    return None
 
-    return True
+
+def is_valid_dem(input_file: str) -> bool:
+    """True when *input_file* is a usable single-band DEM (see :func:`dem_problem`)."""
+    return dem_problem(input_file) is None

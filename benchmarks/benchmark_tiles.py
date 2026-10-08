@@ -21,7 +21,7 @@ Examples (conda env with EGMTrans installed, from the repository root):
 
   python benchmarks/benchmark_tiles.py D:/data/tiles/N06E126_DEM.tif
   python benchmarks/benchmark_tiles.py D:/data/tiles D:/data/dted --modes warm,single,cli
-  python benchmarks/benchmark_tiles.py samples --crosscheck-proj --out results/laptop
+  python benchmarks/benchmark_tiles.py tiles --crosscheck-proj --out results/laptop
 
 Writes <out>.csv and <out>.md; paste the Markdown tables into a briefing.
 """

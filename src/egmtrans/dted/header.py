@@ -124,19 +124,39 @@ def yymm_to_iso(text: str) -> str | None:
     return f'{year:04d}-{mm:02d}'
 
 
+def check_year(year: int) -> None:
+    """Refuse a year a YYMM date cannot carry: the readers assume the century
+    from :data:`schema.CENTURY_PIVOT`, so only 1980-2079 round-trip.
+
+    Raises:
+        ValueError: If *year* lies outside that window.
+    """
+    first = 1900 + schema.CENTURY_PIVOT
+    last = first + 99
+    if not first <= year <= last:
+        raise ValueError(f'a DTED YYMM date must fall in {first}-{last} (the century the readers assume), not {year}')
+
+
 def to_yymm(value: str | dt.date | None) -> str:
-    """The YYMM form of a date given as a date, 'YYYY-MM', 'YYYY-MM-DD', or YYMM already."""
+    """The YYMM form of a date given as a date, 'YYYY-MM', 'YYYY-MM-DD', or YYMM already.
+
+    Raises:
+        ValueError: If the value is not a date, or its year lies outside the
+            window the readers assume (see :func:`check_year`).
+    """
     if value is None or value == '':
         return '0000'
     if isinstance(value, dt.datetime):
         value = value.date()
     if isinstance(value, dt.date):
+        check_year(value.year)
         return f'{value.year % 100:02d}{value.month:02d}'
     text = str(value).strip()
     if re.fullmatch(r'\d{4}', text):
         return text
     match = re.fullmatch(r'(\d{4})-(\d{2})(?:-(\d{2}))?(?:[T ].*)?', text)
     if match:
+        check_year(int(match.group(1)))
         return f'{int(match.group(1)) % 100:02d}{match.group(2)}'
     raise ValueError(f'Not a date (expected YYYY-MM, YYYY-MM-DD or YYMM): {value!r}')
 
@@ -556,13 +576,19 @@ def cell_geometry_of(header: DtedHeader, extension: str | None = None) -> CellGe
 def new_header(cell: CellGeometry) -> DtedHeader:
     """A header with the sentinels, fixed values, spec fills and the fields the
     cell geometry determines; everything else blank. The vertical datum, the
-    security codes, the producer and the accuracies are left for the caller."""
+    security codes, the producer and the accuracies are left for the caller.
+
+    The DSI unique reference number is "free text or zero filled" (3.13.4.1
+    c): zero filled here, as GDAL writes it, until a source supplies text.
+    The UHL unique reference "may be left blank" and is.
+    """
     header = DtedHeader()
     for item in ALL_FIELDS:
         if item.fixed is not None:
             header.set_raw(item.key, item.fixed.ljust(item.length))
         elif item.kind in ('date', 'maint_code', 'outline_flag', 'partial', 'flag1', 'accuracy'):
             header.set(item.key, None)
+    header.set_raw('dsi.unique_ref', '0' * FIELDS_BY_KEY['dsi.unique_ref'].length)
     header.set('dsi.product_spec', schema.PRODUCT_SPEC)
     header.set('dsi.product_spec_amend', schema.PRODUCT_SPEC_AMENDMENT)
     header.set('dsi.product_spec_date', schema.PRODUCT_SPEC_DATE)

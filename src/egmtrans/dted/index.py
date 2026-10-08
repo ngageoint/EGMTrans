@@ -32,6 +32,7 @@ import re
 import struct
 from dataclasses import dataclass, field
 
+from egmtrans.dted.fips import producer_code_warning
 from egmtrans.dted.header import cell_id as make_cell_id
 from egmtrans.dted.header import parse_cell_id
 from egmtrans.dted.schema import (
@@ -166,9 +167,17 @@ def check_value(column: Column, value) -> str | None:
         return None
     if column.type == 'date':
         try:
-            parse_date(value)
+            date = parse_date(value)
         except ValueError as e:
             return str(e)
+        if date is not None and column.dted_key is not None:
+            # A header date is written as YYMM: only the readers' century round-trips.
+            from egmtrans.dted.header import check_year
+
+            try:
+                check_year(date.year)
+            except ValueError as e:
+                return str(e)
         return None
     if not isinstance(value, str):
         return f'{value!r} is not text'
@@ -192,8 +201,12 @@ def check_value(column: Column, value) -> str | None:
 
 
 def normalize_value(column: Column, value):
-    """The canonical Python value of a column: int, date, str or None."""
-    if value is None or (isinstance(value, str) and value.strip() == '' and column.type != 'str'):
+    """The canonical Python value of a column: int, date, str or None.
+
+    A blank string is NULL for every column but free text: a required text
+    column (the producer code) holding blanks has no value.
+    """
+    if value is None or (isinstance(value, str) and value.strip() == '' and (column.type != 'str' or column.required)):
         return None
     if column.type == 'int':
         if isinstance(value, str) and value.strip().upper() == 'NA':
@@ -723,6 +736,8 @@ def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]
                                 'required column is missing; the profile must supply it for every cell'))
     if level is not None and index.level is not None and index.level != level:
         issues.append(Issue('error', 'INDEX', 'dted_level', f'the index is for level {index.level}, not {level}'))
+    blank_required: dict[str, list[str]] = {}
+    nation_warnings: dict[str, list[str]] = {}
     for cell, row in sorted(index.rows.items()):
         try:
             parse_cell_id(cell)
@@ -742,6 +757,23 @@ def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]
         for name in ACCURACY_COLUMNS:
             if name in row and row[name] is None:
                 issues.append(Issue('info', 'INDEX', f'{cell}.{name}', 'NULL, so the header will say NA'))
+        for column in HEADER_COLUMNS:
+            if column.required and column.name not in ACCURACY_COLUMNS and column.name in row:
+                value = row[column.name]
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    blank_required.setdefault(column.name, []).append(cell)
+        producer = row.get('producer_code')
+        if isinstance(producer, str) and producer.strip():
+            nation = producer_code_warning(producer)
+            if nation:
+                nation_warnings.setdefault(nation, []).append(cell)
+    for name, cells in sorted(blank_required.items()):
+        shown = ', '.join(cells[:5]) + (f' and {len(cells) - 5} more' if len(cells) > 5 else '')
+        issues.append(Issue('warning', 'INDEX', name,
+                            f'NULL or blank in {len(cells)} cell(s) ({shown}); the profile must supply it'))
+    for message, cells in sorted(nation_warnings.items()):
+        shown = ', '.join(cells[:5]) + (f' and {len(cells) - 5} more' if len(cells) > 5 else '')
+        issues.append(Issue('warning', 'INDEX', 'producer_code', f'{message}; {len(cells)} cell(s): {shown}'))
     for cell, items in sorted(index.subregions.items()):
         if cell not in index.rows:
             issues.append(Issue('error', 'INDEX', cell, 'subregions for a cell that has no row'))

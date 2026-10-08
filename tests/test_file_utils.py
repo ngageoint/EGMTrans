@@ -174,3 +174,74 @@ class TestCopyFolderStructurePermissions:
         copied = os.path.join(out_dir, "locked.dt2")
         assert os.path.isfile(copied)
         assert stat.S_IMODE(os.stat(copied).st_mode) & stat.S_IWUSR
+
+
+class TestDemProblems:
+    """What find_dems says about files it cannot open, and what the tree copy leaves out."""
+
+    def test_dem_problem_tells_an_unreadable_file_from_a_file_that_is_not_a_dem(self, tmp_dir, synthetic_geotiff):
+        from egmtrans.file_utils import dem_problem
+
+        assert dem_problem(synthetic_geotiff) is None
+        truncated = os.path.join(tmp_dir, 'truncated.tif')
+        with open(synthetic_geotiff, 'rb') as source, open(truncated, 'wb') as target:
+            target.write(source.read(64))
+        assert dem_problem(truncated).startswith('could not be opened')
+        text = os.path.join(tmp_dir, 'notes.tif')
+        with open(text, 'w') as handle:
+            handle.write('not a raster')
+        assert dem_problem(text).startswith('could not be opened')
+        assert dem_problem(os.path.join(tmp_dir, 'tile_mask.tif')) == 'is named like a mask or an image'
+        assert dem_problem(os.path.join(tmp_dir, 'N40E047_01_HEM.tif')) == 'is named like an auxiliary layer'
+        assert is_valid_dem(truncated) is False and is_valid_dem(text) is False
+
+    def test_find_dems_reports_unreadable_files_and_folders(self, tmp_dir, synthetic_geotiff, log_lines):
+        import shutil
+
+        from egmtrans.file_utils import find_dems
+
+        folder = os.path.join(tmp_dir, 'tiles')
+        os.makedirs(os.path.join(folder, 'locked'))
+        shutil.copy(synthetic_geotiff, os.path.join(folder, 'good.tif'))
+        with open(os.path.join(folder, 'bad.tif'), 'wb') as handle:
+            handle.write(b'II*\x00garbage')
+        shutil.copy(synthetic_geotiff, os.path.join(folder, 'locked', 'hidden.tif'))
+        skipped = []
+        if os.name != 'nt' and os.geteuid() != 0:
+            os.chmod(os.path.join(folder, 'locked'), 0)
+        try:
+            found = find_dems(folder, skipped=skipped)
+        finally:
+            os.chmod(os.path.join(folder, 'locked'), stat.S_IRWXU)
+        assert [os.path.basename(path) for path in found] == ['good.tif']
+        reasons = dict(skipped)
+        assert os.path.join(folder, 'bad.tif') in reasons and reasons[os.path.join(folder, 'bad.tif')].startswith(
+            'could not be opened')
+        if os.name != 'nt' and os.geteuid() != 0:
+            assert os.path.join(folder, 'locked') in reasons
+            assert any('could not be read' in line and 'locked' in line for line in log_lines)
+        assert any(line.startswith('Skipping bad.tif: it could not be opened') for line in log_lines)
+
+    def test_copy_folder_structure_leaves_dems_sidecars_and_companions_out(self, tmp_dir, synthetic_geotiff):
+        import shutil
+
+        src = os.path.join(tmp_dir, 'in')
+        os.makedirs(os.path.join(src, 'sub'))
+        dem = shutil.copy(synthetic_geotiff, os.path.join(src, 'a.tif'))
+        for name in ('a.tif.ovr', 'a.tif.aux.xml', 'a.rrd', 'a.aux', 'meta.xml', 'license.pdf'):
+            with open(os.path.join(src, name), 'w') as handle:
+                handle.write('x')
+        dt0 = os.path.join(src, 'sub', 'b.dt0')
+        for name in ('b.dt0', 'b.avg', 'b.min', 'b.max', 'b.xml'):
+            with open(os.path.join(src, 'sub', name), 'w') as handle:
+                handle.write('x')
+        out = os.path.join(tmp_dir, 'out')
+        companions = copy_folder_structure(src, out, skip=[dem, dt0])
+        copied = sorted(os.path.relpath(os.path.join(root, f), out) for root, _, files in os.walk(out) for f in files)
+        assert copied == ['license.pdf', 'meta.xml', os.path.join('sub', 'b.xml')]
+        assert sorted(os.path.basename(path) for path in companions) == ['b.avg', 'b.max', 'b.min']
+        assert os.path.isdir(os.path.join(out, 'sub'))
+        # Without a skip list everything is copied, as before.
+        everything = os.path.join(tmp_dir, 'everything')
+        assert copy_folder_structure(src, everything) == []
+        assert os.path.isfile(os.path.join(everything, 'a.tif.ovr'))

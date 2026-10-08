@@ -79,10 +79,11 @@ def write_tile(path, heights, lon0=LON0, lat0=LAT0, per_degree=PER_DEGREE, nodat
     return write_geotiff(path, heights, lattice_geotransform(lon0, lat0, per_degree, per_degree), nodata=nodata)
 
 
-def convert(src, out, level, *, src_datum='EGM2008', tgt_datum='EGM2008', mask=False, patch=400):
+def convert(src, out, level, *, src_datum='EGM96', tgt_datum='EGM96', mask=False, patch=400):
     transform_vertical_datum(
         src, out, src_datum, tgt_datum, True, mask, patch, 'bilinear', None, False,
         dted_metadata=metadata(level), cell=CellGeometry(level, LON0, LAT0),
+        mask_file=os.path.splitext(out)[0] + '_mask.tif',
     )
     return out
 
@@ -106,7 +107,7 @@ class TestSameDatumConversion:
         for level, path in files.items():
             header, issues = validate_file(path, check_data=True)
             assert [str(i) for i in issues if i.severity == 'error'] == []
-            assert header['dsi.series'] == f'DTED{level}' and header['dsi.vertical_datum'] == 'E08'
+            assert header['dsi.series'] == f'DTED{level}' and header['dsi.vertical_datum'] == 'E96'
             assert header['uhl.lon_interval'] == {2: '0060', 1: '0180', 0: '1800'}[level]
             assert header['dsi.producer_code'] == 'USNGA   ' and header['acc.rel_horiz_acc'] == 'NA  '
             assert header['dsi.partial_cell'] == '99'
@@ -210,7 +211,7 @@ class TestWithDatumShift:
         heights[40:50, 100:140] = 349.99   # 1 cm under the lake's height, apart from it: its own body
         src = write_tile(str(tmp_path / 'tile.tif'), heights)
         transform._verified_grids.clear()
-        out = convert(src, str(tmp_path / 'N85E030.dt2'), 2, tgt_datum='EGM96')
+        out = convert(src, str(tmp_path / 'N85E030.dt2'), 2, src_datum='EGM2008', tgt_datum='EGM96')
         values = read_records(out).values
         lake = values[1200:2389, 240:439]
         assert np.unique(lake).size == 1
@@ -229,7 +230,7 @@ class TestRefusals:
         options = dict(flatten=True, create_mask=False, min_patch_size=16, algorithm='bilinear', save_log=False,
                        assume_yes=True, dted_metadata=metadata(2))
         options.update(kwargs)
-        return process_file(src, out, 'EGM2008', 'EGM2008', **options)
+        return process_file(src, out, 'EGM96', 'EGM96', **options)
 
     def test_rasters_that_cannot_become_dted(self, tmp_path, log_lines):
         heights = synthetic_cell(PER_DEGREE)
@@ -280,9 +281,10 @@ class TestRefusals:
         assert self._run(dted, str(tmp_path / 'n06e126.dt2')) is False
         assert any('keeps its level' in line for line in log_lines)
         src = write_tile(str(tmp_path / 'tile.tif'), synthetic_cell(PER_DEGREE))
-        assert process_file(src, str(tmp_path / 'N85E030.dt2'), 'EGM2008', 'WGS84', True, False, 16, 'bilinear',
-                            save_log=False, dted_metadata=metadata(2)) is False
-        assert any('not WGS84' in line for line in log_lines)
+        for target in ('WGS84', 'EGM2008'):
+            assert process_file(src, str(tmp_path / 'N85E030.dt2'), 'EGM2008', target, True, False, 16, 'bilinear',
+                                save_log=False, dted_metadata=metadata(2)) is False
+            assert any('EGM96 only' in line and target in line for line in log_lines), target
         assert self._run(src, str(tmp_path / 'N85E030.dt2'), algorithm='spline') is False
         assert any('requires the bilinear algorithm' in line for line in log_lines)
         assert self._run(src, str(tmp_path / 'N85E030.dt1')) is False, 'the profile is for level 2'
@@ -308,7 +310,7 @@ class TestFailures:
         src = write_tile(str(tmp_path / 'tile.tif'), synthetic_cell(PER_DEGREE))
         out = str(tmp_path / 'N85E030.dt2')
 
-        def broken(path, cell, posts):
+        def broken(path, cell, posts, **kwargs):
             raise RuntimeError('verification failed on purpose')
 
         monkeypatch.setattr(egm_io, '_verify_dted', broken)
@@ -320,7 +322,7 @@ class TestFailures:
         src = write_tile(str(tmp_path / 'tile.tif'), synthetic_cell(PER_DEGREE))
         out = str(tmp_path / 'N85E030.dt2')
         with pytest.raises(ValueError, match='security_code is required'):
-            transform_vertical_datum(src, out, 'EGM2008', 'EGM2008', True, True, 16, 'bilinear', None, False,
+            transform_vertical_datum(src, out, 'EGM96', 'EGM96', True, True, 16, 'bilinear', None, False,
                                      dted_metadata=None, cell=CellGeometry(2, LON0, LAT0))
         assert sorted(os.listdir(tmp_path)) == ['tile.tif']
 
@@ -349,3 +351,120 @@ class TestFailures:
             _state.set_arcpy(None)
         assert not [i for i in validate_file(out, check_data=True)[1] if i.severity == 'error']
         assert read_records(out).values[1800, 340] == 350
+
+
+class TestUndeclaredVoids:
+    def test_a_band_without_nodata_that_holds_sentinels_is_refused(self, tmp_path, log_lines):
+        heights = synthetic_cell(PER_DEGREE)
+        heights[10:20, 10:20] = -9999.0
+        src = write_tile(str(tmp_path / 'tile.tif'), heights, nodata=None)
+        with pytest.raises(ValueError, match='declares no NoData value but holds 100 post\\(s\\) at -9999'):
+            convert(src, str(tmp_path / 'N85E030.dt2'), 2)
+        heights[10:20, 10:20] = -12000.0
+        src = write_tile(str(tmp_path / 'deep.tif'), heights, nodata=None)
+        with pytest.raises(ValueError, match='at or below -12000 m'):
+            convert(src, str(tmp_path / 'N85E030.dt2'), 2)
+        assert not any(name.endswith('.dt2') for name in os.listdir(tmp_path))
+        # Declared, the same value is a void and the cell is written.
+        src = write_tile(str(tmp_path / 'declared.tif'), heights, nodata=-12000.0)
+        out = convert(src, str(tmp_path / 'N85E030.dt2'), 2)
+        values = read_records(out).values
+        assert np.all(values[120:229, 20:39] == NULL_ELEVATION)
+
+    def test_a_mask_band_is_honored_when_no_nodata_is_declared(self, tmp_path, log_lines):
+        heights = synthetic_cell(PER_DEGREE)
+        src = write_tile(str(tmp_path / 'masked.tif'), heights, nodata=None)
+        with gdal.Open(src, gdal.GA_Update) as ds:
+            ds.CreateMaskBand(gdal.GMF_PER_DATASET)
+            mask = np.full(heights.shape, 255, dtype=np.uint8)
+            mask[10:20, 10:20] = 0
+            ds.GetRasterBand(1).GetMaskBand().WriteArray(mask)
+        out = convert(src, str(tmp_path / 'N85E030.dt2'), 2)
+        values = read_records(out).values
+        assert np.all(values[120:229, 20:39] == NULL_ELEVATION)
+        assert values[0, 0] != NULL_ELEVATION
+        assert any('void post(s) taken from the mask band' in line for line in log_lines)
+
+
+class TestCoverageOfCellsAndHeaders:
+    """End-to-end conversions beyond the self-test's two cells: a southern-western
+    cell with the band-boundary copy on its south row, a zone III cell, negative
+    heights, an exact 1-arc-second tile, and non-default header values."""
+
+    def _profile(self, **values):
+        product = dict(PRODUCT, dted_level=2)
+        product.update(values)
+        return DtedMetadataSource(None, Profile(path='<test>', product=product, harvest=HarvestConfig()))
+
+    def _convert(self, src, out, lon0, lat0, metadata=None, level=2, log=None):
+        transform_vertical_datum(
+            src, out, 'EGM96', 'EGM96', True, False, 400, 'bilinear', None, False,
+            dted_metadata=metadata or self._profile(), cell=CellGeometry(level, lon0, lat0),
+        )
+        header, issues = validate_file(out, check_data=True)
+        assert [str(i) for i in issues if i.severity == 'error'] == []
+        return header, read_records(out).values
+
+    def test_a_southern_western_cell_on_the_50_degree_boundary(self, tmp_path, log_lines):
+        from egmtrans.dted.resample import BAND_EDGE_STEP
+
+        # The cell S50W001 spans -50 to -49: its pole-ward edge, the south row, lies on the boundary and is
+        # a nearest-neighbor copy of the coarser (200 per degree) tile south of it, as TanDEM-X tiles are.
+        fine = synthetic_cell(PER_DEGREE, base_cm=20000)
+        fine[50:100, 50:100] = -30.0  # a basin below sea level, kept as terrain (not flat)
+        coarse_per_degree = PER_DEGREE * BAND_EDGE_STEP[50][0] // BAND_EDGE_STEP[50][1]
+        coarse_row = synthetic_cell(coarse_per_degree, base_cm=21000)[0]
+        numerator, denominator = BAND_EDGE_STEP[50]
+        i = np.arange(PER_DEGREE + 1)
+        nearest = np.minimum((2 * i * numerator + denominator) // (2 * denominator), coarse_per_degree)
+        fine[-1] = coarse_row[nearest]
+        src = write_tile(str(tmp_path / 'S50W001.tif'), fine, lon0=-1, lat0=-50)
+        header, values = self._convert(src, str(tmp_path / 'S50.dt2'), -1, -50)
+        assert header.cell_id == 'S50W001' and header['uhl.origin_lat'] == '0500000S'
+        assert header['uhl.origin_lon'] == '0010000W' and header['dsi.sw_lon'] == '0010000W'
+        # The zone follows the edge nearer the equator (-49): zone I, 1-arc-second columns.
+        assert header['uhl.lon_lines'] == '3601' and values.shape == (3601, 3601)
+        assert any('the south row lies on a longitude-spacing boundary' in line for line in log_lines)
+        assert values.min() < 0, 'negative heights survive'
+        assert header['dsi.partial_cell'] == '00'
+
+    def test_a_zone_iii_cell_and_negative_heights(self, tmp_path):
+        heights = synthetic_cell(PER_DEGREE, base_cm=-40000)  # a cell entirely below sea level
+        src = write_tile(str(tmp_path / 'N72E010.tif'), heights, lon0=10, lat0=72)
+        header, values = self._convert(src, str(tmp_path / 'N72.dt2'), 10, 72)
+        assert header.cell_id == 'N72E010' and header['uhl.lon_interval'] == '0030'
+        assert values.shape == (3601, 1201), 'zone III: 3-arc-second columns'
+        assert values.max() < 0 and values.min() >= -400
+        with open(str(tmp_path / 'N72.dt2'), 'rb') as handle:
+            first_record = handle.read()[HEADER_LENGTH:HEADER_LENGTH + 20]
+        assert first_record[8] & 0x80, 'a negative post is stored in signed magnitude with the sign bit set'
+
+    def test_an_exact_one_arc_second_tile_is_copied_post_for_post(self, tmp_path, log_lines):
+        per_degree = 3600
+        rng = np.random.default_rng(5)
+        heights = rng.integers(-5, 900, size=(per_degree + 1, per_degree + 1)).astype(np.float32)
+        heights += 0.25  # not whole meters: rounding is exercised, resampling is not
+        heights[100:110, 100:110] = np.nan
+        src = write_tile(str(tmp_path / 'N49E006.tif'), heights, lon0=6, lat0=49, per_degree=per_degree)
+        header, values = self._convert(src, str(tmp_path / 'N49.dt2'), 6, 49)
+        assert values.shape == (3601, 3601)
+        expected = round_half_away(heights)
+        valid = ~np.isnan(heights)
+        assert np.array_equal(values[valid], expected[valid].astype(np.int32))
+        assert np.all(values[~valid] == NULL_ELEVATION)
+        assert header['dsi.partial_cell'] == '99'
+        assert not any('interpolated from coarser data' in line for line in log_lines)
+
+    def test_non_default_markings_and_an_override(self, tmp_path):
+        from egmtrans.dted.writer import parse_overrides
+
+        metadata = self._profile(security_code='R', security_control='DS', producer_code='UKDGC',
+                                 security_handling='HANDLE WITH CARE')
+        metadata.overrides.update(parse_overrides(['compilation_date=2025-11', 'data_edition=7']))
+        src = write_tile(str(tmp_path / 'tile.tif'), synthetic_cell(PER_DEGREE))
+        header, _ = self._convert(src, str(tmp_path / 'N85E030.dt2'), LON0, LAT0, metadata=metadata)
+        assert header['dsi.security_code'] == 'R' and header['uhl.security_code'] == 'R  '
+        assert header['dsi.security_control'] == 'DS' and header['dsi.security_handling'].strip() == 'HANDLE WITH CARE'
+        assert header['dsi.producer_code'] == 'UKDGC   '
+        assert header['dsi.compilation_date'] == '2511' and header['dsi.data_edition'] == '07'
+        assert not any('FIPS' in str(issue) for issue in validate_file(str(tmp_path / 'N85E030.dt2'))[1])

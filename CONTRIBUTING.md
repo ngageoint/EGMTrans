@@ -56,13 +56,6 @@ those bytes on purpose must regenerate the reference hashes of
 `egmtrans dted-selftest` (`--print-reference`) and the pins in
 `tests/test_determinism.py`, and say so in the CHANGELOG.
 
-## Commit attribution
-
-If you use an AI assistant (Claude Code, Copilot, etc.) while working on a
-patch, do **not** add a `Co-Authored-By:` line for the assistant to your
-commit message. Attribute only the humans who directed and reviewed the
-change.
-
 ## Pull requests
 
 - One logical change per PR. Small and focused beats large and sweeping.

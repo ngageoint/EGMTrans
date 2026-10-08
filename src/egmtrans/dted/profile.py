@@ -32,12 +32,16 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 
 from egmtrans.dted.index import COLUMNS_BY_NAME, Column, check_value
 
 PROFILE_SCHEMA_VERSION = 1
+# A value of the profile template that has not been filled in: anything in
+# angle brackets. Such a profile is refused before any header is made.
+PLACEHOLDER = re.compile(r'\s*<.*>\s*', re.DOTALL)
 
 
 @dataclass
@@ -135,6 +139,13 @@ def load_profile(path: str) -> Profile:
         raise ValueError(f'{os.path.basename(path)}: profile schema {schema_version} is not supported')
 
     product = dict(document.get('product', {}))
+    placeholders = [key for key, value in product.items() if isinstance(value, str) and PLACEHOLDER.fullmatch(value)]
+    if placeholders:
+        raise ValueError(
+            f'{os.path.basename(path)}: placeholder not filled: '
+            + ', '.join(f'product.{key}' for key in placeholders)
+            + '. Replace every <...> value of the template with the product\'s own before using the profile.'
+        )
     for key, value in list(product.items()):
         if isinstance(value, dt.datetime):
             product[key] = value.date()

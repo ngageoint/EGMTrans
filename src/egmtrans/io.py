@@ -17,7 +17,8 @@ import numpy as np
 from osgeo import gdal
 
 from egmtrans import _state
-from egmtrans.config import DATUM_MAPPING
+from egmtrans.config import DATUM_MAPPING, dted_target_problem
+from egmtrans.dted.companions import COMPANION_EXTENSIONS
 from egmtrans.dted.header import CellGeometry, DtedHeader, read_header, write_header
 from egmtrans.dted.records import check_values, partial_cell_indicator, write_dted_file
 from egmtrans.dted.schema import NULL_ELEVATION
@@ -177,8 +178,8 @@ def update_dted_header(
     determine are written last; see :func:`egmtrans.dted.writer.assemble_header`
     for the precedence. Without index or profile the header changes only in:
 
-    - the **vertical datum** (DSI 142-144): the code of *tgt_datum*,
-      ``E96`` or ``E08``;
+    - the **vertical datum** (DSI 142-144): ``E96``, the one code DTED is
+      written in (MIL-PRF-89020B 3.2.2);
     - the **accuracies** (ACC 4-19 and UHL 29-32): a value that is neither
       0000-9999 nor NA becomes NA, and NA is left justified (``NA  ``) as
       MIL-PRF-89020B 3.13.5 requires; the UHL copy follows the ACC value;
@@ -249,10 +250,16 @@ def preview_dted_header(
 
 
 def _dted_code(tgt_datum: str) -> str:
-    dted_code = DATUM_MAPPING.get(tgt_datum, {}).get('dted_code')
-    if not dted_code:
-        raise ValueError(f'Unsupported target datum for DTED: {tgt_datum}')
-    return dted_code
+    """The DSI vertical datum code of a DTED output: E96, since DTED is
+    written in EGM96 only (MIL-PRF-89020B 3.2.2).
+
+    Raises:
+        ValueError: For any other target datum, with the sentence that says why.
+    """
+    problem = dted_target_problem(tgt_datum)
+    if problem:
+        raise ValueError(problem)
+    return DATUM_MAPPING[tgt_datum]['dted_code']
 
 
 def new_dted_header(
@@ -290,6 +297,7 @@ def write_dted(
     temp_dir: str | None = None,
     *,
     metadata: DtedMetadata | None = None,
+    companions: dict[str, np.ndarray] | None = None,
 ) -> str:
     """Write *heights* (rows north to south, voids as NaN) as the DTED file of *cell*.
 
@@ -302,8 +310,13 @@ def write_dted(
     file under the output name is always a verified one. Returns the SHA-256
     of the file, which is also logged with its size.
 
+    *companions* are the DTED0 ``.avg``, ``.min`` and ``.max`` files of
+    MIL-PRF-89020B 3.9.3, keyed by their extension without the dot: whole
+    meters with voids as -32767, written beside the cell with the cell's
+    header verbatim and verified the same way.
+
     Raises:
-        ValueError: If the datum has no DTED code, the header cannot be
+        ValueError: If the datum is not EGM96, the header cannot be
             completed, or a value cannot be written
             (:class:`~egmtrans.dted.records.RecordError`).
         RuntimeError: If the written file does not verify.
@@ -314,27 +327,45 @@ def write_dted(
     header, sources = new_dted_header(cell, tgt_datum, abs_horiz_accuracy, metadata=metadata, partial_cell=partial)
 
     folder = temp_dir if temp_dir else os.path.dirname(os.path.abspath(output_file))
-    scratch = os.path.join(folder, f'.{os.path.basename(output_file)}.{token_hex(4)}.part')
-    try:
-        content = write_dted_file(scratch, header, posts)
-        _verify_dted(scratch, cell, posts)
-        os.replace(scratch, output_file)
-    finally:
-        if os.path.exists(scratch):
-            os.remove(scratch)
-
+    content = _write_verified(folder, output_file, header, cell, posts)
     digest = hashlib.sha256(content).hexdigest()
     logger.info(f'DTED header of cell {cell.cell_id} built from scratch:')
     for line in describe_changes(None, header, sources):
         logger.info(line)
     logger.info(f'Wrote {output_file}: {len(content):,} bytes, SHA-256 {digest}')
+
+    for name, values in (companions or {}).items():
+        if f'.{name}' not in COMPANION_EXTENSIONS:
+            raise ValueError(f'{name!r} is not a DTED0 companion file (avg, min or max)')
+        companion = f'{os.path.splitext(output_file)[0]}.{name}'
+        companion_posts = check_values(values)
+        companion_content = _write_verified(folder, companion, header, cell, companion_posts)
+        logger.info(
+            f'Wrote {companion}: {len(companion_content):,} bytes, '
+            f'SHA-256 {hashlib.sha256(companion_content).hexdigest()}'
+        )
     return digest
 
 
-def _verify_dted(path: str, cell: CellGeometry, posts: np.ndarray) -> None:
-    """Raise RuntimeError unless the file at *path* validates and GDAL reads
-    *posts* and the cell's geotransform back from it."""
-    _header, issues = validate_file(path, check_data=True)
+def _write_verified(folder: str, output_file: str, header: DtedHeader, cell: CellGeometry, posts: np.ndarray) -> bytes:
+    """Write *header* and *posts* under a scratch name in *folder*, verify the
+    file against the output's extension, and rename it onto *output_file*."""
+    scratch = os.path.join(folder, f'.{os.path.basename(output_file)}.{token_hex(4)}.part')
+    try:
+        content = write_dted_file(scratch, header, posts)
+        _verify_dted(scratch, cell, posts, extension=os.path.splitext(output_file)[1])
+        os.replace(scratch, output_file)
+    finally:
+        if os.path.exists(scratch):
+            os.remove(scratch)
+    return content
+
+
+def _verify_dted(path: str, cell: CellGeometry, posts: np.ndarray, *, extension: str | None = None) -> None:
+    """Raise RuntimeError unless the file at *path* validates (against the
+    *extension* its final name will carry) and GDAL reads *posts* and the
+    cell's geotransform back from it."""
+    _header, issues = validate_file(path, check_data=True, extension=extension)
     errors = [str(issue) for issue in issues if issue.severity == 'error']
     if errors:
         raise RuntimeError('The written DTED file does not validate:\n  ' + '\n  '.join(errors))

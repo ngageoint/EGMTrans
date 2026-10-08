@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from egmtrans import batch, cli
-from egmtrans.cli import datum_arg, delete_output_directory, process_file, str2bool
+from egmtrans.cli import datum_arg, process_file, str2bool
 
 
 class TestStr2Bool:
@@ -38,11 +38,6 @@ class TestStr2Bool:
 class TestProcessFileSignature:
     def test_callable(self):
         assert callable(process_file)
-
-
-class TestDeleteOutputDirectory:
-    def test_callable(self):
-        assert callable(delete_output_directory)
 
 
 class TestDatumArg:
@@ -111,7 +106,7 @@ class TestMainOutputPaths:
             pass
         out = os.path.join(tmp_dir, "out.dt2")
 
-        assert _run(monkeypatch, "-i", src, "-o", out, "-s", "EGM96", "-t", "EGM2008") == 0
+        assert _run(monkeypatch, "-i", src, "-o", out, "-s", "EGM2008", "-t", "EGM96") == 0
 
         assert not os.path.isdir(out), "the output path was turned into a directory"
         assert stub_pipeline[0][1] == out, "not dispatched as a single file"
@@ -134,7 +129,7 @@ class TestMainOutputPaths:
             pass
         outdir = os.path.join(tmp_dir, "results")
 
-        assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM96", "-t", "EGM2008") == 0
+        assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96") == 0
 
         assert stub_pipeline[0][1] == os.path.join(outdir, "n39w077.dt2")
         assert os.path.isdir(outdir)
@@ -144,7 +139,7 @@ class TestMainOutputPaths:
         os.makedirs(indir)
         out = os.path.join(tmp_dir, "out.tif")
 
-        assert _run(monkeypatch, "-i", indir, "-o", out, "-s", "EGM96", "-t", "EGM2008") == 2
+        assert _run(monkeypatch, "-i", indir, "-o", out, "-s", "EGM2008", "-t", "EGM96") == 2
         assert not os.path.exists(out), "a directory was created at the output file path"
         assert stub_pipeline == []
 
@@ -192,7 +187,7 @@ class TestMainExitCodes:
             pass
         assert _run(
             monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
-            "-s", "EGM96", "-t", "EGM2008",
+            "-s", "EGM2008", "-t", "EGM96",
         ) == 0
 
     def test_transform_failure_is_one(self, tmp_dir, stub_pipeline, monkeypatch):
@@ -202,13 +197,13 @@ class TestMainExitCodes:
         monkeypatch.setattr(cli, "process_file", lambda *a, **k: False)
         assert _run(
             monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
-            "-s", "EGM96", "-t", "EGM2008",
+            "-s", "EGM2008", "-t", "EGM96",
         ) == 1
 
     def test_missing_input_is_a_usage_error(self, tmp_dir, stub_pipeline, monkeypatch):
         assert _run(
             monkeypatch, "-i", os.path.join(tmp_dir, "nope.dt2"),
-            "-o", os.path.join(tmp_dir, "out.dt2"), "-s", "EGM96", "-t", "EGM2008",
+            "-o", os.path.join(tmp_dir, "out.dt2"), "-s", "EGM2008", "-t", "EGM96",
         ) == 2
 
     def test_bad_datum_is_a_usage_error(self, tmp_dir, stub_pipeline, monkeypatch):
@@ -339,7 +334,8 @@ class TestDtedRequiresBilinear:
         monkeypatch.setattr(cli, "DTED_REQUIRES_BILINEAR", False)
         src = write_dted(os.path.join(tmp_dir, "n03e008.dt0"), np.full((121, 121), 40, dtype=np.int16), 8, 3)
         out = os.path.join(tmp_dir, "out.dt0")
-        assert process_file(src, out, "EGM96", "EGM2008", True, False, 16, "spline") is True
+        assert process_file(src, out, "EGM2008", "EGM96", True, False, 16, "spline",
+                            check_for_wrong_datum=False) is True
         assert len(no_transform) == 1
         assert any("DTED output requires the bilinear algorithm" in line for line in log_lines)
 
@@ -363,7 +359,7 @@ class TestBareFlags:
             pass
         assert _run(
             monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
-            "-s", "EGM96", "-t", "EGM2008", flag,
+            "-s", "EGM2008", "-t", "EGM96", flag,
         ) == 2
         assert stub_pipeline == []
 
@@ -375,7 +371,7 @@ class TestContainmentOption:
             pass
         assert _run(
             monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
-            "-s", "EGM96", "-t", "EGM2008", "-c", "1.5",
+            "-s", "EGM2008", "-t", "EGM96", "-c", "1.5",
         ) == 2
         assert stub_pipeline == []
 
@@ -434,7 +430,7 @@ class TestDtedLevelFlags:
         src = write_geotiff(os.path.join(tmp_dir, "tile.tif"), synthetic_cell(60),
                             lattice_geotransform(30, 85, 60, 60), nodata=-32767.0)
         outdir = os.path.join(tmp_dir, "out")
-        profile = os.path.join(os.path.dirname(os.path.dirname(__file__)), "samples", "dted_profile_example.toml")
+        profile = os.path.join(os.path.dirname(__file__), "data", "dted_profile.toml")
         argv = ["-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "2",
                 "--dted-naming", "cell", "--dted-profile", profile]
         # The header plan is shown before anything is written; a "no" ends the run.
@@ -460,7 +456,7 @@ class TestDtedLevelFlags:
                     "--dted-level", "2") == 2
         assert stub_pipeline == []
 
-    def test_dted_input_keeps_its_level(self, tmp_dir, stub_pipeline, monkeypatch):
+    def test_dted_input_must_be_at_the_level_given(self, tmp_dir, stub_pipeline, monkeypatch, capsys):
         import numpy as np
 
         from tests.conftest import write_dted
@@ -468,8 +464,27 @@ class TestDtedLevelFlags:
         src = write_dted(os.path.join(tmp_dir, "n50w001.dt0"), np.full((121, 121), 5, dtype=np.int16), -1, 50)
         outdir = os.path.join(tmp_dir, "out")
         assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "2",
+                    "-y") == 1
+        assert "a DTED file keeps its level" in capsys.readouterr().out and stub_pipeline == []
+        assert _run(monkeypatch, "-i", src, "-o", outdir, "-s", "EGM2008", "-t", "EGM96", "--dted-level", "0",
                     "-y") == 0
         assert stub_pipeline[0][1] == os.path.join(outdir, "n50w001.dt0")
+
+    def test_an_egm2008_target_for_dted_is_refused_before_anything_runs(self, tmp_dir, stub_pipeline, monkeypatch,
+                                                                       capsys):
+        tiles = os.path.join(tmp_dir, "tiles")
+        os.makedirs(tiles)
+        src = os.path.join(tiles, "in.dt2")
+        with open(src, "wb"):
+            pass
+        for args in (("-i", src, "-o", os.path.join(tmp_dir, "out.dt2"), "-s", "EGM96", "-t", "EGM2008"),
+                     ("-i", src, "-o", os.path.join(tmp_dir, "out"), "-s", "EGM96", "-t", "WGS84"),
+                     ("-i", tiles, "-o", os.path.join(tmp_dir, "out"), "-s", "EGM2008", "-t", "EGM2008",
+                      "--dted-level", "2")):
+            assert _run(monkeypatch, *args) == 2, args
+            assert "EGM96 only" in capsys.readouterr().err
+        assert stub_pipeline == []
+        assert not os.path.exists(os.path.join(tmp_dir, "out"))
 
 
 class TestDtedSet:
@@ -515,18 +530,71 @@ class TestDtedSet:
 
         # Without an index, a profile or overrides there is nothing to confirm.
         monkeypatch.setattr("builtins.input", no_input)
-        assert process_file(src, out, "EGM96", "EGM2008", False, False, 16, "bilinear",
+        assert process_file(src, out, "EGM2008", "EGM96", False, False, 16, "bilinear",
                             check_for_wrong_datum=False) is True
         assert len(calls) == 1 and "DTED header plan" not in log_lines
 
         source = DtedMetadataSource(None, None, parse_overrides(["producer_code=USNGA"]))
         monkeypatch.setattr("builtins.input", lambda *_: "no")
-        assert process_file(src, out, "EGM96", "EGM2008", False, False, 16, "bilinear",
+        assert process_file(src, out, "EGM2008", "EGM96", False, False, 16, "bilinear",
                             check_for_wrong_datum=False, dted_metadata=source) is False
         assert len(calls) == 1 and "DTED header plan" in log_lines
         assert any("dsi.producer_code" in line and "(override)" in line for line in log_lines)
         assert "  example: cell N06E126, n06e126.dt0 -> out.dt0" in log_lines
         monkeypatch.setattr("builtins.input", lambda *_: "yes")
-        assert process_file(src, out, "EGM96", "EGM2008", False, False, 16, "bilinear",
+        assert process_file(src, out, "EGM2008", "EGM96", False, False, 16, "bilinear",
                             check_for_wrong_datum=False, dted_metadata=source) is True
         assert len(calls) == 2
+
+
+class TestLogsAndTracebacks:
+    def test_a_traceback_goes_to_the_log_file_only(self, tmp_dir, stub_pipeline, monkeypatch, capsys):
+        def explode(*args, **kwargs):
+            raise RuntimeError("boom in the transform")
+
+        monkeypatch.setattr(cli, "process_file", explode)
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        out = os.path.join(tmp_dir, "out.dt2")
+        assert _run(monkeypatch, "-i", src, "-o", out, "-s", "EGM2008", "-t", "EGM96") == 1
+        printed = capsys.readouterr().out
+        assert "EGMTrans stopped: boom in the transform" in printed and "Traceback" not in printed
+        with open(os.path.join(tmp_dir, "out_transform.log"), encoding="utf-8") as handle:
+            log = handle.read()
+        assert "Traceback (for the record)" in log and "boom in the transform" in log
+
+    def test_the_log_is_appended_with_a_banner_and_written_in_utf_8(self, tmp_dir, stub_pipeline, monkeypatch):
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        out = os.path.join(tmp_dir, "sortie_été.dt2")
+        for _ in range(2):
+            assert _run(monkeypatch, "-i", src, "-o", out, "-s", "EGM2008", "-t", "EGM96") == 0
+        with open(os.path.join(tmp_dir, "sortie_été_transform.log"), encoding="utf-8") as handle:
+            log = handle.read()
+        assert log.count("run started") == 2, "the second run appended to the first run's log"
+        assert "sortie_été.dt2" in log, "a path outside cp1252 reaches the log"
+        assert log.index("run started") < log.index("Processing completed.")
+
+    def test_an_unwritable_export_path_is_an_argument_error(self, tmp_dir, stub_pipeline, monkeypatch, capsys):
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        code = _run(monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out"), "-s", "EGM2008", "-t", "EGM96",
+                    "--export-water-levels", os.path.join(tmp_dir, "nowhere", "levels.csv"))
+        assert code == 2 and "does not exist" in capsys.readouterr().err
+        assert stub_pipeline == []
+
+
+def test_a_patch_size_below_one_is_refused(tmp_dir, log_lines, monkeypatch):
+    import numpy as np
+
+    from tests.conftest import write_dted
+
+    monkeypatch.setattr(cli, "verify_grids", lambda *a: None)
+    src = write_dted(os.path.join(tmp_dir, "n06e126.dt0"), np.full((121, 121), 3, dtype=np.int16), 126, 6)
+    for bad in (0, None, -4):
+        assert process_file(src, os.path.join(tmp_dir, "out.dt0"), "EGM2008", "EGM96", True, False, bad,
+                            "bilinear", check_for_wrong_datum=False) is False
+    assert sum("minimum patch size must be at least 1 post" in line for line in log_lines) == 3

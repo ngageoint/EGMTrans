@@ -118,11 +118,12 @@ def synthetic_cell(per_degree, seed_offset=0, base_cm=30000):
     return (cm / 100).astype(np.float32)
 
 
-def write_dted(path, array, lon0, lat0):
+def write_dted(path, array, lon0, lat0, datum_code=None):
     """Write a DTED tile with the posts of *array* on lon0..lon0+1, lat0..lat0+1.
 
     121 x 121 posts make a DTED0 tile (30 arc seconds); the GDAL driver accepts
-    that size everywhere, whereas an odd-sized DTED2 crop is refused.
+    that size everywhere, whereas an odd-sized DTED2 crop is refused. GDAL
+    writes MSL as the vertical datum; *datum_code* (E08, E96) replaces it.
     """
     from osgeo import gdal
 
@@ -131,6 +132,12 @@ def write_dted(path, array, lon0, lat0):
     write_geotiff(scratch, array, point_geotransform(lon0, lat0, array.shape[0]), nodata=-32767)
     gdal.Translate(path, scratch, format="DTED")
     os.remove(scratch)
+    if datum_code:
+        from egmtrans.dted.header import read_header, write_header
+
+        header = read_header(path)
+        header.set_raw("dsi.vertical_datum", datum_code)
+        write_header(path, header)
     return path
 
 

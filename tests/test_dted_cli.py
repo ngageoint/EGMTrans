@@ -13,10 +13,7 @@ from egmtrans.dted.header import read_header, write_header
 from egmtrans.dted.index import read_index
 from tests.conftest import write_dted
 
-SAMPLES = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'samples')
-SRTM = os.path.join(SAMPLES, '03n008e_SRTM.dt2')
-PROFILE = os.path.join(SAMPLES, 'dted_profile_example.toml')
-requires_srtm = pytest.mark.skipif(not os.path.isfile(SRTM), reason='SRTM sample not present')
+PROFILE = os.path.join(os.path.dirname(__file__), 'data', 'dted_profile.toml')
 
 
 @pytest.fixture
@@ -97,7 +94,7 @@ def test_routing_from_the_main_command(dt0, monkeypatch, capsys):
 
 def test_transform_flags_check_the_files(dt0, tmp_dir, monkeypatch, capsys):
     out = os.path.join(tmp_dir, 'out.dt0')
-    monkeypatch.setattr(sys, 'argv', ['egmtrans', '-i', dt0, '-o', out, '-s', 'EGM96', '-t', 'EGM2008',
+    monkeypatch.setattr(sys, 'argv', ['egmtrans', '-i', dt0, '-o', out, '-s', 'EGM2008', '-t', 'EGM96',
                                       '--dted-index', os.path.join(tmp_dir, 'missing.gpkg')])
     with pytest.raises(SystemExit) as excinfo:
         cli.main()
@@ -106,7 +103,7 @@ def test_transform_flags_check_the_files(dt0, tmp_dir, monkeypatch, capsys):
     bad = os.path.join(tmp_dir, 'bad.toml')
     with open(bad, 'w') as handle:
         handle.write('[product]\nsecurity_code = "X"\n')
-    monkeypatch.setattr(sys, 'argv', ['egmtrans', '-i', dt0, '-o', out, '-s', 'EGM96', '-t', 'EGM2008',
+    monkeypatch.setattr(sys, 'argv', ['egmtrans', '-i', dt0, '-o', out, '-s', 'EGM2008', '-t', 'EGM96',
                                       '--dted-profile', bad])
     with pytest.raises(SystemExit) as excinfo:
         cli.main()
@@ -114,12 +111,33 @@ def test_transform_flags_check_the_files(dt0, tmp_dir, monkeypatch, capsys):
     assert 'security_code' in capsys.readouterr().err
 
 
-@requires_srtm
-def test_srtm_sample_is_clean(capsys):
-    assert cli_dted.main(['dted-header', SRTM, '--format', 'json']) == 0
-    document = json.loads(capsys.readouterr().out)
-    assert document['summary']['errors'] == 0 and document['summary']['warnings'] == 0
-    assert document['summary']['cell_id'] == 'N03E008' and document['summary']['partial_cell'] == '99'
+def test_a_cell_the_codec_writes_is_clean_and_so_are_its_companions(tmp_dir, capsys):
+    from egmtrans.dted.header import CellGeometry, new_header
+    from egmtrans.dted.records import write_dted_file
+
+    cell = CellGeometry(0, 8, 3)
+    header = new_header(cell)
+    header.set('dsi.security_code', 'U')
+    header.set_raw('uhl.security_code', 'U  ')
+    header.set('dsi.data_edition', 1)
+    header.set('dsi.match_merge_version', 'A')
+    header.set('dsi.producer_code', 'USNGA')
+    header.set('dsi.compilation_date', '2024-07')
+    header.set('dsi.vertical_datum', 'E96')
+    for key in ('acc.abs_horiz_acc', 'acc.abs_vert_acc', 'acc.rel_horiz_acc', 'acc.rel_vert_acc', 'uhl.abs_vert_acc'):
+        header.set(key, 5)
+    values = np.full((cell.lat_points, cell.lon_lines), 40, dtype=np.int32)
+    values[:10, :10] = -32767
+    header.set('dsi.partial_cell', 99)
+    paths = [os.path.join(tmp_dir, 'N03' + extension) for extension in ('.dt0', '.avg', '.min', '.max')]
+    for path in paths:
+        write_dted_file(path, header, values)
+    assert cli_dted.main(['dted-header', *paths, '--format', 'json', '--check-data']) == 0
+    documents = json.loads(capsys.readouterr().out)
+    for document in documents:
+        assert document['summary']['errors'] == 0 and document['summary']['warnings'] == 0, document['summary']
+        assert document['summary']['cell_id'] == 'N03E008' and document['summary']['partial_cell'] == '99'
+        assert document['summary']['series'] == 'DTED0'
 
 
 def test_index_build_from_a_table(tmp_dir, capsys):

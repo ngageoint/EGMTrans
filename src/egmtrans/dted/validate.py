@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from egmtrans.dted import schema
+from egmtrans.dted.fips import producer_code_warning
 from egmtrans.dted.header import DtedHeader, decode_accuracy, has_visible_text, parse_dms, read_header
 from egmtrans.dted.records import RecordError, read_records
 from egmtrans.dted.schema import (
@@ -138,6 +139,10 @@ def _check_field(item: Field, raw: str, issues: list[Issue]) -> bool:
         elif not re.match(r'^[A-Z]{2}', raw):
             issues.append(Issue('warning', item.record, _short_key(item.key),
                                 f'{raw.strip()!r} does not begin with a FIPS 10-4 country code (3.13.4.1 i)'))
+        else:
+            nation = producer_code_warning(raw)
+            if nation:
+                issues.append(Issue('warning', item.record, _short_key(item.key), nation))
     if item.key == 'dsi.vertical_datum' and not raw.strip():
         issues.append(Issue('error', item.record, _short_key(item.key), 'vertical datum is blank'))
         return False
@@ -389,10 +394,18 @@ def validate_records(path: str, header: DtedHeader, *, verify_checksums: bool = 
     return issues
 
 
-def validate_file(path: str, *, check_data: bool = False) -> tuple[DtedHeader, list[Issue]]:
-    """Read the header of *path* and validate it (and its records when asked)."""
+def validate_file(
+    path: str, *, check_data: bool = False, extension: str | None = None
+) -> tuple[DtedHeader, list[Issue]]:
+    """Read the header of *path* and validate it (and its records when asked).
+
+    *extension* stands in for the path's own when the file is a scratch copy
+    of a file that will get another name, so the level the name claims is
+    checked against the header before the rename.
+    """
     header = read_header(path)
-    extension = os.path.splitext(path)[1]
+    if extension is None:
+        extension = os.path.splitext(path)[1]
     issues = validate_header(header, extension=extension, file_size=os.path.getsize(path))
     if check_data:
         issues.extend(validate_records(path, header))
