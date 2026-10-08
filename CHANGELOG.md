@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A DTED metadata index with several rows for one cell is an error; one of the rows was used without notice.
+- A GeoParquet file with neither the index metadata nor a header column, such as a catalog, is refused as a DTED metadata index; it was read as one, and every header field came from the profile. A GeoPackage without the `dted_cells` layer is refused with a message that lists its layers.
+- Without pyarrow, the metadata of a GeoParquet index (its level) is read through GDAL.
+
 ## [1.9.0] - 2026-10-06
 
 ### Added

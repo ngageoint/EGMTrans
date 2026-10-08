@@ -16,6 +16,11 @@ Dates are ISO dates in the index; the header assembler turns them into YYMM.
 A column that is NULL in every row is not written, so the profile supplies
 that field; a NULL among values means NA for an accuracy and "not from the
 index" for any other field.
+
+A GeoPackage without the cells layer is not an index, and neither is a
+GeoParquet file with neither the index metadata nor a header column (a
+catalog, say): reading one fails with a message that says so. A cell with
+several rows is an error of :func:`validate_index`.
 """
 
 from __future__ import annotations
@@ -248,12 +253,15 @@ def parse_polygon_wkb(blob: bytes) -> list[tuple[float, float]]:
 
 @dataclass
 class DtedIndex:
-    """A loaded index: rows by cell id, subregions by cell id, and the meta table."""
+    """A loaded index: rows by cell id, subregions by cell id, the meta table,
+    and the cells the file holds more than one row for (with how many; the
+    last row read is the one in *rows*)."""
 
     path: str
     rows: dict[str, dict] = field(default_factory=dict)
     subregions: dict[str, list[dict]] = field(default_factory=dict)
     meta: dict[str, str] = field(default_factory=dict)
+    duplicates: dict[str, int] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -275,6 +283,24 @@ class DtedIndex:
         for row in self.rows.values():
             return set(row)
         return set(self.meta.get('columns', '').split(',')) - {''}
+
+
+def _add_row(index: DtedIndex, cell: str, row: dict) -> None:
+    """A row read from a file, counting a cell that comes again."""
+    if cell in index.rows:
+        index.duplicates[cell] = index.duplicates.get(cell, 1) + 1
+    index.rows[cell] = row
+
+
+def _not_an_index(path: str, reason: str, names: list[str], kind: str) -> ValueError:
+    shown = ', '.join(names[:8]) + (f' and {len(names) - 8} more' if len(names) > 8 else '')
+    return ValueError(f'{os.path.basename(path)} is not a DTED metadata index: {reason}'
+                      + (f' (its {kind}: {shown})' if names else '')
+                      + '. "egmtrans dted-index build --from-table" makes an index from a table.')
+
+
+def _holds_header_column(names) -> bool:
+    return any(COLUMNS_BY_NAME[name].dted_key for name in names if name in COLUMNS_BY_NAME)
 
 
 def _driver_for(path: str) -> str:
@@ -466,9 +492,17 @@ def _read_ogr(path: str, driver_name: str | None = None) -> DtedIndex:
     index = DtedIndex(path=path)
     cells = source.GetLayerByName(CELLS_LAYER) if driver_name is None else source.GetLayer(0)
     if cells is None:
-        raise ValueError(f'{os.path.basename(path)} has no {CELLS_LAYER} layer')
+        layers = [source.GetLayer(i).GetName() for i in range(source.GetLayerCount())]
+        raise _not_an_index(path, f'it has no {CELLS_LAYER} layer', layers, 'layers')
     definition = cells.GetLayerDefn()
     names = [definition.GetFieldDefn(i).GetName() for i in range(definition.GetFieldCount())]
+    if driver_name == 'Parquet':
+        # GDAL serves the Parquet file's key-value metadata in this domain.
+        raw_meta = cells.GetMetadataItem(PARQUET_META_KEY, '_PARQUET_METADATA_')
+        if raw_meta:
+            index.meta = {k: str(v) for k, v in json.loads(raw_meta).items()}
+        elif not _holds_header_column(names):
+            raise _not_an_index(path, 'it has neither the index metadata nor a header column', names, 'columns')
     for feature in cells:
         row = {}
         for i, name in enumerate(names):
@@ -477,7 +511,7 @@ def _read_ogr(path: str, driver_name: str | None = None) -> DtedIndex:
         if not cell:
             continue
         row['cell_id'] = cell
-        index.rows[cell] = row
+        _add_row(index, cell, row)
     outlines = source.GetLayerByName(SUBREGIONS_LAYER) if driver_name is None else None
     if outlines is not None:
         definition = outlines.GetLayerDefn()
@@ -569,13 +603,16 @@ def _write_parquet(path: str, rows: dict[str, dict], subregions: dict[str, list[
 def _read_parquet(path: str) -> DtedIndex:
     import pyarrow.parquet as pq
 
-    table = pq.read_table(path)
+    schema = pq.read_schema(path)
     index = DtedIndex(path=path)
-    metadata = table.schema.metadata or {}
+    metadata = schema.metadata or {}
     raw_meta = metadata.get(PARQUET_META_KEY.encode())
     if raw_meta:
         index.meta = {k: str(v) for k, v in json.loads(raw_meta).items()}
-    for record in table.to_pylist():
+    elif not _holds_header_column(schema.names):
+        names = [name for name in schema.names if name != 'geometry']
+        raise _not_an_index(path, 'it has neither the index metadata nor a header column', names, 'columns')
+    for record in pq.read_table(path).to_pylist():
         record.pop('geometry', None)
         cell = str(record.get('cell_id') or '').upper()
         if not cell:
@@ -584,7 +621,7 @@ def _read_parquet(path: str) -> DtedIndex:
             if column.name in record and column.type == 'date':
                 record[column.name] = parse_date(record[column.name])
         record['cell_id'] = cell
-        index.rows[cell] = record
+        _add_row(index, cell, record)
     sub_path = _subregions_path(path)
     if os.path.isfile(sub_path):
         for record in pq.read_table(sub_path).to_pylist():
@@ -671,9 +708,14 @@ def read_index(path: str) -> DtedIndex:
 
 
 def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]:
-    """Problems with an index: bad keys, values out of range, level mismatch,
-    subregion rules, missing required columns."""
+    """Problems with an index: cells with several rows, bad keys, values out
+    of range, level mismatch, subregion rules, missing required columns."""
     issues: list[Issue] = []
+    if index.duplicates:
+        shown = ', '.join(f'{cell} ({count} rows)' for cell, count in sorted(index.duplicates.items())[:5])
+        more = f' and {len(index.duplicates) - 5} more' if len(index.duplicates) > 5 else ''
+        issues.append(Issue('error', 'INDEX', 'cell_id', f'{len(index.duplicates)} cell(s) have several rows: '
+                                                         f'{shown}{more}; an index holds one row per cell'))
     present = index.columns
     for column in INDEX_COLUMNS:
         if column.required and column.name not in present:

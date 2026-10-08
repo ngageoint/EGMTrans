@@ -641,6 +641,10 @@ def build_index(
     meta: dict = {}
     if update and os.path.isfile(out):
         existing = read_index(out)
+        if existing.duplicates:
+            # Rewriting would keep one of each cell's rows without a word.
+            raise ValueError(f'{os.path.basename(out)} holds several rows for {len(existing.duplicates)} cell(s) '
+                             f'({", ".join(sorted(existing.duplicates)[:5])}); keep one row per cell, then update')
         rows, subregions, meta = existing.rows, existing.subregions, dict(existing.meta)
         meta.pop('created', None)
         meta.pop('cells', None)
