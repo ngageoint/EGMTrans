@@ -69,7 +69,13 @@ egmtrans dted-index build --out collection.gpkg --from-table catalog.parquet --p
   --map compilation_date=creation_date --set security_code=U --profile product.toml
 
 egmtrans dted-index validate collection.gpkg --profile product.toml --level 2
+
+# A field the run gives every cell (the compilation date of a profile without one) is given
+# to validate the same way, so the index and the profile check as the run will see them
+egmtrans dted-index validate collection.gpkg --profile product.toml --level 2 --dted-set compilation_date=today
 ```
+
+`dted-index validate` checks the index, the profile and the `--dted-set` overrides of the run they are meant for: the values, the keys and the subregions, the level, the producer codes against FIPS 10-4, and that every required header field comes from one of them. A field an override supplies is not reported as missing from the index.
 
 The profile's `[harvest.tags.fields]` map index columns to raster metadata tags and `[harvest.xml.fields]` to XPath expressions in a sidecar found through `[harvest.xml] sidecar` (`{stem}`, `{name}`, `{cell}` and `{dir}` are replaced); a mapping may be a table with a `pattern` whose first group is the value, and an XML mapping may list several XPaths, tried in order until one yields a value. XPath with namespaces and predicates needs `lxml`; a sidecar that declares a DOCTYPE or entities is refused. Harvested accuracies are rounded up to whole meters. Values the build cannot find stay NULL, to be filled in any GIS or with a script, and `dted-index validate` lists what is missing.
 

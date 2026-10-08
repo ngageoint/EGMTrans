@@ -84,6 +84,33 @@ def test_index_build_and_validate(dt0, tmp_dir, capsys):
     assert cli_dted.main(['dted-index', 'build', '--out', out]) == 2
 
 
+def test_index_validate_takes_the_overrides_of_the_run(tmp_dir, capsys):
+    """An index and a profile that leave the compilation date to the run (--dted-set
+    compilation_date=today) check clean when validate is given the same override."""
+    from egmtrans.dted.index import new_row, write_index
+
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    write_index(out, [new_row('N06E126', security_code='U', abs_vert_acc=5)], level=2)
+    with open(PROFILE, encoding='utf-8') as handle:
+        product = [line for line in handle.read().split('[harvest')[0].splitlines()
+                   if not line.startswith('compilation_date')]
+    profile = os.path.join(tmp_dir, 'no_date.toml')
+    with open(profile, 'w', encoding='utf-8') as handle:
+        handle.write('\n'.join(product) + '\n')
+    validate = ['dted-index', 'validate', out, '--level', '2', '--profile', profile]
+
+    assert cli_dted.main(validate) == 1
+    assert 'Neither the index, the profile nor --dted-set supplies: compilation_date' in capsys.readouterr().err
+    assert cli_dted.main(validate + ['--dted-set', 'compilation_date=today']) == 0
+    err = capsys.readouterr().err
+    assert 'compilation_date' not in err and '0 error(s)' in err
+    # The value is checked as in a run, and a producer code as in a run too.
+    assert cli_dted.main(validate + ['--dted-set', 'compilation_date=1975-06']) == 2
+    assert '--dted-set: compilation_date: a DTED YYMM date must fall in 1980-2079' in capsys.readouterr().err
+    assert cli_dted.main(validate + ['--dted-set', 'compilation_date=today', '--dted-set', 'producer_code=AUTEST']) == 0
+    assert 'WARNING OVERRIDE.producer_code: AU is Austria in FIPS 10-4' in capsys.readouterr().err
+
+
 def test_routing_from_the_main_command(dt0, monkeypatch, capsys):
     monkeypatch.setattr(sys, 'argv', ['egmtrans', 'dted-header', dt0, '--format', 'json'])
     with pytest.raises(SystemExit) as excinfo:

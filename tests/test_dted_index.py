@@ -541,6 +541,26 @@ def test_header_dates_keep_to_the_readers_century_but_catalog_dates_do_not():
     assert check_value(COLUMNS_BY_NAME['source_date'], '1975-06') is None, 'a catalog date may hold any year'
 
 
+def test_fields_the_run_supplies_are_not_reported_missing():
+    index = DtedIndex(path='<memory>', rows={
+        'N06E126': {'cell_id': 'N06E126', 'security_code': 'U', 'data_edition': 1, 'match_merge_version': 'A',
+                    'producer_code': 'AUTEST', 'abs_horiz_acc': 3, 'abs_vert_acc': 3, 'rel_horiz_acc': 3,
+                    'rel_vert_acc': 3},
+        'N06E127': {'cell_id': 'N06E127', 'security_code': 'U', 'data_edition': 1, 'match_merge_version': 'A',
+                    'producer_code': None, 'abs_horiz_acc': 3, 'abs_vert_acc': 3, 'rel_horiz_acc': 3,
+                    'rel_vert_acc': 3},
+    })
+
+    def warned(supplied=()):
+        return sorted(issue.key for issue in validate_index(index, supplied=supplied) if issue.severity == 'warning')
+
+    # The index has no compilation date, one blank producer code and one that is Austria in FIPS 10-4.
+    assert warned() == ['compilation_date', 'producer_code', 'producer_code']
+    # A run that sets both in every header (--dted-set) leaves nothing to warn about.
+    assert warned({'compilation_date', 'producer_code'}) == []
+    assert warned({'compilation_date'}) == ['producer_code', 'producer_code']
+
+
 def test_a_blank_required_value_is_null_and_reported(tmp_dir):
     from egmtrans.dted.index import normalize_value
 

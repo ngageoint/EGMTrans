@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `egmtrans dted-index validate --dted-set FIELD=VALUE` takes the overrides of the run an index is meant for, as the transform does: a field the run gives every cell, such as `compilation_date=today` for a profile without a compilation date, counts as supplied instead of stopping the check, and is not reported as missing from the index.
+
+### Changed
+
+- `egmtrans dted-index validate` checks the producer codes of the profile and of the overrides against FIPS 10-4, as a run does; it checked only the producer codes of the index.
+
 ## [1.10.0] - 2026-10-08
 
 ### Added

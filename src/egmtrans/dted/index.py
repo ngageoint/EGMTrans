@@ -30,6 +30,7 @@ import json
 import os
 import re
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from egmtrans.dted.fips import producer_code_warning
@@ -720,9 +721,16 @@ def read_index(path: str) -> DtedIndex:
     raise RuntimeError('Reading a GeoParquet index needs pyarrow or a GDAL with the Parquet driver')
 
 
-def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]:
+def validate_index(index: DtedIndex, *, level: int | None = None, supplied: Iterable[str] = ()) -> list[Issue]:
     """Problems with an index: cells with several rows, bad keys, values out
-    of range, level mismatch, subregion rules, missing required columns."""
+    of range, level mismatch, subregion rules, missing required columns.
+
+    *supplied* names the header fields a run gives every cell (its
+    ``--dted-set`` overrides): the index may leave them out, or NULL, without
+    a warning, and its own values for them are not checked against FIPS 10-4,
+    since no header gets them.
+    """
+    supplied = set(supplied)
     issues: list[Issue] = []
     if index.duplicates:
         shown = ', '.join(f'{cell} ({count} rows)' for cell, count in sorted(index.duplicates.items())[:5])
@@ -731,7 +739,7 @@ def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]
                                                          f'{shown}{more}; an index holds one row per cell'))
     present = index.columns
     for column in INDEX_COLUMNS:
-        if column.required and column.name not in present:
+        if column.required and column.name not in present and column.name not in supplied:
             issues.append(Issue('warning', 'INDEX', column.name,
                                 'required column is missing; the profile must supply it for every cell'))
     if level is not None and index.level is not None and index.level != level:
@@ -758,12 +766,13 @@ def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]
             if name in row and row[name] is None:
                 issues.append(Issue('info', 'INDEX', f'{cell}.{name}', 'NULL, so the header will say NA'))
         for column in HEADER_COLUMNS:
-            if column.required and column.name not in ACCURACY_COLUMNS and column.name in row:
+            if (column.required and column.name not in ACCURACY_COLUMNS and column.name in row
+                    and column.name not in supplied):
                 value = row[column.name]
                 if value is None or (isinstance(value, str) and not value.strip()):
                     blank_required.setdefault(column.name, []).append(cell)
         producer = row.get('producer_code')
-        if isinstance(producer, str) and producer.strip():
+        if isinstance(producer, str) and producer.strip() and 'producer_code' not in supplied:
             nation = producer_code_warning(producer)
             if nation:
                 nation_warnings.setdefault(nation, []).append(cell)

@@ -201,7 +201,7 @@ class DtedMetadataSource:
     def validate(self, level: int | None = None) -> list[Issue]:
         issues = []
         if self.index is not None:
-            issues.extend(validate_index(self.index, level=level))
+            issues.extend(validate_index(self.index, level=level, supplied=self.overrides))
         if self.profile is not None and level is not None and self.profile.level not in (None, level):
             issues.append(Issue('error', 'PROFILE', 'dted_level',
                                 f'the profile is for level {self.profile.level}, not {level}'))

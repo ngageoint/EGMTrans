@@ -97,10 +97,20 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument('--product', metavar='NAME', help='Product name recorded in the index meta table')
     build.add_argument('--update', action='store_true', help='Update an existing index instead of replacing it')
 
-    validate = index_commands.add_parser('validate', help='Check an index against the schema.')
+    validate = index_commands.add_parser(
+        'validate', help='Check an index against the schema.',
+        description='Check an index, and the profile and the --dted-set overrides of the run it is meant for: '
+                    'values, keys and subregions, the level, the producer codes against FIPS 10-4, and that every '
+                    'required header field comes from the index, the profile or an override.',
+    )
     validate.add_argument('index', metavar='INDEX', help='Index to check (.gpkg or .parquet)')
     validate.add_argument('--profile', metavar='FILE', help='Product profile to check alongside')
     validate.add_argument('--level', type=int, choices=(0, 1, 2), help='DTED level the index must be for')
+    validate.add_argument(
+        '--dted-set', action='append', default=[], metavar='FIELD=VALUE',
+        help='A value the run writes in every header, as the transform\'s --dted-set (may be repeated): a field '
+             'the index and the profile leave to the run, such as compilation_date=today, counts as supplied',
+    )
 
     selftest = subparsers.add_parser(
         'dted-selftest', help='Convert built-in synthetic tiles to DTED and compare the bytes with the reference.',
@@ -235,13 +245,21 @@ def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
 
 
 def run_index_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """Check an index as a run with the same profile and overrides would see it."""
+    from egmtrans.dted.writer import DtedMetadataSource, parse_overrides
+
+    try:
+        overrides = parse_overrides(args.dted_set)
+    except ValueError as e:
+        logger.error(f'--dted-set: {e}')
+        return 2
     try:
         index = read_index(args.index)
     except (OSError, ValueError, RuntimeError) as e:
         logger.error(str(e))
         return 2
     level = args.level
-    issues = validate_index(index, level=level)
+    profile = None
     if args.profile:
         try:
             profile = load_profile(args.profile)
@@ -251,13 +269,12 @@ def run_index_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
         if level is not None and profile.level not in (None, level):
             logger.error(f'The profile is for level {profile.level}, not {level}')
             return 1
-        from egmtrans.dted.index import HEADER_COLUMNS
-
         missing = [c.name for c in HEADER_COLUMNS if c.required and c.name not in index.columns
-                   and c.name not in profile.product]
+                   and c.name not in profile.product and c.name not in overrides]
         if missing:
-            logger.error(f'Neither the index nor the profile supplies: {", ".join(missing)}')
+            logger.error(f'Neither the index, the profile nor --dted-set supplies: {", ".join(missing)}')
             return 1
+    issues = DtedMetadataSource(index, profile, overrides).validate(level)
     logger.info(f'{os.path.basename(args.index)}: {len(index)} cell(s), level {index.level}, '
                 f'{sum(len(s) for s in index.subregions.values())} subregion(s)')
     for issue in issues:
