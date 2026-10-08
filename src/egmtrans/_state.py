@@ -1,4 +1,4 @@
-"""Mutable runtime state — replaces module-level globals from the monolithic script.
+"""Mutable runtime state: replaces module-level globals from the monolithic script.
 
 The original EGMTrans.py relied on ``global`` variables for the logger, arcpy
 module, arc-mode flag, and log-file path.  This module provides getter/setter
@@ -51,3 +51,17 @@ def set_log_file_path(path: str | None) -> None:
 def get_logger() -> logging.Logger:
     """Return the shared ``egmtrans`` logger instance."""
     return logging.getLogger("egmtrans")
+
+
+_quiet: bool = False
+
+
+def get_quiet() -> bool:
+    """True while a large batch keeps the ArcGIS Pro messages pane to progress lines and warnings."""
+    return _quiet
+
+
+def set_quiet(value: bool) -> None:
+    """Set or clear the quiet mode of the ArcGIS Pro log handler."""
+    global _quiet
+    _quiet = value

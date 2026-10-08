@@ -28,6 +28,7 @@ import os
 from dataclasses import dataclass, field
 
 from egmtrans import _state
+from egmtrans.dted.fips import producer_code_warning
 from egmtrans.dted.header import (
     AccSubregion,
     CellGeometry,
@@ -204,6 +205,15 @@ class DtedMetadataSource:
         if self.profile is not None and level is not None and self.profile.level not in (None, level):
             issues.append(Issue('error', 'PROFILE', 'dted_level',
                                 f'the profile is for level {self.profile.level}, not {level}'))
+        for where, values in (
+            ('PROFILE', self.profile.product if self.profile is not None else {}),
+            ('OVERRIDE', self.overrides),
+        ):
+            producer = values.get('producer_code')
+            if isinstance(producer, str) and producer.strip():
+                nation = producer_code_warning(producer)
+                if nation:
+                    issues.append(Issue('warning', where, 'producer_code', nation))
         return issues
 
     def for_cell(self, cell_id: str) -> DtedMetadata:
@@ -242,7 +252,11 @@ class DtedMetadataSource:
             if name in self.overrides:
                 overridden.append(name)
                 continue
-            nulls = sum(1 for row in rows if row.get(name) is None) if name in present else None
+            if name in present:
+                blank = (lambda value: value is None) if name in ACCURACY_COLUMNS else is_blank
+                nulls = sum(1 for row in rows if blank(row.get(name)))
+            else:
+                nulls = None
             if nulls == 0:
                 from_index.append(name)
                 continue
@@ -250,7 +264,7 @@ class DtedMetadataSource:
                 partly[name] = nulls
                 if name in ACCURACY_COLUMNS:
                     continue  # a NULL accuracy is an explicit NA
-            if name in product:
+            if name in product and not (column.required and is_blank(product[name])):
                 from_profile.append(name)
             elif column.required and not (name == 'abs_horiz_acc' and cli_abs_horiz_accuracy is not None):
                 missing[name] = nulls if nulls is not None else (len(rows) or 1)
@@ -278,6 +292,11 @@ class DerivedFields:
     partial_cell: int | None = None  # None keeps the base header's value
 
 
+def is_blank(value) -> bool:
+    """True for None and for text that holds no visible character."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def _apply(header: DtedHeader, sources: dict[str, str], column_name: str, value, source: str) -> None:
     column = COLUMNS_BY_NAME[column_name]
     key = column.dted_key
@@ -287,6 +306,11 @@ def _apply(header: DtedHeader, sources: dict[str, str], column_name: str, value,
             sources[key] = source
             return
         if value is None:
+            return
+        if column.required and is_blank(value):
+            # Eight blanks are not a producer code: a required field needs a
+            # value, so a blank one is no source (an optional text field may
+            # be blanked on purpose).
             return
         if column.type == 'date':
             header.set(key, to_yymm(value))

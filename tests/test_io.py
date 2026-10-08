@@ -135,7 +135,7 @@ class TestRestoreNodata:
 class TestWriteDted:
     """A DTED file written from scratch: rounded, verified, published by rename."""
 
-    PROFILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'samples', 'dted_profile_example.toml')
+    PROFILE = os.path.join(os.path.dirname(__file__), 'data', 'dted_profile.toml')
 
     def _metadata(self, level=2):
         from egmtrans.dted.profile import load_profile
@@ -199,10 +199,11 @@ class TestWriteDted:
             write_dted(out, cell, heights, 'EGM96', temp_dir=tmp_dir)
         with pytest.raises(HeaderAssemblyError, match='profile is for DTED level 2'):
             write_dted(out, cell, heights, 'EGM96', temp_dir=tmp_dir, metadata=self._metadata(level=2))
-        with pytest.raises(ValueError, match='Unsupported target datum'):
-            write_dted(out, cell, heights, 'WGS84', temp_dir=tmp_dir, metadata=self._metadata(level=0))
-        with pytest.raises(ValueError, match='Unsupported target datum'):
-            new_dted_header(cell, 'WGS84', metadata=self._metadata(level=0))
+        for target in ('WGS84', 'EGM2008'):
+            with pytest.raises(ValueError, match='EGM96 only'):
+                write_dted(out, cell, heights, target, temp_dir=tmp_dir, metadata=self._metadata(level=0))
+            with pytest.raises(ValueError, match='EGM96 only'):
+                new_dted_header(cell, target, metadata=self._metadata(level=0))
         heights[5, 5] = 9001.0
         with pytest.raises(RecordError, match='outside'):
             write_dted(out, cell, heights, 'EGM96', temp_dir=tmp_dir, metadata=self._metadata(level=0))
@@ -210,10 +211,28 @@ class TestWriteDted:
 
         # The dry run and the write build the same header.
         heights[5, 5] = 100.0
-        header, sources = new_dted_header(cell, 'EGM2008', 7, metadata=self._metadata(level=0))
-        assert header['dsi.vertical_datum'] == 'E08' and header['acc.abs_horiz_acc'] == '0012'
+        header, sources = new_dted_header(cell, 'EGM96', 7, metadata=self._metadata(level=0))
+        assert header['dsi.vertical_datum'] == 'E96' and header['acc.abs_horiz_acc'] == '0012'
         assert sources['acc.abs_horiz_acc'] == 'profile'
-        write_dted(out, cell, heights, 'EGM2008', 7, tmp_dir, metadata=self._metadata(level=0))
+        assert header['dsi.unique_ref'] == '0' * 15, 'zero filled when nothing supplies it (3.13.4.1 c)'
+        write_dted(out, cell, heights, 'EGM96', 7, tmp_dir, metadata=self._metadata(level=0))
         from egmtrans.dted.header import read_header
 
         assert read_header(out) == header
+
+
+class TestLevelAgainstName:
+    def test_a_level_2_cell_written_to_a_dt1_name_is_refused(self, tmp_dir):
+        from egmtrans.dted.header import CellGeometry
+        from egmtrans.dted.profile import load_profile
+        from egmtrans.dted.writer import DtedMetadata
+        from egmtrans.io import write_dted
+
+        profile = load_profile(TestWriteDted.PROFILE)
+        profile.product['dted_level'] = 0
+        cell = CellGeometry(0, 126, 6)
+        heights = np.full((121, 121), 100.0)
+        out = os.path.join(tmp_dir, 'N06E126.dt1')
+        with pytest.raises(RuntimeError, match='ambiguous'):
+            write_dted(out, cell, heights, 'EGM96', temp_dir=tmp_dir, metadata=DtedMetadata(None, [], profile))
+        assert os.listdir(tmp_dir) == []

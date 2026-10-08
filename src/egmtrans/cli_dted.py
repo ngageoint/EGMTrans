@@ -1,7 +1,8 @@
-"""The ``dted-header``, ``dted-index`` and ``dted-selftest`` subcommands.
+"""The ``dted-header``, ``dted-index``, ``dted-selftest`` and ``dmed`` subcommands.
 
     egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH]
                          [--zero-based] [--check-data] [--strict]
+    egmtrans dmed FOLDER [--out PATH] [--check]
     egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH...
                          | --from-table FILE [--layer NAME] [--cell-field NAME]
                            [--map INDEX_COLUMN=TABLE_COLUMN]... [--set INDEX_COLUMN=VALUE]...
@@ -22,13 +23,14 @@ import os
 import sys
 
 from egmtrans import _state
+from egmtrans.dted.companions import COMPANION_EXTENSIONS
 from egmtrans.dted.harvest import build_index, parse_column_map, parse_constants
 from egmtrans.dted.index import HEADER_COLUMNS, DtedIndex, read_index, validate_index
 from egmtrans.dted.profile import load_profile
 from egmtrans.dted.report import FORMATS, build_report, render_report
 from egmtrans.dted.validate import count, validate_file
 
-SUBCOMMANDS = ('dted-header', 'dted-index', 'dted-selftest')
+SUBCOMMANDS = ('dted-header', 'dted-index', 'dted-selftest', 'dmed')
 
 
 def _stderr_logger() -> logging.Logger:
@@ -53,7 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
         description='Report every field of the UHL, DSI and ACC records of DTED files, with the level evidence, '
                     'a summary and the MIL-PRF-89020B findings.',
     )
-    header.add_argument('files', nargs='+', metavar='FILE', help='DTED file(s) (.dt0, .dt1, .dt2)')
+    header.add_argument('files', nargs='+', metavar='FILE',
+                        help='DTED file(s) (.dt0, .dt1, .dt2, or a DTED0 companion .avg, .min or .max)')
     header.add_argument('--format', choices=FORMATS, default='text', help='Report format (default: text)')
     header.add_argument('--out', metavar='PATH', help='Write the report to this file instead of stdout')
     header.add_argument('--zero-based', action='store_true',
@@ -109,7 +112,27 @@ def build_parser() -> argparse.ArgumentParser:
                           help='Write the tiles and the DTED files to this folder and keep them')
     selftest.add_argument('--print-reference', action='store_true',
                           help='Print the hashes as the REFERENCE mapping of egmtrans.dted.selftest')
+
+    dmed = subparsers.add_parser(
+        'dmed', help='Write the DMED volume file of a DTED delivery.',
+        description='Describe every cell under the DTED folder of a delivery (DTED/E006/N49.dt2, '
+                    'MIL-PRF-89020B 3.10.7.2) in the DMED file of 3.9.5: the bounding rectangle, then for each '
+                    'cell of the rectangle its edition, its match/merge version and the minimum, maximum, mean '
+                    'and standard deviation of the posts of each 15-minute area. The file is written as DMED at '
+                    'the root of the delivery, beside the DTED folder.',
+    )
+    dmed.add_argument('folder', metavar='FOLDER', help='The delivery (the folder that holds DTED/), or its DTED folder')
+    dmed.add_argument('--out', metavar='PATH', help='Write the DMED to this file instead of <FOLDER>/DMED')
+    dmed.add_argument('--check', action='store_true',
+                      help='Do not write: compare the existing DMED with what the cells give')
     return parser
+
+
+def report_extension(path: str) -> str:
+    """The extension the validator judges *path* by: a DTED0 companion file
+    (``.avg``, ``.min``, ``.max``) is judged as a ``.dt0``."""
+    extension = os.path.splitext(path)[1].lower()
+    return '.dt0' if extension in COMPANION_EXTENSIONS else extension
 
 
 def _write_out(text: str, out: str | None) -> None:
@@ -128,7 +151,7 @@ def run_header(args: argparse.Namespace, logger: logging.Logger) -> int:
             logger.error(f'Not a file: {path}')
             return 2
         try:
-            header, issues = validate_file(path, check_data=args.check_data)
+            header, issues = validate_file(path, check_data=args.check_data, extension=report_extension(path))
         except (OSError, ValueError) as e:
             logger.error(f'{path}: {e}')
             return 2
@@ -279,6 +302,34 @@ def run_selftest(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 1
 
 
+def run_dmed(args: argparse.Namespace, logger: logging.Logger) -> int:
+    from egmtrans.dted.dmed import DmedError, check_dmed, write_dmed
+
+    try:
+        if args.check:
+            problems = check_dmed(args.folder, args.out)
+            if problems:
+                for problem in problems:
+                    logger.error(problem)
+                logger.error('The DMED does not match the cells.')
+                return 1
+            logger.info('The DMED matches the cells.')
+            return 0
+        result = write_dmed(args.folder, args.out)
+    except DmedError as e:
+        logger.error(str(e))
+        return 2
+    except OSError as e:
+        logger.error(f'The DMED could not be written: {e}')
+        return 1
+    rectangle = result.rectangle
+    logger.info(
+        f'Wrote {result.path}: {result.record_count} records of 394 bytes for {len(result.cells)} cell(s) in a '
+        f'rectangle of {rectangle.east - rectangle.west} x {rectangle.north - rectangle.south} degrees.'
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run a subcommand; returns the exit code."""
     parser = build_parser()
@@ -288,6 +339,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_header(args, logger)
     if args.command == 'dted-selftest':
         return run_selftest(args, logger)
+    if args.command == 'dmed':
+        return run_dmed(args, logger)
     if args.index_command == 'build':
         return run_index_build(args, logger)
     return run_index_validate(args, logger)

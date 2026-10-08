@@ -70,27 +70,27 @@ PRODUCT = {
 # whenever the conversion is meant to change.
 REFERENCE: dict[str, tuple[str, str]] = {
     'N49E006.dt2': (
-        '0d1ceba1e744b40dc83c5280eac94fb98910586cc80fb119819527f34613e9bb',
+        '08d2490713f7ae4f806fe41e777020fa9e0b13dc3d0dcaa47285ed61f6fdb09a',
         'e9ad50fdf1f9d43b3b23ecc456655ee1237a18f13aef821ded818adfdad5c16c',
     ),
     'N49E006.dt1': (
-        '40802b415759d5dbb5f620f0c1224441b072bf63a3ba8b25139ec0461f2d9987',
+        'd7b1c7879a1b1eb685617f0ad857d457781a58d8d231df2dbaca3d4416ff6b75',
         'c8fc6060ffa831eb6d83d5a95094fb8c12d1d1508f45780645a5b3a5d05aa07b',
     ),
     'N49E006.dt0': (
-        '1f5ed7dc0b3fbd1eeff5f95915b9d22dc6b8cbe16f3a2ab64c32f7959a4bdfbd',
+        'cc9ebe41c3d2fd519d2a451e62012e10782701af90bd1022de9af47b040cd087',
         'b883635a167118f605ccc3183297827834accf5982274affd2724944c996fd42',
     ),
     'N50E006.dt2': (
-        '1dd65c04c5a67e34c97922595bc07a1b2395f2fde8a6f1cbd5a79931e7ad3fbb',
+        'b6dda3601a86e94e02bc797983ae7b97dc232dd42f0a2876669000f8ffba55cb',
         '3e6f7d3befac435fbbcc98bf480222630358e18eeb118ec0d84d18530e5347e7',
     ),
     'N50E006.dt1': (
-        '057047ead43c1988022428d4cb568c50c6abb1670d7b7258ab5fe28674cf24d1',
+        '73abfb93a1c10183ee7de024a24ae07c7260a6ff2e65d8be65c4f4827735a9f3',
         '0e797efaa6994e718ba16a650688339df0167bdacdbc98c6b209ae71802e92e0',
     ),
     'N50E006.dt0': (
-        '5087d34b501f10c07b296cf6ed88fcb9665c382ddf629aa59ded953c98036398',
+        '1058e4faeb02f5d4b1ebccd07a8d8a77c08dc328574899c2019f429cd30f671a',
         '48b881f244b13e019649dd2a808ca71b35af02e47343757d77b525f1f2fb3204',
     ),
 }

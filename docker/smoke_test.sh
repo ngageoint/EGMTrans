@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Prove the EGMTrans image transforms a GeoTIFF and a DTED file, and makes DTED from
-# a GeoTIFF, with the network off.
+# Prove the EGMTrans image transforms a GeoTIFF and a DTED file, makes a standard
+# DTED delivery from GeoTIFF tiles with its DMED, and refuses an EGM2008 DTED
+# target, with the network off. Every input is synthetic: the self-test's tiles.
 #
-#   docker/smoke_test.sh                  build egmtrans:smoke, then test it
-#   docker/smoke_test.sh egmtrans:1.9.0   test an image that is already built
+#   docker/smoke_test.sh                   build egmtrans:smoke, then test it
+#   docker/smoke_test.sh egmtrans:1.10.0   test an image that is already built
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,98 +22,116 @@ chmod 0777 "$work"
 run() { docker run --rm --network none --user "$(id -u):$(id -g)" -v "$work:/data" "$image" "$@"; }
 py() { docker run --rm --network none --user "$(id -u):$(id -g)" -v "$work:/data" --entrypoint python "$image" -c "$1"; }
 
-samples=/opt/egmtrans/samples
+echo "0/5 The self-test writes its synthetic tiles and EGM96 cells"
+run dted-selftest --keep /data/selftest >/dev/null 2>&1 || { echo "    the self-test did not reproduce the reference bytes" >&2; exit 1; }
+mkdir -p "$work/tiles"
+cp "$work/selftest/south.tif" "$work/selftest/north.tif" "$work/tiles/"
 
-echo "1/4 GeoTIFF: Copernicus DEM (EGM2008) to EGM96"
-run -i "$samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif" -o /data/cop_egm96.tif \
-    -s EGM2008 -t EGM96 -y -l False >/dev/null
+echo "1/5 GeoTIFF: a synthetic tile (EGM2008) to EGM96"
+run -i /data/tiles/south.tif -o /data/south_egm96.tif -s EGM2008 -t EGM96 -y -l False >/dev/null
 py "
 import numpy as np
 from osgeo import gdal
-src = gdal.Open('$samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif').ReadAsArray()
-ds = gdal.Open('/data/cop_egm96.tif')
+src = gdal.Open('/data/tiles/south.tif')
+source = src.GetRasterBand(1).ReadAsArray()
+void = source == src.GetRasterBand(1).GetNoDataValue()
+ds = gdal.Open('/data/south_egm96.tif')
 out = ds.ReadAsArray()
 wkt = ds.GetSpatialRef().ExportToWkt()
 assert 'EGM96' in wkt, wkt
-assert np.array_equal(np.isnan(src), np.isnan(out)), f'{int(np.isnan(out).sum())} voids in the output'
-ocean = np.abs(np.round(src, 2)) < 0.01
-assert np.all(out[ocean] == 0), 'ocean left 0 m'
-print(f'    compound CRS carries EGM96 height, {int(ocean.sum()):,} ocean pixels at 0 m, no new voids: ok')
+assert np.array_equal(void, np.isnan(out)), f'{int(np.isnan(out).sum())} voids in the output, {int(void.sum())} in the source'
+ocean = np.abs(source) < 0.015
+assert np.all(out[ocean & ~void] == 0), 'ocean left 0 m'
+print(f'    compound CRS carries EGM96 height, {int(ocean.sum()):,} ocean posts at 0 m, voids kept: ok')
 "
 
-echo "2/4 DTED2: SRTM (EGM96) to EGM2008 and back"
-run -i "$samples/03n008e_SRTM.dt2" -o /data/srtm_egm08.dt2 -s EGM96 -t EGM2008 -y -l False >/dev/null
-run -i /data/srtm_egm08.dt2 -o /data/srtm_egm96.dt2 -s EGM2008 -t EGM96 -y -l False >/dev/null
+echo "2/5 DTED2: a cell relabeled E08 to EGM96 (the DTED-to-DTED path)"
+py "
+from egmtrans.dted.header import read_header, write_header
+path = '/data/selftest/N49E006.dt2'
+header = read_header(path)
+header.set_raw('dsi.vertical_datum', 'E08')
+write_header(path, header)
+"
+run -i /data/selftest/N49E006.dt2 -o /data/N49E006_egm96.dt2 -s EGM2008 -t EGM96 -y -l False >/dev/null
 py "
 import numpy as np
 from osgeo import gdal
-
 messages = []
 gdal.PushErrorHandler(lambda cls, no, msg: messages.append(msg))
 gdal.SetConfigOption('DTED_VERIFY_CHECKSUM', 'YES')
-src = gdal.Open('$samples/03n008e_SRTM.dt2').ReadAsArray().astype(int)
-mid = gdal.Open('/data/srtm_egm08.dt2').ReadAsArray().astype(int)
-out = gdal.Open('/data/srtm_egm96.dt2').ReadAsArray().astype(int)
+src = gdal.Open('/data/selftest/N49E006.dt2').ReadAsArray().astype(int)
+out = gdal.Open('/data/N49E006_egm96.dt2').ReadAsArray().astype(int)
 gdal.PopErrorHandler()
-with open('/data/srtm_egm96.dt2', 'rb') as f:
+with open('/data/N49E006_egm96.dt2', 'rb') as f:
     code = f.read()[221:224].decode()
 void = src == -32767
 assert not [m for m in messages if 'checksum' in m.lower()], messages
 assert code == 'E96', code
 assert np.array_equal(void, out == -32767), 'voids moved'
 assert np.all(out[src == 0] == 0), 'ocean left 0 m'
-# Integer DTED cannot tell land that rounds to 0 m from ocean, so the return trip
-# holds those posts at 0. Everything else must come back within DTED's 1 m rounding.
-sea_level_land = ~void & (src != 0) & (mid == 0)
-comparable = ~void & ~sea_level_land
-assert np.abs(out[comparable] - src[comparable]).max() <= 1, 'round trip drifted more than DTED rounding'
-print(f'    header E96, {int(void.sum()):,} voids kept, ocean at 0 m, record checksums valid,')
-print(f'    round trip within 1 m except {int(sea_level_land.sum())} land posts that rounded to 0 m: ok')
+shift = out[~void] - src[~void]
+assert shift.min() >= -2 and shift.max() <= 2, 'the datum shift is not of the expected size'
+print(f'    header E96, {int(void.sum()):,} voids kept, ocean at 0 m, record checksums valid: ok')
 "
 
-echo "3/4 Unattended: a prompt that cannot be answered exits with code 2"
+echo "3/5 Unattended: a prompt that cannot be answered exits with code 2"
 set +e
-run -i "$samples/03n008e_SRTM.dt2" -o /data/mismatch.dt2 -s EGM2008 -t EGM96 -l False >/dev/null 2>&1
+run -i /data/selftest/N49E006.dt2 -o /data/mismatch.dt2 -s EGM96 -t EGM96 -l False >/dev/null 2>&1
 rc=$?
 set -e
 if [[ $rc -ne 2 ]]; then
     echo "    expected exit code 2 without --yes, got $rc" >&2
     exit 1
 fi
-echo "    header says EGM96 but -s says EGM2008, no --yes: exit code 2: ok"
+echo "    header says E08 but -s says EGM96, no --yes: exit code 2: ok"
 
-echo "4/4 DTED from GeoTIFF: the self-test, then the SRTM sample as a Float32 tile to DTED2"
-run dted-selftest >/dev/null 2>&1 || { echo "    the self-test did not reproduce the reference bytes" >&2; exit 1; }
+echo "4/5 DTED from GeoTIFF: two tiles to the standard tree, headers checked, DMED built"
+cat > "$work/product.toml" <<'TOML'
+schema = 1
+[product]
+dted_level = 2
+security_code = "U"
+data_edition = 1
+match_merge_version = "A"
+producer_code = "USNGA"
+digitizing_system = "SYNTHETIC"
+compilation_date = "2026-01"
+abs_horiz_acc = 10
+abs_vert_acc = 5
+rel_horiz_acc = "NA"
+rel_vert_acc = 3
+TOML
+run -i /data/tiles -o /data/delivery -s EGM2008 -t EGM96 -y -l False -m True -p 400 --dted-level 2 \
+    --dted-profile /data/product.toml >/dev/null
+for cell in E006/N49 E006/N50; do
+    [[ -f "$work/delivery/DTED/$cell.dt2" ]] || { echo "    $cell.dt2 is missing from the tree" >&2; exit 1; }
+done
+[[ -f "$work/delivery/DTED/E006/south_mask.tif" && -f "$work/delivery/DTED/E006/north_mask.tif" ]] \
+    || { echo "    the masks are not beside their cells" >&2; exit 1; }
+run dted-header /data/delivery/DTED/E006/N49.dt2 /data/delivery/DTED/E006/N50.dt2 --check-data >/dev/null
+run dmed /data/delivery >/dev/null 2>&1
 py "
-import numpy as np
-from osgeo import gdal
-# A Float32 copy of the SRTM sample on the whole-degree lattice, voids kept.
-gdal.Translate('/data/srtm_float.tif', '$samples/03n008e_SRTM.dt2', outputType=gdal.GDT_Float32,
-               creationOptions=['COMPRESS=DEFLATE'])
-with gdal.Open('/data/srtm_float.tif', gdal.GA_Update) as ds:
-    ds.SetMetadataItem('AREA_OR_POINT', 'Point')
+import os
+size = os.path.getsize('/data/delivery/DMED')
+assert size == 3 * 394, size
+with open('/data/delivery/DMED', 'rb') as f:
+    data = f.read()
+assert data[:14] == b'N49N51E006E007', data[:14]
+assert data[394:401] == b'N49E006' and data[788:795] == b'N50E006'
+print('    DTED/E006/N49.dt2 and N50.dt2 with masks beside them, headers and records clean, DMED of 3 records: ok')
 "
-run -i /data/srtm_float.tif -o /data/srtm_made.dt2 -s EGM96 -t EGM2008 -y -l False \
-    --dted-profile "$samples/dted_profile_example.toml" >/dev/null
-run dted-header /data/srtm_made.dt2 --check-data >/dev/null
-py "
-import numpy as np
-from osgeo import gdal
-messages = []
-gdal.PushErrorHandler(lambda cls, no, msg: messages.append(msg))
-gdal.SetConfigOption('DTED_VERIFY_CHECKSUM', 'YES')
-src = gdal.Open('$samples/03n008e_SRTM.dt2').ReadAsArray().astype(int)
-made = gdal.Open('/data/srtm_made.dt2').ReadAsArray().astype(int)
-gdal.PopErrorHandler()
-assert not [m for m in messages if 'checksum' in m.lower()], messages
-with open('/data/srtm_made.dt2', 'rb') as f:
-    header = f.read(3428)
-assert header[221:224] == b'E08', header[221:224]
-assert header[80 + 59:80 + 64] == b'DTED2', header[80 + 59:80 + 64]
-void = src == -32767
-assert np.array_equal(void, made == -32767), 'voids moved'
-assert np.all(made[src == 0] == 0), 'ocean left 0 m'
-print(f'    DTED2 made from a GeoTIFF: header E08, {int(void.sum()):,} voids kept, ocean at 0 m, checksums valid: ok')
-"
+run dmed /data/delivery --check >/dev/null 2>&1
+
+echo "5/5 An EGM2008 DTED target is refused before anything runs"
+set +e
+run -i /data/tiles -o /data/refused -s EGM96 -t EGM2008 -y -l False --dted-level 2 --dted-profile /data/product.toml >/dev/null 2>&1
+rc=$?
+set -e
+if [[ $rc -ne 2 || -e "$work/refused" ]]; then
+    echo "    expected exit code 2 and nothing written, got $rc" >&2
+    exit 1
+fi
+echo "    DTED is written in EGM96 only: exit code 2, nothing written: ok"
 
 echo "Smoke test passed: $image"

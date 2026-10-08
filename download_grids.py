@@ -18,7 +18,7 @@ _src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
 
-from egmtrans.download import ensure_grids
+from egmtrans.download import ensure_grids  # noqa: E402
 
 if __name__ == "__main__":
     ensure_grids()

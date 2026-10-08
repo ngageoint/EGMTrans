@@ -238,7 +238,9 @@ class TestDtedLevelPaths:
             resolve_io_paths(str(src), str(tmp_path / 'out.dt2'), dted_level=3)
         paths = resolve_io_paths(str(src), str(tmp_path / 'out.dt2'), dted_level=2)
         assert paths.mode == 'file' and paths.output_folder == str(tmp_path)
-        folder = resolve_io_paths(str(tmp_path), str(tmp_path / 'out'), dted_level=1)
+        tiles = tmp_path / 'tiles'
+        tiles.mkdir()
+        folder = resolve_io_paths(str(tiles), str(tmp_path / 'out'), dted_level=1)
         assert folder.mode == 'folder' and folder.output_folder == str(tmp_path / 'out')
 
     def test_naming_presets_and_templates(self):
@@ -254,10 +256,52 @@ class TestDtedLevelPaths:
         tile = os.path.join(root, 'band1', 'N49E006_DEM.tif')
         assert dted_output_name('stem', tile, root, 'N49E006', 2) == 'band1/N49E006_DEM.dt2'
         assert dted_output_name('cell', tile, root, 'N49E006', 1) == 'N49E006.dt1'
-        assert dted_output_name('dted', tile, root, 'N49E006', 0) == 'E006/N49.dt0'
+        assert dted_output_name('dted', tile, root, 'N49E006', 0) == 'DTED/E006/N49.dt0'
+        assert dted_output_name('dted', tile, root, 'S01W001', 2, output_root='out') == 'DTED/W001/S01.dt2'
+        # An output folder that is itself the DTED root gets no second root, whatever its case.
+        assert dted_output_name('dted', tile, root, 'N49E006', 2, output_root='x/DTED') == 'E006/N49.dt2'
+        assert dted_output_name('dted', tile, root, 'N49E006', 2, output_root='x/dted/') == 'E006/N49.dt2'
+        assert dted_output_name('DTED/{cell}', tile, root, 'N49E006', 2, output_root='DTED') == 'N49E006.dt2'
+        assert dted_output_name('{cell}', tile, root, 'N49E006', 2, output_root='x/DTED') == 'N49E006.dt2'
         assert dted_output_name('DTED{level}_{lon}{lat}', tile, root, 'S06E030', 2) == 'DTED2_E030S06.dt2'
         assert dted_output_name('stem', os.path.join(root, 'a.tif'), root, 'N49E006', 2) == 'a.dt2'
         with pytest.raises(ValueError, match='leaves the output folder'):
             dted_output_name('../{cell}', tile, root, 'N49E006', 2)
         with pytest.raises(ValueError, match='empty name'):
             dted_output_name('{dir}', os.path.join(root, 'a.tif'), root, 'N49E006', 2)
+
+
+class TestNestingAndRoots:
+    """An output folder inside the input folder, and a drive or share root as the output."""
+
+    def test_an_output_inside_the_input_folder_is_refused(self, tmp_path):
+        tiles = tmp_path / 'tiles'
+        tiles.mkdir()
+        (tiles / 'a.tif').write_bytes(b'')
+        with pytest.raises(ValueError, match='lies inside the input folder'):
+            resolve_io_paths(str(tiles), str(tiles / 'out'))
+        with pytest.raises(ValueError, match='lies inside the input folder'):
+            resolve_io_paths(str(tiles), str(tiles))
+        with pytest.raises(ValueError, match='lies inside the input folder'):
+            resolve_io_paths(str(tiles), str(tiles / 'deeper' / 'out'), dted_level=2)
+        paths = resolve_io_paths(str(tiles), str(tmp_path / 'out'))
+        assert paths.mode == 'folder'
+        # A single file may go into its own folder: that is how a tile gets its DTED name beside it.
+        paths = resolve_io_paths(str(tiles / 'a.tif'), str(tiles), dted_level=2)
+        assert paths.output_path == str(tiles / 'a.dt2')
+
+    def test_a_root_output_folder_is_accepted(self, tmp_path):
+        from egmtrans.file_utils import derive_log_path
+
+        tiles = tmp_path / 'tiles'
+        tiles.mkdir()
+        (tiles / 'a.tif').write_bytes(b'')
+        root = os.path.abspath(os.sep)
+        paths = resolve_io_paths(str(tiles), root)
+        assert paths.mode == 'folder' and paths.output_path == root
+        assert paths.log_path == os.path.join(root, 'egmtrans_transform.log')
+        paths = resolve_io_paths(str(tiles / 'a.tif'), root, dted_level=2)
+        assert paths.output_path == os.path.join(root, 'a.dt2')
+        assert derive_log_path(root, 'folder') == os.path.join(root, 'egmtrans_transform.log')
+        with pytest.raises(ValueError, match='Invalid output name'):
+            resolve_io_paths(str(tiles), str(tmp_path / 'bad<name>'))

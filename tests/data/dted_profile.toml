@@ -1,0 +1,48 @@
+# The DTED product profile of the test suite: header constants of a fictional
+# product, as a producer would write them for a real one (see
+# docs/dted_profile_template.toml for the template users start from).
+
+schema = 1
+
+[product]
+dted_level = 2
+security_code = "U"
+security_handling = "PUBLIC SALE/NO RESTRICTION"
+data_edition = 1
+match_merge_version = "A"
+producer_code = "USCNIMA"
+digitizing_system = "SRTM"
+product_spec = "PRF89020B"
+product_spec_amend = "00"
+product_spec_date = "2000-05"
+# Most products set the compilation date per cell in the index; this is the
+# fallback for cells whose row leaves it NULL.
+compilation_date = "2000-02"
+abs_horiz_acc = 12
+abs_vert_acc = 6
+rel_horiz_acc = "NA"
+rel_vert_acc = 8
+dsi_free_text = "Example free text comment: questions about this product go to the producer named in the DSI."
+
+# How "egmtrans dted-index build --from-rasters" fills per-cell columns from
+# the source rasters. A mapping is a tag or XPath, or a table with a regular
+# expression whose first group is the value.
+
+[harvest.tags.fields]
+source_date = "TIFFTAG_DATETIME"
+# The version number inside the software tag, whatever the software is called.
+source_version = { tag = "TIFFTAG_SOFTWARE", pattern = '([0-9]+(?:\.[0-9A-Za-z]+)+)' }
+
+[harvest.xml]
+# Relative to the raster's folder; {stem}, {name}, {cell} and {dir} are
+# replaced, and the pattern may be a glob. Any ISO 19139 sidecar answers the
+# XPaths below.
+sidecar = "{stem}.xml"
+
+[harvest.xml.namespaces]
+gmd = "http://www.isotc211.org/2005/gmd"
+gco = "http://www.isotc211.org/2005/gco"
+
+[harvest.xml.fields]
+source_id = "//gmd:fileIdentifier/gco:CharacterString"
+compilation_date = "//gmd:identificationInfo//gmd:CI_Citation/gmd:date/gmd:CI_Date/gmd:date/gco:Date"

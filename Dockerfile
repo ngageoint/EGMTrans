@@ -37,18 +37,19 @@ m.ensure_grids(datums_dir='/opt/egmtrans/datums', filenames=['us_nga_egm96_1.tif
 COPY pyproject.toml README.md LICENSE CHANGELOG.md SECURITY.md ./
 COPY src ./src
 COPY crs ./crs
-COPY samples ./samples
 COPY benchmarks ./benchmarks
 RUN pip install --no-deps --no-build-isolation --no-cache-dir -e .
 
-# Compile the Numba kernels once (float and DTED paths) so a run does not pay the
-# JIT cost. The cache is world-writable: a host CPU unlike the build machine's
-# recompiles into it, whatever --user the container runs as.
+# Compile the Numba kernels once (the float path on a synthetic tile, the DTED
+# path on a cell the self-test wrote) so a run does not pay the JIT cost. The
+# cache is world-writable: a host CPU unlike the build machine's recompiles
+# into it, whatever --user the container runs as.
 RUN mkdir -p "$NUMBA_CACHE_DIR" /tmp/warmup \
-    && egmtrans -i samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif -o /tmp/warmup/cop.tif \
-        -s EGM2008 -t EGM96 -y -l False \
-    && egmtrans -i samples/03n008e_SRTM.dt2 -o /tmp/warmup/srtm.dt2 -s EGM96 -t EGM2008 -y -l False \
-    && egmtrans dted-selftest \
+    && egmtrans dted-selftest --keep /tmp/warmup \
+    && egmtrans -i /tmp/warmup/south.tif -o /tmp/warmup/south_egm96.tif -s EGM2008 -t EGM96 -y -l False \
+    && python -c "from egmtrans.dted.header import read_header, write_header; \
+p = '/tmp/warmup/N49E006.dt2'; h = read_header(p); h.set_raw('dsi.vertical_datum', 'E08'); write_header(p, h)" \
+    && egmtrans -i /tmp/warmup/N49E006.dt2 -o /tmp/warmup/N49E006_egm96.dt2 -s EGM2008 -t EGM96 -y -l False \
     && rm -rf /tmp/warmup \
     && chmod -R a+rwX "$NUMBA_CACHE_DIR"
 

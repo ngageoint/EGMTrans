@@ -3,673 +3,164 @@
       <img src="img/3d/EGM2008_Oceania_512.png" alt="EGM2008 Oceania" width="350">
    </div>
 
-# EGMTrans Tool and Explorer
+# EGMTrans
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.9.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
-EGMTrans transforms vertical datums between the WGS 84 ellipsoid and the EGM96 and EGM2008 geoids for DTED and GeoTIFF files, and makes DTED0, DTED1 and DTED2 directly from GeoTIFF tiles that lie on the whole-degree lattice. It resamples NGA's global geoid undulation models at one arc minute (~1.8 km) resolution to the input DEM resolution using bilinear, thin plate spline, or Delaunay triangulation interpolation, then applies the difference to generate the output DEM. It can be run as an ArcGIS Pro toolbox or a standalone Python script.
+EGMTrans makes standard DTED deliveries from GeoTIFF elevation tiles and transforms the vertical datum of DTED and GeoTIFF files between the WGS 84 ellipsoid, EGM96 and EGM2008. DTED is written in EGM96 only, as MIL-PRF-89020B requires, into the standard `DTED/E006/N49.dt2` tree, with the headers filled from a metadata index and a product profile, water bodies kept level across tiles, and the same bytes on every computer.
 
-The companion **EGMTrans Explorer** map, available for both ArcGIS Pro and QGIS, stores the full-resolution geoid models and allows users to interrogate datum transformations performed by this tool or other software and identify datum errors.
+It runs as an ArcGIS Pro toolbox (ArcGIS Pro 3.7 or later, Python 3.13) or on the command line, on Windows, Linux and macOS, online or on a closed network.
 
-## Table of Contents
+## Quick start in ArcGIS Pro
 
-- [Features](#features)
-- [Versioning](#versioning)
-- [License](#license)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Performance Considerations](#performance-considerations)
-- [Geoid Grid Files](#geoid-grid-files)
-  - [Grid provenance](#grid-provenance)
-- [ArcGIS Pro Setup Instructions](#arcgis-pro-setup-instructions)
-- [ArcGIS Pro Python Environment](#arcgis-pro-python-environment)
-- [Using the Transformation Tool in ArcGIS Pro](#using-the-transformation-tool-in-arcgis-pro)
-- [Using EGMTrans on the Command Line](#using-egmtrans-on-the-command-line)
-- [Run in a Container](#run-in-a-container)
-- [EGMTrans Explorer](#egmtrans-explorer)
-- [Interpolation Algorithms](#interpolation-algorithms)
-- [DTED Header Handling](#dted-header-handling)
-- [DTED Header Report](#dted-header-report)
-- [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)
-- [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)
-- [Notes](#notes)
-- [Constraints](#constraints)
-- [Troubleshooting](#troubleshooting)
-- [Contact](#contact)
-
-## Features
-
-- Performs transformations between WGS84, EGM96, and EGM2008 vertical datums
-- Handles both DTED (Digital Terrain Elevation Data) and GeoTIFF file formats
-- Processes either individual files or entire directories
-- Applies scale factors and offsets automatically when needed
-- Outputs Cloud Optimized GeoTIFF (COG) format for non-DTED results
-- Keeps the ocean at 0 and every flat area (a lake, a reservoir, a hydro-flattened river reach) at one level, across the tiles of a batch run, with a customizable patch size
-- Creates optional mask files of the ocean and the water bodies for quality control
-- Reports and validates every field of a DTED header against MIL-PRF-89020B, as text, JSON, CSV or Markdown
-- Fills DTED headers from a collection-wide metadata index (GeoPackage or GeoParquet) and a product profile, so a production run writes the same header fields on every machine
-- Makes DTED0, DTED1 and DTED2 directly from GeoTIFF tiles on the whole-degree lattice (TanDEM-X and similar products), one file per cell, with the same bytes on every computer; `egmtrans dted-selftest` proves it on yours
-- Utilizes parallel processing for improved performance on multi-core systems
-- Runs unattended in a Docker container that carries its own geoid grids and needs no network access
-- Supports multiple interpolation algorithms (bilinear, thin plate spline, and Delaunay triangulation)
-- Supports NGA's most widely used coordinate reference systems, including geographic, UTM and polar stereographic projections
-- The EGMTrans Explorer in ArcGIS and QGIS formats permits visualization and comparison of the geoids with each other and elevation datasets
-
-## Versioning
-
-This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The version is defined in [`src/egmtrans/_version.py`](src/egmtrans/_version.py) as the single source of truth.
-
-For a detailed list of changes for each version, please see the [`CHANGELOG.md`](CHANGELOG.md) file.
-
-## License
-
-This project is licensed under the MIT License - see the [`LICENSE`](LICENSE) file for details.
-
-## Prerequisites
-
-- Python 3.13+ (ArcGIS Pro 3.7 ships 3.13; the development environment is 3.14)
-- GDAL 3.11.0+ (with Python bindings)
-- NumPy 2.0+
-- SciPy 1.15+
-- Numba 0.61+ (recommended but optional)
-- pyarrow and lxml (optional, the `index` extra: GeoParquet metadata indexes and XPath harvest from XML sidecars; both ship with ArcGIS Pro 3.7)
-
-## Installation
-
-> **Windows users:** GDAL cannot be reliably installed via `pip` on Windows. Use [Option C (conda)](#option-c-conda-environment) for the smoothest setup experience.
-
-### Option A: Install as a Python package (recommended)
-
-```bash
-pip install -e .               # includes numba + tqdm for best performance
-pip install -e ".[core]"       # without numba/tqdm (restricted environments)
-pip install -e ".[index]"      # plus pyarrow and lxml for GeoParquet indexes and XML harvest
-pip install -e ".[dev]"        # with test/lint tools
-```
-
-> **Note:** On Windows, `pip install` will fail if a pre-built GDAL wheel is not available for your Python version (common with newer Python releases). If you see an error about Microsoft Visual C++ Build Tools, use [Option C (conda)](#option-c-conda-environment) instead, or install GDAL separately via [OSGeo4W](https://trac.osgeo.org/osgeo4w/) before running `pip install`.
-
-After installation, download the required geoid grid files:
-
-```bash
-python download_grids.py
-```
-
-Then the `egmtrans` command is available:
-
-```bash
-egmtrans -i input.tif -o output.tif -s WGS84 -t EGM2008
-```
-
-### Option B: Run directly (no install)
-
-```bash
-python download_grids.py
-python EGMTrans.py -i input.tif -o output.tif -s WGS84 -t EGM2008
-```
-
-The root-level `EGMTrans.py` is a backward-compatibility shim that re-exports from the `egmtrans` package.
-
-### Option C: Conda environment
-
-```bash
-conda env create -f environment.yml
-conda activate egmtrans
-pip install -e .
-python download_grids.py
-```
-
-Note: GDAL installation can be complex. Consider using Anaconda for a smoother installation process.
-
-## Performance Considerations
-
-### Numba Acceleration
-
-Numba is a Just-In-Time (JIT) compiler that significantly accelerates computational operations in EGMTrans:
-
-- **Performance Boost**: Numba can accelerate processing by 20-50x depending on the dataset size and operation
-- **Parallel Processing**: Enables efficient multi-core utilization for large datasets
-- **Memory Efficiency**: Optimized memory usage for processing large DEMs
-
-While Numba is recommended for optimal performance, EGMTrans will function without it in environments where installation is restricted.
-
-- **Graceful Degradation**: The tool automatically detects if Numba is available and falls back to non-accelerated implementations if necessary.
-- **Processing Time**: Without Numba, expect significantly longer processing times, especially for large datasets or batch operations.
-- **Memory Usage**: Non-accelerated processing may require more memory for equivalent operations.
-
-For restricted environments without access to Anaconda or custom ArcGIS Pro environments, EGMTrans will still work, but processing will be slower. For this reason, numba installation is recommended for large batch transformations.
-
-## Geoid Grid Files
-
-The geoid grid GeoTIFFs (~1.3 GB total) are hosted as [GitHub Release assets](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1), not stored in the repository itself.
-
-Both the command-line tool and the ArcGIS Pro toolbox download any missing grid files automatically on first run – no manual step required. If you prefer to pre-populate the `datums/` folder up front (e.g. on an offline machine, or to avoid the download delay inside ArcGIS Pro), you can run:
-
-```bash
-python download_grids.py
-```
-
-Or download the files manually from the [GitHub Releases page](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1) and drop them into `datums/`.
-
-The required files for transformation are:
-- EGM96: `us_nga_egm96_1.tif`
-- EGM2008: `us_nga_egm08_1.tif`
-
-These are the one-arc-minute geoid models in Cloud Optimized GeoTIFF (COG) format prepared by the U.S. National Geospatial-Intelligence Agency (<https://earth-info.nga.mil/>).
-
-### Grid provenance
-
-The 1-arc-minute EGM96 and EGM2008 grids shipped with EGMTrans were computed *directly from the published spherical harmonic coefficients*, not interpolated up from the lower-resolution published grids. Evaluation was performed using NGA's own Fortran executables (`hsynth_WGS84`, `f477_bin`, and `clenqt_bin`), which are distributed by NGA's Office of Geomatics & Targeting at <https://earth-info.nga.mil>. Python wrappers around those executables were used to generate the global grids, which were then written out as Cloud Optimized GeoTIFFs. Geoid undulations are rounded to the nearest millimeter (3 decimal places).
-
-The EGM2008 grid was validated against the independent 1-arc-minute binary file `Und_min1x1_egm2008_isw=82_WGS84_TideFree_SE` provided by Nikolaos Pavlis (a lead author of EGM2008) to NGA. The two grids agree to within millimeters globally.
-
-Each grid file is pinned to a SHA-256 hash in [`src/egmtrans/download.py`](src/egmtrans/download.py); the download routine verifies the hash after fetching and deletes any file that fails the check. See [`SECURITY.md`](SECURITY.md) for details.
-
-Three additional grids are downloaded for the EGMTrans Explorer map: the EGM96-to-EGM2008 difference grid, and lower-resolution versions of EGM2008 (2.5 arc minutes) and EGM96 (15 arc minutes). The lower-resolution grids can also be obtained from the PROJ.org Content Delivery Network: <https://cdn.proj.org/>. The lower-resolution EGM96 grid is less precise; errors of >0.5 m have been observed between the sparse 15 arc minute (~27 km) EGM96 posts. In contrast, the 1 arc minute grids have a post spacing of ~1.8 km, and the difference between the EGM96 and EGM2008 spherical harmonics formulas and their one-minute grid representations is negligible.
-
-
-| Grid | Resolution | Post Spacing |
-|------|-----------|--------------|
-| EGM96 (15') | 15 arc minutes | ~27 km |
-| EGM2008 (2.5') | 2.5 arc minutes | ~4.5 km |
-| **EGM96 / EGM2008 (1')** | **1 arc minute** | **~1.8 km** |
-
-PROJ registers the lower-resolution grids for EPSG:5773 and EPSG:3855, so left to itself the `proj` interpolation option would resample those rather than the 1 arc minute grids. EGMTrans overrides the `+geoidgrids=` value to force the 1 arc minute grid, and `proj` now agrees with `bilinear` to within the 1 cm output rounding. The lower-resolution grids are retained for the EGMTrans Explorer map.
-
-## ArcGIS Pro Setup Instructions
-
-1. Ensure you have ArcGIS Pro 3.7 or later installed on your system (its Python is 3.13).
-
-2. Copy the `EGMTrans` folder to a location accessible by ArcGIS Pro.
-
-3. Make sure the `EGMTrans.py` file and `src/` directory are located in the `EGMTrans` directory. The directory structure should look like this:
-
-```
-EGMTrans/
-├── src/
-│   └── egmtrans/            # Python package (core logic)
-│       ├── __init__.py
-│       ├── _version.py
-│       ├── _state.py
-│       ├── config.py
-│       ├── cli.py
-│       ├── cli_dted.py          # dted-header and dted-index subcommands
-│       ├── dted/                # DTED header schema, codec, validator, report, index, profile
-│       ├── crs.py
-│       ├── download.py
-│       ├── interpolation.py
-│       ├── flattening.py
-│       ├── io.py
-│       ├── transform.py
-│       ├── tiling.py
-│       ├── batch.py
-│       ├── file_utils.py
-│       ├── arcpy_compat.py
-│       ├── logging_setup.py
-│       └── numba_utils.py
-├── tests/                   # Test suite
-├── arcgis/                  # ArcGIS Pro toolbox: EGMTrans Tool and DTED Header Report
-│   ├── EGMTransToolbox.pyt
-│   └── ...
-├── crs/                     # PROJ data
-├── datums/                  # Geoid grids (downloaded separately)
-├── samples/                 # Sample elevation data
-├── img/
-├── EGMTrans.py              # Backward-compat shim
-├── pyproject.toml
-├── environment.yml
-├── CHANGELOG.md
-├── LICENSE
-└── README.md
-```
-
-4. Geoid grid files will be downloaded automatically the first time you run the EGMTrans Tool. Alternatively, run `python download_grids.py` from the EGMTrans directory, or download the grid files manually from the [GitHub Releases page](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1) and place them in the `datums/` folder.
-
-5. Open ArcGIS Pro and create a new project or open an existing one.
-
-6. In the Catalog pane, right-click on Toolboxes and select "Add Toolbox".
-
-7. Navigate to the `EGMTrans/arcgis` folder and select the `EGMTransToolbox.pyt` file.
-
-8. The "EGMTransToolbox" toolbox should now appear in your Toolboxes list, with two tools: *EGMTrans Tool* (the transformation) and *DTED Header Report* (see [DTED Header Report](#dted-header-report)).
-
-## ArcGIS Pro Python Environment
-
-**ArcGIS Pro Package Manager**  
-<img src="img/ArcGIS_package_manager.png" alt="ArcGIS Pro Package Manager" width="800">
-
-In order to run the *EGM Transformation Tool* in ArcGIS Pro with optimal performance, the Python active environment should include the `numba` package. Numba is an optimizing compiler that uses parallelization to increase the speed of water flattening and masking operations by 20 to 50 times. It is not installed in the default Python environment (`arcgispro-py3`). To use it, follow these steps:
-
-1. Clone the default environment into a new environment (e.g. `arcgispro-egm`). This may take some time. If the clone fails, you may need to work with your IT department. If you already have a cloned environment (not `arcgispro-py3`) you may use that.
-
-2. Make the cloned environment active, then click on the `Add Packages` tab.
-
-3. Search for "numba" and install it.
-
-4. Ensure that the same environment is active when the Transformation Tool is run.
-
-Note: While Numba is recommended for optimal performance, EGMTrans will still function without it, though processing will be _significantly_ slower.
+1. Unzip the release anywhere ArcGIS Pro can read, for example `C:\Tools\EGMTrans`.
+2. Put the two one-arc-minute geoid grids in the `datums` folder: `us_nga_egm96_1.tif` and `us_nga_egm08_1.tif`, from the [geoid grid release](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1). On a closed network, copy them over by hand and check their SHA-256 against `datums/README.md` (see [Offline setup](#offline-setup)); the toolbox downloads them itself when the computer is online.
+3. In the Catalog pane, right-click Toolboxes, choose Add Toolbox, and pick `arcgis\EGMTransToolbox.pyt`. Nothing is installed: the toolbox finds the package in `src` beside it.
+4. Run **DTED Self-Test**. It converts two built-in tiles and compares the bytes with the pinned reference, so you know this computer reproduces the reference before a real run.
+5. Run **EGMTrans Tool**: the input tile or folder, the output folder, the Output Format (DTED2 by default), the Source Datum of your tiles, and, in the DTED output group, the product profile and the metadata index. The Target Datum is EGM96; the dialog shows the header plan of the first cell before you run.
 
 **EGMTrans Tool in ArcGIS Pro**  
-<img src="img/EGMTrans_toolbox.png" alt="EGM Transformation Tool in ArcGIS Pro" width="300">
+<img src="img/EGMTrans_toolbox.png" alt="EGMTrans Tool in ArcGIS Pro" width="300">
 
-## Using the Transformation Tool in ArcGIS Pro
+Large batches run 20 to 50 times faster with Numba, which ArcGIS Pro's default environment does not have; see [Offline setup](#offline-setup) for the cloned environment. The results are the same without it.
 
-1. In the Catalog pane, expand the *EGMTransToolbox.pyt* toolbox.
-
-2. Double-click on the *EGM Transformation Tool* tool to open it.
-
-3. Fill in the required parameters:
-   - **Input File or Folder**: Select your input DTED or GeoTIFF file, or a folder containing multiple files.
-   - **Output File or Folder**: Specify the output location for the transformed file(s).
-   - **Source Datum**: Select the source vertical datum (EGM2008, EGM96, or WGS84).
-   - **Target Datum**: Select the target vertical datum (EGM2008, EGM96, or WGS84).
-
-4. (Optional) Adjust the additional parameters if desired:
-   - **Interpolation Algorithm**: Choose the interpolation method (Bilinear Interpolation, Thin Plate Spline, Delaunay Triangulation); defaults to Bilinear Interpolation. DTED output accepts only Bilinear Interpolation (see [Interpolation Algorithms](#interpolation-algorithms)).
-   - **Minimum Patch Size**: Specify the minimum size (in pixels) for flat areas to be retained; defaults to 16.
-   - **Absolute Horizontal Accuracy**: Provide a default horizontal accuracy that will be added to the output DTED file if it is missing from the input.
-   - **Retain Flat Areas**: Check this box to keep the ocean at 0 and every water body at one level during transformation; checked by default.
-   - **Create Mask**: Check this box to create a mask of the ocean (value 1) and the water bodies (one value each), DTED included; unchecked by default.
-   - **Save Log File**: Check this box to save the log messages to an external .log file in the output directory.
-   - **Context Folder**: A folder of neighboring tiles that are analyzed but not transformed, so that a water body which continues into them gets the level a run including them would give it (see [Notes](#notes)).
-   - **Water Levels Table**: A CSV written by the command line's `--export-water-levels` in an earlier run over a larger area; a water body found in it takes the table's level when that is lower than the level found in this run.
-   - **Minimum Containment**: The share of a flat area's boundary that must lie above it for the area to count as a water body; defaults to 0.8 (see [Notes](#notes)).
-   - **DTED Metadata Index**: A GeoPackage or GeoParquet index whose row for the output cell fills the DTED header; a cell the index does not hold fails (see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
-   - **DTED Product Profile**: A TOML file of header constants for the product; the index row overrides it field by field.
-   - **DTED Level**: Write every GeoTIFF input as DTED of this level, one file per whole one-degree cell it covers; DTED inputs keep their level (see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)).
-   - **DTED Output Naming**: How the cells are named under the output folder: `stem`, `cell`, `dted`, or a template.
-   - **DTED Header Overrides**: Header fields to write with one value in every cell of the run, over the index row and the profile: pick the field, type the value (an accuracy takes `NA`; a date takes `YYYY-MM`, `YYYY-MM-DD` or `today`).
-   - **DTED Header Fields**: Read only; filled as soon as an index, a profile or overrides are chosen: how many cells the index holds, which header fields come from the index, the profile and the overrides, and which required fields nothing supplies yet. The plan of the first cell is the first thing in the messages of a run.
-
-5. Click "Run" to execute the tool.
-
-6. The tool will process the input file(s) and create the transformed output(s) in the specified location.
-
-The *DTED Header Report* tool in the same toolbox reports and validates the header of a DTED file or of every DTED file under a folder: choose the format (text, JSON, CSV or Markdown), an optional report file, whether to check the elevation records too, and whether to count byte positions from 0 instead of the specification's 1. Findings appear as errors and warnings in the messages, and a text report is shown there when no report file is given. The *DTED Self-Test* tool converts built-in synthetic tiles and checks that this computer reproduces the reference bytes (see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)).
-
-## Using EGMTrans on the Command Line
-
-The basic syntax for using EGMTrans in a terminal or command prompt is:
-
-```
-python EGMTrans.py -i INPUT -o OUTPUT -s SOURCE_DATUM -t TARGET_DATUM \
-  [-f FLATTEN] [-m CREATE_MASK] [-p MIN_PATCH_SIZE] [-c CONTAINMENT] [-a ALGORITHM] \
-  [--abs_horiz_accuracy METERS] [-l LOG_FILE] [-y] \
-  [--context FOLDER] [--water-levels FILE] [--export-water-levels FILE] \
-  [--dted-index FILE] [--dted-profile FILE] [--dted-level N] [--dted-naming NAME]
-```
-
-Arguments:
-- `-i`, `--input`: Path to input file or directory
-- `-o`, `--output`: Path for output file or directory
-- `-s`, `--source_datum`: Source vertical datum (EGM2008, EGM96, or WGS84)
-- `-t`, `--target_datum`: Target vertical datum (EGM2008, EGM96, or WGS84)
-- `-f`, `--flatten`: Whether to retain flat areas (optional; default: True)
-- `-m`, `--create_mask`: Whether to create a flat mask file (optional, default: False)
-- `-p`, `--min_patch_size`: Minimum size in pixels for a flat area to be retained, DTED included (optional; default: 16)
-- `-c`, `--containment`: Share of a flat area's boundary that must lie above it for the area to count as a water body and be flattened, 0 to 1 (optional; default: 0.8; 0 keeps every flat area). See [Notes](#notes).
-- `-a`, `--algorithm`: Interpolation algorithm to use (optional; choices: 'bilinear', 'spline', 'delaunay', 'proj'; default: 'bilinear'). DTED output accepts only 'bilinear' (see [Interpolation Algorithms](#interpolation-algorithms)).
-- `--abs_horiz_accuracy`: A default horizontal accuracy that will be added to the output DTED file only if it is missing from the input. (Long form only – `-h` is `--help`.)
-- `-l`, `--log_file`: Whether to save the log messages to an external .log file (optional; default: True).
-- `-y`, `--yes`: Proceed without asking when the input file's vertical datum disagrees with `-s`, when `-s` equals `-t` for a GeoTIFF, or after the DTED header plan (optional). Use it for unattended runs: without a terminal to answer a prompt, EGMTrans stops with exit code `2` rather than guess.
-- `--context FOLDER`: A folder of neighboring tiles to analyze but not transform, so that a water body which continues into them gets the level a run including them would give it (optional; may be repeated). See [Notes](#notes).
-- `--export-water-levels FILE`: Write the level of every water body that touches a tile edge, keyed by the edge crossing, for later runs over neighboring tiles (optional).
-- `--water-levels FILE`: A table written by `--export-water-levels` in an earlier run; a water body found in it takes the table's level when that is lower than the level found in this run (optional).
-- `--dted-index FILE`: A DTED metadata index (`.gpkg` or `.parquet`) whose row for the output cell fills the DTED header; a cell the index does not hold fails (optional; see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
-- `--dted-profile FILE`: A DTED product profile (TOML) of header constants; the index row overrides it field by field (optional).
-- `--dted-level N`: Write every GeoTIFF input as DTED of level `N` (0, 1 or 2), one file per whole one-degree cell it covers; DTED inputs keep their level (optional; see [Creating DTED from GeoTIFF](#creating-dted-from-geotiff)). A single GeoTIFF written to a `.dt0`, `.dt1` or `.dt2` output name needs no level.
-- `--dted-naming NAME|TEMPLATE`: How the cells made from GeoTIFF are named under the output folder: `stem` (the input's folder and name), `cell` (`N49E006.dt2`), `dted` (`E006/N49.dt2`), or a template with `{stem}`, `{dir}`, `{cell}`, `{lat}`, `{lon}` and `{level}`; the extension is added (optional; default: `stem`).
-- `--dted-set FIELD=VALUE`: Write this value in every DTED header of the run, over the index row and the profile (optional; may be repeated). `FIELD` is a header column of the index (`producer_code`, `compilation_date`, `abs_horiz_acc`, ...); an accuracy takes `NA`, a date takes `YYYY-MM`, `YYYY-MM-DD` or `today`.
-
-Three subcommands serve DTED; each has its own `--help`:
-
-```
-egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH] [--zero-based] [--check-data] [--strict]
-egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH... | --from-table FILE) \
-  [--layer NAME] [--cell-field NAME] [--map INDEX_COLUMN=TABLE_COLUMN]... [--set INDEX_COLUMN=VALUE]... \
-  [--prefer TABLE_COLUMN] [--profile FILE] [--level N] [--product NAME] [--update]
-egmtrans dted-index validate INDEX [--profile FILE] [--level N]
-egmtrans dted-selftest [--keep FOLDER]
-```
-
-The input and output must both be files or both be folders, except that a single input file may be
-written into an output folder, in which case it keeps its own filename (with the DTED extension when a
-level is given). An output path ending in `.tif`, `.tiff`, `.dt0`, `.dt1`, or `.dt2` is treated as a
-file; anything else is treated as a folder.
-
-**Exit codes:** `0` success, `1` a transformation failed, `2` an argument or path error, or a prompt that could not be answered.
-
-The command line checks, and if necessary downloads, only the geoid grids its source and target datums need. `python download_grids.py` fetches the full set, including the grids used by the EGMTrans Explorer.
-
-### Examples
-
-The files referenced in the following cases are stored in the `samples/` directory.
-
-1. Transform a Copernicus DEM from EGM2008 to EGM96, retaining flat areas:
+## Quick start on the command line
 
 ```bash
-python EGMTrans.py -i "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif" \
-  -o "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM_EGM96.tif" \
-  -s EGM2008 -t EGM96 -f True -p 25
+conda env create -f environment.yml      # GDAL from conda-forge; pip cannot install it reliably on Windows
+conda activate egmtrans
+pip install -e .                         # or "pip install -e .[core]" without Numba
+python download_grids.py                 # the five geoid grids, about 1.3 GB; see Offline setup for two
+
+egmtrans -i tiles -o delivery -s EGM2008 -t EGM96 -y --dted-level 2 \
+  --dted-index collection.gpkg --dted-profile product.toml
+egmtrans dmed delivery
 ```
 
-2. Transform an SRTM DTED file from EGM96 to EGM2008, writing a mask of the ocean and the water bodies beside it:
+`python EGMTrans.py` runs the same command line without installing. `egmtrans --help` lists every option; the subcommands `dted-header`, `dted-index`, `dted-selftest` and `dmed` have their own `--help`.
+
+## Recipes
+
+**Transform a tile or a folder.** A GeoTIFF becomes a Cloud Optimized GeoTIFF with a compound CRS; a DTED file keeps its name and level and gets its header rewritten. A folder is searched recursively, its folders and auxiliary files are mirrored, and the water bodies that cross tile edges get one level over the whole run.
 
 ```bash
-python EGMTrans.py -i "samples/03n008e_SRTM.dt2" \
-  -o "samples/03n008e_SRTM_EGM2008.dt2" \
-  -s EGM96 -t EGM2008 -f True -m True
+egmtrans -i tile.tif -o tile_egm96.tif -s EGM2008 -t EGM96
+egmtrans -i cells_e08 -o cells_e96 -s EGM2008 -t EGM96 -y
 ```
 
-3. Transform a 1.5m LiDAR-derived DSM over Mazatlán, Mexico from EGM2008 to WGS84 ellipsoid, without flattening:
-
-```bash
-python EGMTrans.py -i "INEGI_Mexico_150cm_f13a35e4_DSM.tif" \
-  -o "INEGI_Mexico_150cm_f13a35e4_DSM_WGS84.tif" \
-  -s EGM2008 -t WGS84 -f False
-```
-
-4. Batch process a directory of TERRAFORM (DTED2 format) files and transform them all to EGM2008:
-
-```bash
-python EGMTrans.py -i "TERRAFORM_EGM96" -o "TERRAFORM_EGM2008" -s EGM96 -t EGM2008
-```
-
-5. Transform a single Copernicus DEM that need not edge-match its neighbors with spline interpolation (slower; a few millimeters from bilinear, and not accepted for DTED):
-
-```bash
-python EGMTrans.py -i "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM.tif" \
-  -o "samples/Copernicus_DSM_COG_10_N06_00_E126_00_DEM_EGM96.tif" \
-  -s EGM2008 -t EGM96 -a spline
-```
-
-6. Transform the DTED tiles of one production cell so that every lake and river reach that crosses a tile edge gets one level, with the neighboring cells' tiles as context (searched like the input, read from their headers, and only the adjoining tiles analyzed), and export the levels for the cells that follow:
-
-```bash
-python EGMTrans.py -i "cell_17_EGM2008" -o "cell_17_EGM96" -s EGM2008 -t EGM96 -y \
-  --context "delivery/cell_16" --context "delivery/cell_18" \
-  --export-water-levels "cell_17_levels.csv"
-```
-
-7. Transform a later cell with the levels of an earlier run, so that a water body shared with it gets the same level whatever the order of production, and keep only the flat areas whose boundary is at least 90% above them:
-
-```bash
-python EGMTrans.py -i "cell_18_EGM2008" -o "cell_18_EGM96" -s EGM2008 -t EGM96 -y \
-  --water-levels "cell_17_levels.csv" -c 0.9
-```
-
-8. Make a DTED2 cell from one GeoTIFF tile on the whole-degree lattice, with the header filled from a product profile:
-
-```bash
-python EGMTrans.py -i "N50W001_DEM.tif" -o "N50W001.dt2" -s EGM2008 -t EGM96 -y \
-  --dted-profile "samples/dted_profile_example.toml"
-```
-
-9. Make DTED2 from every tile under a folder, one file per cell named `DTED2_E006N49.dt2`, with the headers filled from the collection's index and profile, and check that this computer reproduces the reference bytes first:
+**Make DTED from GeoTIFF with an index and a profile, then the DMED.** The tiles must lie on the whole-degree lattice (TanDEM-X and similar products). Every whole one-degree cell a tile covers becomes one file under `DTED/<lon>/<lat>.dt2`; the index row and the profile fill its header. Copy `docs/dted_profile_template.toml`, replace every `<...>` placeholder with the product's own values (a profile with a placeholder is refused), and build or export the index (see [docs/dted_index.md](docs/dted_index.md)). Run the self-test first, and the DMED last, once every cell of the delivery is there.
 
 ```bash
 egmtrans dted-selftest
-python EGMTrans.py -i "tiles" -o "dted2" -s EGM2008 -t EGM96 -y --dted-level 2 \
-  --dted-naming "DTED{level}_{lon}{lat}" --dted-index "collection.gpkg" --dted-profile "collection.toml"
+egmtrans -i tiles -o delivery -s EGM2008 -t EGM96 -y -m True --dted-level 2 \
+  --dted-index collection.gpkg --dted-profile product.toml
+egmtrans dted-header delivery/DTED/E006/N49.dt2 --check-data
+egmtrans dmed delivery
 ```
 
-## Run in a Container
+A single tile to a single cell needs no level: `egmtrans -i N49E006_DEM.tif -o N49.dt2 -s EGM2008 -t EGM96 -y --dted-profile product.toml`. A run that was cancelled or failed is continued with `--skip-existing`; the cells already written and verified are left alone.
 
-The `Dockerfile` builds an image with GDAL, NumPy, SciPy and Numba from conda-forge, the two 1-arc-minute geoid grids (downloaded during the build and checked against their pinned SHA-256 hashes), and precompiled Numba kernels. A container needs no network access at run time.
+**Check a header.** `egmtrans dted-header N49.dt2` prints every field with its byte positions and the specification's findings; `--check-data` checks the records too; `--format json|csv|md` and `--out` write a report. The DTED Header Report tool does the same in ArcGIS Pro.
+
+**Neighbors and water levels.** Tiles that share a lake or river belong in one run. When the neighbors are produced in another run, give them as `--context FOLDER` (Neighboring Tiles in ArcGIS Pro): they are analyzed with the input but never written. Or export the levels of an earlier run over the larger area with `--export-water-levels levels.csv` and pass them to the later runs with `--water-levels levels.csv`, so the level does not depend on the order of production. See [docs/water_bodies.md](docs/water_bodies.md).
+
+```bash
+egmtrans -i cell_17 -o out_17 -s EGM2008 -t EGM96 -y --context delivery/cell_16 --context delivery/cell_18 \
+  --export-water-levels cell_17_levels.csv
+egmtrans -i cell_18 -o out_18 -s EGM2008 -t EGM96 -y --water-levels cell_17_levels.csv
+```
+
+**Run in a container.** The Dockerfile builds an image with GDAL, NumPy, SciPy, Numba, the two one-arc-minute grids (checked against their pinned SHA-256) and precompiled kernels; a container needs no network at run time.
 
 ```bash
 docker build -t egmtrans .
-
-# Transform one tile from EGM2008 to EGM96. The current directory is mounted at /data.
 docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/data" egmtrans \
-  -i N06E126_DEM.tif -o N06E126_DEM_EGM96.tif -s EGM2008 -t EGM96 -y
-
-# Batch: every DEM under a folder, keeping the folder structure.
-docker run --rm --network none --user "$(id -u):$(id -g)" -v "$PWD:/data" egmtrans \
-  -i tiles_egm2008 -o tiles_egm96 -s EGM2008 -t EGM96 -y
+  -i tiles -o delivery -s EGM2008 -t EGM96 -y --dted-level 2 --dted-profile product.toml
 ```
 
-- Pass `-y`: a container has no terminal to answer a confirmation prompt, so without it EGMTrans stops with exit code `2` instead.
-- `--user` makes the outputs belong to you rather than to the image's non-root `egmtrans` user (UID 10001).
-- For large batches, run one container per region with `NUMBA_NUM_THREADS=1` and as many containers as cores. A water body that crosses a tile edge gets one level only when both tiles are in the same run (or the neighbor is given as `--context`), so split a batch along boundaries that no lake or river crosses, such as coastlines or divides. For single, on-demand tiles, leave Numba all cores.
-- `docker/smoke_test.sh` builds the image and checks a GeoTIFF transform, a DTED transform, the self-test and a DTED made from a GeoTIFF, with the network disabled.
-- `benchmarks/benchmark_tiles.py` measures seconds and memory per tile on your own data; see [`benchmarks/README.md`](benchmarks/README.md).
+Pass `-y`: a container has no terminal to answer a prompt, so without it EGMTrans stops with exit code 2. For large batches, run one container per region with `NUMBA_NUM_THREADS=1` and as many containers as cores, split along boundaries that no lake or river crosses. `docker/smoke_test.sh` builds the image and checks a GeoTIFF transform, a DTED transform, a delivery with its DMED and the refusal of an EGM2008 target, with the network off; `benchmarks/README.md` describes the timing script.
 
-## EGMTrans Explorer
+## Offline setup
 
-**EGM2008 shaded relief**  
-<img src="img/EGM2008_shaded_relief.png" alt="EGM2008 shaded relief" width="800">
+Everything below is what a closed network needs; nothing else reaches the internet.
 
-The EGMTrans Explorer is provided in two software formats: ArcGIS Pro (.aprx) and QGIS (.qgz). Both versions provide a user-friendly interface for visualizing and analyzing the results of datum transformations.
+- **The two geoid grids** `us_nga_egm96_1.tif` and `us_nga_egm08_1.tif` go in `datums/`. Copy them from the [release page](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1) on a connected computer and compare their SHA-256 with the values in `datums/README.md` (`certutil -hashfile <file> SHA256` on Windows, `sha256sum` elsewhere). The tool and the toolbox verify the hashes before a DTED cell is written and download only the grids a run needs, so these two are enough for every transform. The three other grids serve the Explorer map only. `python download_grids.py` fetches all five and needs the internet.
+- **Numba in ArcGIS Pro.** The default environment `arcgispro-py3` cannot take packages: clone it (Package Manager, or `conda create --clone`), activate the clone, and install `numba`. Online, Package Manager installs it from Esri's channel. On a closed network, carry the `numba` and `llvmlite` packages for the clone's Python version over and install them with `conda install --offline`; the procedure is checked on ArcGIS Pro 3.7. Without Numba a one-degree 0.4-arc-second tile takes tens of minutes instead of about a minute; the bytes are the same.
+- **The Python package.** `pip install -e .` fetches setuptools when the environment lacks it; `pip install --no-build-isolation -e .` with setuptools already present stays offline, and `python EGMTrans.py` needs no installation at all.
+- **Docker.** The image builds online only (it downloads the grids and the conda packages); move it with `docker save` and `docker load`.
+- **The Explorer** map's OpenStreetMap basemap and its locators need the internet; the geoid layers do not.
 
-It renders the EGM2008 and EGM96 Cloud Optimized GeoTIFFs (COGs) as both (1) grids and (2) color relief files. Using the datum "grids" allows the user to visualize the relative horizontal resolution of the 1-arc-minute grids and the standard EGM products, which are 15 arc minutes for EGM96 and 2.5 arc minutes for EGM2008. When zooming out, a hillshade, combined with the color relief map, functions as shaded relief to add depth to the geoid models. There is also a 1-arc-minute delta grid, created by subtracting the EGM96 geoid undulation from the EGM2008 geoid undulation, allowing the datums to be compared with each other and with any DEMs that a user loads into the map. An Open Street Map (OSM) basemap layer provides additional geospatial context.
+## Reference
 
-The EGMTrans Explorer offers the following capabilities:
+### Parameters
 
-- Interactive map display of EGM96 and EGM2008 geoid undulations
-- Difference calculation and visualization between EGM96 and EGM2008 geoids
-- Comparison of original and transformed DEMs
-- Comparison of DEMs and point clouds against reference elevation (e.g. TanDEM-X) to identify datum errors
-
-**EGM96 to EGM2008 delta**  
-<img src="img/EGM96_to_EGM2008_delta.png" alt="EGM96 to EGM2008 delta" width="800">
-
-**EGM96 15' (black) and EGM2008 2.5' (gray) grids**  
-<img src="img/datum_grids_example.png" alt="EGM96 (black) and EGM2008 (gray) grids" width="400">
-
-## Using the EGMTrans Explorer
-
-1. Open the `EGMTrans_Explorer` file in ArcGIS Pro (`.aprx`) or QGIS (`.qgz`).
-
-2. Use the provided map layers to visualize the EGM96 and EGM2008 geoids.
-
-3. Load your elevation datasets (DEMs and point clouds) into the Explorer to compare them with the geoid heights.
-
-4. Utilize the analysis tools in the Explorer to compare datums, calculate differences, and generate statistics.
-
-5. Customize the symbology and labeling as needed for your specific analysis requirements.
-
-6. Export your visualizations and analysis results using the standard ArcGIS Pro or QGIS export tools.
-
-7. In QGIS, the "Value Tool" plugin (https://plugins.qgis.org/plugins/valuetool/) can be used to instantly query the value of all rasters turned on in the map (see below).
-
-**QGIS Value Tool plugin**  
-<img src="img/qgis_value_tool_plugin.png" alt="QGIS Value Tool plugin" width="600">
-
-## Interpolation Algorithms
-
-EGMTrans supports multiple interpolation algorithms for vertical datum transformation:
-
-- **bilinear** (default): Fast and memory-efficient interpolation suitable for most applications. Provides a good balance between speed and accuracy.
-- **spline**: Uses thin plate spline interpolation for highest accuracy, especially in areas with complex geoid variations. Significantly slower than other methods.
-- **delaunay**: Uses triangulation-based linear interpolation. More accurate than bilinear for irregular point distributions (not an issue with datum grids) but slower.
-- **proj**: Uses GDAL's built-in vertical datum transformation capabilities, forced onto the same 1 arc minute grids the other algorithms use. Fastest option but may produce artifacts at edges. Not available in ArcGIS Pro.
-
-The choice of algorithm depends on your specific requirements:
-- For most applications, the default **bilinear** algorithm provides the best balance of speed and accuracy
-- For a single GeoTIFF that need not match its neighbors, in an area with complex geoid variations, **spline** follows the curvature of the geoid between grid nodes; the difference from bilinear is a few millimeters
-
-**DTED output accepts only `bilinear`.** DTED tiles are edge-matched products, and only bilinear gives the same correction at a shared post whatever the tile extent: the thin plate spline is solved over the clipped grid of each tile, so its result differs at every shared post, and Delaunay differs off the grid lines. Even millimeters matter once heights are rounded to whole meters: on a DTED2 tile, spline and bilinear disagree by 1 m at 0.067% of posts (about 9,000 per tile) and Delaunay and bilinear at 0.032%, from differences of 1 to 14 mm in the correction, so tiles transformed with different algorithms would not edge-match. GeoTIFF tiles that must edge-match (DGED, Copernicus, TanDEM-X) should use `bilinear` for the same reason; a batch run with another algorithm says so once.
-
-## DTED Header Handling
-
-When transforming DTED files, EGMTrans rewrites the output file's 3,428-byte header (the UHL, DSI and ACC records) from the input's header, following [**STANAG 3809**](https://nsgreg.nga.mil/doc/view?i=2126) (MIL-PRF-89020B). The header is read and written as raw bytes, never through GDAL, so a `.aux.xml` sidecar or a driver default cannot stand between the tool and the file. Note that MIL-PRF-89020B (2000) knows only `MSL` and `E96` as vertical datum codes; `E08` for EGM2008 is common practice but not in the specification, so DTED transforms should use EGM96 as the target datum for full compliance.
-
-Without a metadata index or profile, the header changes only in:
-- **Vertical datum** (DSI characters 142-144): the code of the target datum, `E96` or `E08`.
-- **Accuracies** (ACC characters 4-19 and the UHL copy at 29-32): a value that is neither `0000`-`9999` nor NA becomes NA, and NA is written left justified (`NA  `), as section 3.13.5 of the specification requires for alpha values; versions up to 1.6.0 wrote it right justified (`  NA`), which the validator now reports as a warning. The UHL absolute vertical accuracy always repeats the ACC value.
-- **Absolute horizontal accuracy**: the `--abs_horiz_accuracy` value fills the field only when it is NA.
-- **Bytes that are not printable**: the NUL bytes that GDAL-written headers carry where the specification wants blanks become blanks.
-
-Every change is logged with its source, and the findings of the validator (see [DTED Header Report](#dted-header-report)) are logged as warnings, so a problem the input header had and nothing corrected is visible. With `--dted-index` and `--dted-profile`, the cell's row and the profile fill the rest of the header (see [DTED Metadata Index and Profile](#dted-metadata-index-and-profile)).
-
-## DTED Header Report
-
-`egmtrans dted-header` (and the *DTED Header Report* tool in ArcGIS Pro) reports every field of a DTED header as a table with the columns Start, End, Length, Title, Value and Description, one section per record, followed by the decoded accuracy subregions, a summary and the findings. Byte positions are the specification's one-based character positions, so a row can be checked against the MIL-PRF-89020B tables as printed; `--zero-based` counts from 0 as a hex editor does. The level is taken from four sources (the extension, the DSI series designator, the UHL latitude interval and the UHL latitude point count) and a disagreement is reported. Accuracy titles name the statistic: absolute horizontal accuracy is a 90% circular error (CE90), vertical accuracies are 90% linear errors (LE90).
-
-```bash
-egmtrans dted-header N55.dt2                          # text report on stdout
-egmtrans dted-header N55.dt2 --check-data             # also check every elevation record
-egmtrans dted-header E038 --format csv --out headers.csv   # files given one by one
-egmtrans dted-header N55.dt2 --format json --strict   # exit 1 on warnings too
-```
-
-Findings have three severities. An error breaks readers or a mandatory rule: a wrong sentinel, a byte that is not printable, an interval that does not match the latitude zone (Tables I to III of the specification), counts that do not match the interval, a UHL origin that differs from the DSI, security codes that differ between UHL and DSI, a UHL vertical accuracy that differs from the ACC, flags that disagree with the subregions, a malformed date or accuracy. A warning is a deviation that readers tolerate: NA right justified, `E08`, a product specification other than `PRF89020B`, a producer code that does not start with a country code, an unset compilation date. Information notes free text in a reserved area, the elevation range, and an overall accuracy better than its worst subregion. With `--check-data`, the elevation records are checked too: the `0xAA` sentinel, the block and line counts, the checksum of every record, and the share of null posts against the partial cell indicator. Log messages go to stderr, the report to stdout (or `--out`), so a JSON or CSV report can be piped; the exit code is 1 when a file has errors (or warnings with `--strict`), 2 for a usage error.
-
-## DTED Metadata Index and Profile
-
-The geometry fields of a DTED header follow from the raster, but the accuracies (CE90 and LE90), the edition, the dates, the producer, the security markings and the free text do not, and they differ per cell. EGMTrans takes them from two files that a producer prepares once for a whole collection:
-
-- A **metadata index**, a GeoPackage (`.gpkg`) or GeoParquet (`.parquet`) file with one row per one-degree cell, keyed by `cell_id` (`N38E045`), built and checked with `egmtrans dted-index`. The index is also a catalog of the collection that other services can read, filter and style: every row carries the cell polygon.
-- A **product profile**, a TOML file of the values that are the same for every cell of a product. `samples/dted_profile_example.toml` follows the header of the public SRTM DTED2 sample in `samples/`.
-
-When a header is written, its fields are filled in order of precedence: values derived from the cell geometry, the target datum and the data (sentinels, origin, intervals, counts, corners, series, vertical and horizontal datum, partial cell indicator, the multiple-accuracy flags, the UHL copies of the security code and the vertical accuracy) can never be overridden; then the run's overrides (`--dted-set FIELD=VALUE`, or the DTED Header Overrides table in ArcGIS Pro: one value for every cell, for a date that must be today's or a producer code that has changed); then the cell's index row; then the profile; then the input file's header (for a DTED input); then the `--abs_horiz_accuracy` fallback, which fills its field only when it is still NA; then the specification's fill (NA, `0000`, blanks). A cell the index does not hold, or holds twice, stops the run before anything is written, and so does an index or profile made for another DTED level. For a DTED cell made from a GeoTIFF there is no input header: the security code, the edition, the match/merge version, the producer code, the compilation date and the four accuracies must come from the index, the profile or `--abs_horiz_accuracy`, and the run stops before writing when one of them has no source (an explicit NA counts). A `vertical_datum` or `horizontal_datum` the profile or index states for another product (`E96` in an index harvested from the EGM96 collection, for an EGM2008 output) is reported as a warning and the output keeps its own code. A column the index does not have is supplied by the profile: an index built by `dted-index build` leaves out every column that is NULL in all its rows (an index built by 1.8.0 keeps them until it is rebuilt). A NULL among an accuracy column's values means NA; to write NA in every cell, say so in the profile (`rel_horiz_acc = "NA"`). Every field's source is logged, the validator's warnings on the result are logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
-
-Before a run writes anything, the **header plan** is logged: the index, profile and overrides in use, the first cell as the example, and every supplied field with its value and source (for a DTED-to-DTED run with an index, a profile or overrides, every field that changes). On the command line the run then asks `Write the DTED headers as planned?`; `-y` answers it. In ArcGIS Pro the plan is the first thing in the messages, and the DTED Header Fields box shows the summary as soon as an index or a profile is chosen, so a wrong value is seen before a long run starts.
-
-Index columns (layer `dted_cells`; dates are ISO dates and are written as YYMM):
-
-| Column | Header field | Notes |
+| ArcGIS Pro | Command line | What it does |
 |---|---|---|
-| `cell_id`, `dted_level` | | The key (`N38E045`) and the level the row describes |
-| `security_code` | UHL 33, DSI 4 | U, R, C or S; required |
-| `security_control`, `security_handling` | DSI 5-6, 7-33 | Control and release markings, handling description |
-| `unique_ref_uhl`, `unique_ref_dsi` | UHL 36-47, DSI 65-79 | Unique reference numbers |
-| `data_edition`, `match_merge_version` | DSI 88-89, 90 | 1-99 and A-Z; required |
-| `maintenance_date`, `match_merge_date`, `maintenance_code` | DSI 91-102 | NULL until used |
-| `producer_code` | DSI 103-110 | Country code first (FIPS 10-4); required |
-| `product_spec`, `product_spec_amend`, `product_spec_date` | DSI 127-141 | `PRF89020B`, `00`, 2000-05 by default |
-| `digitizing_system`, `compilation_date` | DSI 150-163 | Compilation date required |
-| `abs_horiz_acc`, `abs_vert_acc`, `rel_horiz_acc`, `rel_vert_acc` | ACC 4-19 | Meters; NULL means NA |
-| `acc_nima_reserved`, `dsi_nima_text`, `dsi_producer_text`, `dsi_free_text` | ACC 24, DSI 292-648 | Free text areas |
-| `vertical_datum`, `horizontal_datum` | DSI 142-149 | Checked against the output, never written from here |
-| `source_id`, `source_file`, `source_metadata_file`, `source_date`, `source_version`, `partial_cell`, `qc_status`, `notes`, `updated` | | Catalog columns the writer ignores |
+| Input File or Folder | `-i` | A DTED or GeoTIFF file, or a folder of them, searched recursively. Files that are not DEMs are skipped; files that cannot be read are reported and counted. |
+| Output File or Folder | `-o` | The output file (`.tif`, `.tiff`, `.dt0`, `.dt1`, `.dt2`) or folder; may not lie inside the input folder; a drive or share root is fine. |
+| Output Format | `--dted-level N` | DTED2 (default), DTED1, DTED0 or GeoTIFF. A DTED input must be at the level given. For a DTED format the Target Datum and the Interpolation Algorithm offer EGM96 and bilinear only and the DTED parameters apply. |
+| Source Datum | `-s` | WGS84, EGM96 or EGM2008: state what your tiles are in. Every input's header or CRS is compared with it before anything is written. |
+| Target Datum | `-t` | EGM96 for DTED; WGS84, EGM96 or EGM2008 for GeoTIFF. |
+| Interpolation Algorithm | `-a` | bilinear (default; the only one for DTED), spline, delaunay, or proj on the command line. See [docs/algorithms.md](docs/algorithms.md). |
+| Minimum Patch Size (posts) | `-p` | The least number of posts of a flat area that counts as a water body; default 16. |
+| Retain Flat Areas | `-f` | Keep the ocean at 0 and every water body at one level across the run; on by default. Off, or with WGS84 as either datum, nothing is leveled and the three water options below are ignored. |
+| Create Mask | `-m` | A mask beside each output: 1 for the ocean, one value per water body. Beside a DTED cell it is named for the source tile. |
+| Save Log File | `-l` | The log, beside a single output or inside the output folder; appended on a rerun, UTF-8. |
+| Skip Existing Cells | `--skip-existing` | Leave outputs that already exist and verify alone, so a cancelled or failed run can be continued. Otherwise existing outputs are listed before they are replaced. |
+| Neighboring Tiles (not processed) | `--context FOLDER` | Additional tiles in the source datum that constrain the run: analyzed, never written. May be repeated on the command line. |
+| Water Levels Table | `--water-levels FILE` | A table from an earlier run's `--export-water-levels`. |
+| Minimum Containment (0-1) | `-c` | The share of a flat area's boundary that must lie above it for the area to be water; default 0.8. |
+| Absolute Horizontal Accuracy | `--abs_horiz_accuracy` | A default CE90 for DTED headers that have none. |
+| DTED Metadata Index | `--dted-index FILE` | GeoPackage or GeoParquet; the cell's row fills its header. |
+| DTED Product Profile | `--dted-profile FILE` | TOML of the product's header constants, from the template. |
+| DTED Output Naming, Naming Template | `--dted-naming` | DTED standard (`DTED/E006/N49.dt2`, default), Cell name (`N49E006.dt2`), Input name (`stem`), or a template with `{stem}`, `{dir}`, `{cell}`, `{lat}`, `{lon}`, `{level}`. |
+| DTED Header Overrides | `--dted-set FIELD=VALUE` | One value for every cell of the run, over the index and the profile. |
+| DTED Header Summary | | Read only: which header fields come from where, and what is still missing. |
+| | `-y` | Answer the prompts (a datum the headers contradict, the header plan) for unattended runs. |
+| | `--export-water-levels FILE` | Write the levels of the water bodies that touch a tile edge. |
 
-Accuracy subregions (up to nine per cell, each with its four accuracies and an outline of 3 to 14 vertices) go in the layer `dted_acc_subregions` (`cell_id`, `seq`, the accuracies, a polygon); in a GeoParquet index they are the sibling file `<name>_subregions.parquet`. The table `dted_index_meta` (or the Parquet file's metadata) records the schema version, the level, the product and the generator. Columns the writer does not know are kept, so an index may carry whatever else a collection needs. A GeoPackage without the layer `dted_cells`, or a GeoParquet file with neither the index metadata nor a header column, is not an index and is refused.
+Subcommands: `egmtrans dted-header FILE...`, `egmtrans dted-index build|validate`, `egmtrans dted-selftest [--keep FOLDER]`, `egmtrans dmed FOLDER [--out PATH] [--check]`. The toolbox has the same four tools: EGMTrans Tool, DTED Header Report, DTED Self-Test and Build DMED.
 
-Building an index:
+### DTED output
 
-```bash
-# Rows from the headers of an existing DTED collection (subregions included)
-egmtrans dted-index build --out collection.gpkg --from-dted /data/dted --product DTED2
+- DTED is written in EGM96 only (MIL-PRF-89020B 3.2.2); an EGM2008 or WGS84 target is refused before anything runs. EGM2008 (`E08`) DTED is read as input.
+- Cells made from GeoTIFF land in the standard tree, `DTED/E006/N49.dt2`, with masks beside them. An output folder named `DTED` gets no second root. `--dted-naming stem` gives the layout of earlier versions.
+- Every cell is written under a scratch name, verified (header, records, checksums, the level its name claims, GDAL reading it back) and renamed; the log holds its size and SHA-256.
+- A DTED0 cell comes with its `.avg`, `.min` and `.max` companion files (3.9.3). The DMED volume file (3.9.5) is written by `egmtrans dmed` once the delivery is complete. Not produced: `onc.dir`, the gazetteer and `Read.me`.
+- A DTED input is transformed at its own level and must match the level given; DTED-to-DTED runs mirror the input tree.
+- Only bilinear interpolation is accepted for DTED, so that tiles edge-match whatever their extent.
 
-# Rows for every cell the source rasters cover, with values the profile's harvest
-# mappings pull from raster tags and XML sidecars
-egmtrans dted-index build --out collection.parquet --from-rasters /data/tiles --profile collection.toml
+### Exit codes
 
-# Rows from a footprint layer, then add what the DTED headers say, keeping the rest
-egmtrans dted-index build --out collection.gpkg --from-table footprints.gpkg --cell-field item_name
-egmtrans dted-index build --out collection.gpkg --from-dted /data/dted --update
+`0` success, `1` a transformation failed or the run was cancelled, `2` an argument or path error, a DTED target other than EGM96, or a prompt that could not be answered.
 
-# Rows from any attribute table (a catalog, an export): a table column named like an index
-# column fills it, --map names the others, --set fills a column with one value, --prefer
-# keeps one row per cell, and the import is reported (what mapped, what was dropped, what
-# the profile must supply)
-egmtrans dted-index build --out collection.gpkg --from-table catalog.parquet --prefer tile_version \
-  --map compilation_date=creation_date --set security_code=U --profile collection.toml
+### Constraints
 
-egmtrans dted-index validate collection.gpkg --profile collection.toml --level 2
-```
+The following are refused: formats other than GeoTIFF and DTED; a horizontal datum other than WGS 84; a GeoTIFF that is not on the whole-degree lattice, has a scale or offset, covers no whole cell, or holds undeclared voids (-9999, or values at or below -12,000 m without a NoData value), when DTED is made from it; a DTED cell without a profile or index to fill its header; a DTED input at another level than the one given; an interpolation algorithm other than bilinear for DTED; GeoTIFFs with more than one band (ignored in a folder); an output folder inside the input folder; a profile that still holds template placeholders; a date outside 1980-2079 in a header field.
 
-The profile's `[harvest.tags.fields]` map index columns to raster metadata tags and `[harvest.xml.fields]` to XPath expressions in a sidecar found through `[harvest.xml] sidecar` (`{stem}`, `{name}`, `{cell}` and `{dir}` are replaced); a mapping may be a table with a `pattern` whose first group is the value, and an XML mapping may list several XPaths, tried in order until one yields a value. XPath with namespaces and predicates needs `lxml`; a sidecar that declares a DOCTYPE or entities is refused. Harvested accuracies are rounded up to whole meters. Values the build cannot find stay NULL, to be filled in any GIS or with a script, and `dted-index validate` lists what is missing. Using the index:
+You are asked before the run goes on when the source and target datums are the same for a GeoTIFF (the file is rewritten as an optimized copy with the compound CRS), and when an input's header or CRS declares another vertical datum than the source datum you gave (the files are listed; `-y` proceeds, ArcGIS Pro warns and proceeds).
 
-```bash
-egmtrans -i in/N55.dt2 -o out/N55.dt2 -s EGM2008 -t EGM96 --dted-index collection.gpkg --dted-profile collection.toml
-egmtrans -i tiles -o dted2 -s EGM2008 -t EGM96 --dted-level 2 --dted-index collection.gpkg \
-  --dted-profile collection.toml --dted-set compilation_date=today --dted-set producer_code=USNGA
-```
+### Troubleshooting
 
-## Creating DTED from GeoTIFF
+- **GDAL build failure on Windows** (`Microsoft Visual C++ 14.0 or greater is required`): `pip` found no GDAL wheel for your Python. Use the conda environment, or install GDAL from OSGeo4W before `pip install`.
+- **EPSG lookups fail** (`proj_create_from_database: Open of .../share/proj failed`): PROJ 9.9 lists the user's own PROJ directory first, and when it exists without a `proj.db` every lookup fails. EGMTrans points GDAL at the directory that holds the database; if the error remains, set `PROJ_DATA` to it, for example `<env>/share/proj`.
+- **The toolbox shows the previous version** after an upgrade: restart ArcGIS Pro; the toolbox reloads its shim but not the package, and it warns when the two versions differ.
+- **Red "!" icons on the Explorer's geoid layers**: the project was opened before the grids were in `datums/`; close and reopen it.
+- **A run in ArcGIS Pro says little** for a large batch: the messages pane shows one line per cell and the warnings; the log file keeps the detail.
 
-With `--dted-level` (or a `.dt0`, `.dt1` or `.dt2` output name for a single file), a GeoTIFF becomes DTED without an intermediate product, so the vertical transform works on the unrounded heights. The source must be in geographic coordinates on WGS 84, pixel-is-point, with a whole number of posts per degree on each axis and a post on every whole degree, as TanDEM-X tiles are; each whole one-degree cell it covers becomes one DTED file. The heights are kept as they are read: a band with a scale or offset, a rotated or projected raster, or one off the lattice is refused.
+### More
 
-How a cell is made:
-
-- **Resampling.** Every DTED post lies at a rational position between source posts, so bilinear interpolation is a mean with whole-number weights (halves and thirds for TanDEM-X spacings), computed exactly. A void source post is dropped and the weights renormalized; a post is void when no valid neighbor carries weight. The lower levels are the finished DTED2 thinned (every third post for DTED1, every thirtieth for DTED0), so the three levels agree at every common post.
-- **Water.** Flat areas and the containment test (`-p`, `-c`) are judged on the source grid, where rivers and lakes were flattened, and carried to the cell: a DTED post belongs to a water body when every source post that contributes to it does. Enclosed low spots beside a water body are raised to its level (see [Notes](#notes)), when they are enclosed on the source grid as well.
-- **Longitude-spacing boundaries.** On the TanDEM-X boundaries at 50, 60, 70, 80 and 85 degrees, the tile on the equator side carries a copy of the coarser tile's edge row. EGMTrans recovers that row and resamples from it, so the two cells derive their shared row from the same data and agree post for post.
-- **Geoid correction.** The correction is evaluated on the arc-minute lattice of the 1' grids with the same whole-number weights, and the grids are checked against their published SHA-256 before a cell is written.
-- **Writing.** EGMTrans writes the header and the elevation records itself, verifies the file (header, records, checksums, and GDAL reading it back) and only then gives it the output name. The log records the versions of EGMTrans, Python, GDAL, numpy and Numba, the SHA-256 of the grids read, and the size and SHA-256 of every DTED written.
-
-The same version of EGMTrans, the same grids and the same inputs give the same bytes on every computer, with or without Numba, in a terminal or in ArcGIS Pro. "The same inputs" includes the other tiles of the run, the context folders and the water-levels table, since they decide the levels of water bodies that cross cell edges, and the index and the profile, which fill the header; distribute the index rather than rebuilding it per computer. `egmtrans dted-selftest` converts two built-in synthetic tiles and compares the bytes with the reference pinned in EGMTrans, so each producer can prove their installation before a run. After a batch run, the shared posts of the DTED outputs along every seam are read back and compared; the log reports any that differ.
-
-## Notes
-
-- When processing DTED files, the output must also be in DTED format, at the same level.
-- DTED files can only use EGM96 or EGM2008 as vertical datums, not WGS84.
-- Flat areas: every 4-connected patch of at least `-p` posts of one height (the same whole centimeter; whole meters for DTED) is a candidate water body. It counts as one when at least `-c` (default 80%) of its boundary posts lie above it in the input; ocean neighbors are neutral, so lagoons and river mouths qualify; a contour band on a slope or a flat hilltop does not qualify and is transformed post by post. In a batch run the share is summed over every part of a water body, so both sides of a seam reach the same verdict. The ocean (0 m) stays at 0. Every water body is set to the lowest of its transformed values, so no land post is changed and no shore post can end up below the water beside it. The log counts, per file, the flat areas left as terrain and how the shore posts stand to the water after the transform.
-- Enclosed low spots: in floating-point data, a few posts below the water body beside them, bounded by the water and by higher ground, are set to the water's level and join it in the mask, when there are fewer of them than `-p`. A low spot that reaches lower water (an outlet), the tile edge or a void is left as it is, and so is every post of DTED and whole-meter input. The log counts the spots and lists every raise of a meter or more with its position.
-- Water bodies that span tiles: in a batch run, patches are joined across the seams between tiles and each water body takes one level over all its parts, so the tiles edge-match. A water body that reaches an edge with no neighbor in the run is listed in the log, because a neighbor transformed separately may give it a different level. Put the tiles that share a lake or river in one run, give the neighboring tiles as `--context` (a whole delivery folder will do: it is searched like `-i`, every DEM's placement is read from its header, and only the tiles that adjoin the run are analyzed), or pass the `--water-levels` table exported by an earlier run over the larger area; with the table, the level does not depend on the order in which the tiles are produced.
-- The flattening option is not available when transforming to or from WGS84.
-- After upgrading EGMTrans, restart ArcGIS Pro: the toolbox reloads `EGMTrans.py` but not the package beneath it, and warns when the two versions differ.
-- The interpolation algorithms use Python's NumPy and Numba modules, not Esri's Spatial Analyst license.
-- For GeoTIFF outputs, the tool creates Cloud Optimized GeoTIFFs (COGs) with DEFLATE compression.
-- The tool rounds elevation values to the nearest centimeter to reduce noise in flat area detection and improve compression.
-- When batch processing, the tool preserves the input directory structure and auxiliary files in the output directory, except when a DTED level is given: then only the DTED files, their masks and the log are written.
-- The minimum patch size parameter can be adjusted to control the granularity of flat area preservation.
-- Creating mask files can be useful for quality control: the mask holds 1 for the ocean and one value per water body, so it shows exactly what was flattened, DTED included.
-- The script creates a detailed log file ending in `_transform.log`: beside the output file when the
-  output is a single file (`out.dt2` → `out_transform.log`), or inside the output folder named after
-  it when the output is a folder (`results/` → `results/results_transform.log`). Pass `-l False` to
-  skip it.
-- Performance is significantly improved (by 20-50x) when Numba is available, especially for large datasets.
-
-## Constraints
-
-The following operations are not allowed and will cause the transformation to abort.
-- Transforming DEMs in unsupported formats (only GeoTIFF, DTED0, DTED1, and DTED2 are supported).
-- Transforming DTED files to the WGS 84 ellipsoid, which is outside the DTED specification (STANAG 3809).
-- Transforming files with a horizontal datum other than WGS 84 (e.g., NAD83).
-- Writing a DTED file at another level than its input.
-- Creating DTED from a GeoTIFF that is not on the whole-degree lattice (projected, rotated, a spacing that is not a whole number of posts per degree, posts off the whole degree), whose band has a scale or offset, or that covers no whole cell, and creating it without a product profile or metadata index to fill the header.
-- Writing DTED with an interpolation algorithm other than `bilinear` (see [Interpolation Algorithms](#interpolation-algorithms)).
-- Transforming GeoTIFFs with more than one band. If multi-band GeoTIFFs (e.g. auxiliary orthophotos) exist in directories during batch processing, they will be ignored.
-
-In addition, users will be warned in the following circumstances and asked if they wish to proceed:
-- The user requests flattening or ignores the flag (flattening is the default), when transforming to or from the WGS 84 ellipsoid. Flattening can only be applied between orthometric heights. If the user chooses to proceed with the transformation, no flattening will occur.
-- The source datum and target datum are the same. If the source is a GeoTIFF file and the user chooses to proceed, the output GeoTIFF will be assigned the correct vertical datum (which is often missing in GeoTIFF files) with values rounded to 1 cm and optimized DEFLATE compression. If the source is a DTED file, the operation will abort. A GeoTIFF made into DTED goes on without asking: the cell is resampled and its water flattened whatever the datum.
-- The source datum does not match the datum in the source file header. If the user chooses to proceed, the source file metadata will be ignored. This may be necessary if the source file is in error, but it is important to check the sources to be sure.
-
-## Troubleshooting
-
-### GDAL build failure on Windows (`Microsoft Visual C++ 14.0 or greater is required`)
-
-This error occurs when `pip` cannot find a pre-built GDAL wheel for your Python version and falls back to compiling from source. Building GDAL from source requires both the Microsoft Visual C++ Build Tools and the GDAL C library headers, which most users will not have installed. This is especially common with newer Python releases (e.g., 3.13+) that GDAL has not yet published wheels for.
-
-**Fix:** Use the [conda installation method](#option-c-conda-environment), which provides pre-compiled GDAL binaries from conda-forge. Alternatively, install GDAL via [OSGeo4W](https://trac.osgeo.org/osgeo4w/) before running `pip install`.
-
-### EPSG lookups fail with `proj_create_from_database: Open of .../share/proj failed`
-
-GDAL 3.13 with PROJ 9.9 lists the user's own PROJ directory (`~/.local/share/proj`, where downloaded transformation grids go) ahead of the installation's, and when that directory exists without a `proj.db` every EPSG lookup fails. EGMTrans points GDAL at the directory that holds the database when it starts. If the error still appears (another program initialized PROJ first), set `PROJ_DATA` to that directory, for example `<env>/share/proj` of the conda environment.
-
-### EGMTrans Toolbox in ArcGIS Pro
-
-- If you encounter any issues with the toolbox, check the ArcGIS Pro Python window for error messages.
-- Ensure that the `EGMTrans.py` file is correctly located in the `EGMTrans` directory.
-- Make sure you have the necessary permissions to read the input files and write to the output location.
-- For Explorer-specific issues, ensure that your transformed files are in the correct location and properly referenced in the ArcGIS Pro project.
-- If you encounter performance issues, check if Numba is installed and properly configured in your Python environment.
-
-### Red "!" icons next to geoid layers in ArcGIS Pro
-
-If ArcGIS Pro (especially the EGMTrans Explorer project) is opened *before* the geoid grid files have been downloaded, the map layers that reference those `.tif` files will appear with red "!" broken-reference icons next to their checkboxes in the Contents pane. This is expected: the toolbox downloads the grids on its first run, but a project opened earlier has already cached the "missing file" state for the session.
-
-**Fix:** Run the EGMTrans tool once (on any sample input) to trigger the grid download. Then close and reopen the ArcGIS Pro project. On the next load, the layers will resolve against the now-present `.tif` files and render correctly without any manual repath or symbology changes.
-
-## Additional Resources
-
-- For more information on vertical datums and their transformations, contact NGA's [Office of Geomatics](https://earth-info.nga.mil/).
-- To learn more about using Python toolboxes in ArcGIS Pro, consult the [ArcGIS Pro documentation](https://pro.arcgis.com/en/pro-app/latest/arcpy/geoprocessing_and_python/a-quick-tour-of-python-toolboxes.htm).
-
-For further assistance, please contact the tool developer (see below) or refer to the ArcGIS Pro documentation on using Python toolboxes and working with elevation data.
+- [docs/dted_index.md](docs/dted_index.md): the metadata index, the product profile, header precedence, the producer code, DTED-to-DTED headers and the header report.
+- [docs/water_bodies.md](docs/water_bodies.md): flattening, containment, enclosed low spots, seams, neighboring tiles and water-level tables.
+- [docs/algorithms.md](docs/algorithms.md): the interpolation algorithms, why DTED takes bilinear only, and the geoid grids.
+- [docs/determinism.md](docs/determinism.md): how a DTED cell is made from a GeoTIFF, the companion files, and the same bytes on every computer.
+- [docs/explorer.md](docs/explorer.md): the EGMTrans Explorer map for ArcGIS Pro and QGIS.
+- [CHANGELOG.md](CHANGELOG.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md). The version is defined in `src/egmtrans/_version.py`. MIT license, see [LICENSE](LICENSE).
 
 ## Contact
-
-If you have questions about this program or would like to know more about NGA's geodetic and elevation products, please contact us!  
 
 **National Geospatial-Intelligence Agency (NGA)**  
 _Office of Geomatics & Targeting, Elevation Division_  

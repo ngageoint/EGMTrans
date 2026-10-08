@@ -29,18 +29,31 @@ from __future__ import annotations
 import csv
 import datetime
 import os
+import re
+import shutil
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from egmtrans import _state
 from egmtrans._version import __version__
-from egmtrans.config import DATUM_MAPPING, DTED_EXTENSIONS
+from egmtrans.config import DATUM_MAPPING, DTED_EXTENSIONS, DTED_ROOT, dted_target_problem
 from egmtrans.dted.header import CellGeometry, DtedHeader, read_header
+from egmtrans.dted.schema import DATA_RECORD_OVERHEAD, HEADER_LENGTH
+from egmtrans.dted.validate import validate_file
 from egmtrans.dted.writer import DtedMetadataSource, HeaderAssemblyError, header_plan_lines
-from egmtrans.file_utils import IOPaths, copy_folder_structure, dted_output_name, find_dems, is_valid_dem
+from egmtrans.file_utils import (
+    DEFAULT_DTED_NAMING,
+    IOPaths,
+    copy_folder_structure,
+    dted_output_name,
+    find_dems,
+    is_valid_dem,
+    mask_output_name,
+)
 from egmtrans.flattening import DEFAULT_CONTAINMENT
 from egmtrans.io import new_dted_header, preview_dted_header
+from egmtrans.logging_setup import progress
 from egmtrans.tiling import (
     SeamCheck,
     TableRow,
@@ -55,19 +68,31 @@ from egmtrans.tiling import (
     format_seam_report,
     merge_patches,
 )
-from egmtrans.transform import _make_temp_dir, _remove_temp_dir, analyze_tile, source_grid, tile_geometry
+from egmtrans.transform import (
+    _make_temp_dir,
+    _remove_temp_dir,
+    analyze_tile,
+    remove_leftover_temp_dirs,
+    source_grid,
+    tile_geometry,
+)
 
 TABLE_COLUMNS = ('height_m', 'level_m', 'posts', 'tiles', 'side', 'line', 'start', 'end')
+# Above this many work units, a run in ArcGIS Pro keeps the per-cell detail
+# to the log file and shows the messages pane one line per cell.
+QUIET_THRESHOLD = 20
 
 
 @dataclass(frozen=True)
 class WorkUnit:
     """One output of a run: an input file, where its output goes (None for a
-    context tile), and the DTED cell to make from it (None for a transform)."""
+    context tile), the DTED cell to make from it (None for a transform), and
+    where its flat mask goes when one is asked for."""
 
     input_file: str
     output_file: str | None
     cell: CellGeometry | None = None
+    mask_file: str | None = None
 
     @property
     def name(self) -> str:
@@ -92,6 +117,9 @@ class BatchResult:
     units: list[WorkUnit] = field(default_factory=list)
     outputs: list[str] = field(default_factory=list)
     seam_checks: list[SeamCheck] = field(default_factory=list)
+    skipped_existing: int = 0
+    unreadable: int = 0
+    cancelled: bool = False
 
 
 def plan_units(
@@ -103,39 +131,55 @@ def plan_units(
 ) -> list[WorkUnit]:
     """The work units of *inputs* (file, output or None for context).
 
-    Without a level every input is one unit. With a level, a DTED input keeps
-    its level and is one unit; a GeoTIFF becomes one unit per whole cell it
-    covers, named by *naming* under *output_root*.
+    Without a level every input is one unit. With a level, a DTED input must
+    be at that level and is one unit (a DTED file keeps its level); a GeoTIFF
+    becomes one unit per whole cell it covers, named by *naming* under
+    *output_root*, and the cells it covers only in part are logged.
 
     Raises:
-        ValueError: If a GeoTIFF cannot become DTED, covers no whole cell, or
-            the naming template is invalid.
+        ValueError: If a GeoTIFF cannot become DTED, covers no whole cell, a
+            DTED input is at another level, or the naming template is invalid.
     """
+    logger = _state.get_logger()
     units: list[WorkUnit] = []
     for input_file, output_file in inputs:
+        name = os.path.basename(input_file)
         if dted_level is None or input_file.lower().endswith(DTED_EXTENSIONS):
-            units.append(WorkUnit(input_file, output_file, None))
+            if (
+                dted_level is not None and output_file is not None
+                and input_file.lower().endswith(DTED_EXTENSIONS) and int(input_file[-1]) != dted_level
+            ):
+                raise ValueError(
+                    f'{name} is DTED level {input_file[-1]}, not level {dted_level}: a DTED file keeps its level. '
+                    f'Run the DTED{input_file[-1]} files at their own level.'
+                )
+            mask = mask_output_name(output_file) if output_file is not None else None
+            units.append(WorkUnit(input_file, output_file, None, mask))
             continue
         grid = source_grid(input_file)
         cells = grid.cells()
         if not cells:
             raise ValueError(
-                f'{os.path.basename(input_file)} holds no whole one-degree cell with posts on all four of '
+                f'{name} holds no whole one-degree cell with posts on all four of '
                 f'its edges, so no DTED cell can be made from it'
+            )
+        for lon0, lat0 in grid.partial_cells():
+            logger.info(
+                f'Cell {CellGeometry(dted_level, lon0, lat0).cell_id} is covered only in part by {name} and is skipped.'
             )
         for lon0, lat0 in cells:
             cell = CellGeometry(dted_level, lon0, lat0)
-            output = None
+            output = mask = None
             if output_file is not None:
                 output = os.path.join(
-                    output_root, dted_output_name(naming, input_file, input_root, cell.cell_id, dted_level)
+                    output_root,
+                    dted_output_name(
+                        naming, input_file, input_root, cell.cell_id, dted_level, output_root=output_root
+                    ),
                 )
-            units.append(WorkUnit(input_file, output, cell))
+                mask = mask_output_name(output, input_file, cell.cell_id, several_cells=len(cells) > 1)
+            units.append(WorkUnit(input_file, output, cell, mask))
     return units
-
-
-def _mask_name(output_file: str) -> str:
-    return os.path.join(os.path.dirname(output_file), f'{os.path.splitext(os.path.basename(output_file))[0]}_mask.tif')
 
 
 def check_units(units: list[WorkUnit], create_mask: bool) -> list[str]:
@@ -147,7 +191,7 @@ def check_units(units: list[WorkUnit], create_mask: bool) -> list[str]:
     for unit in units:
         if unit.output_file is None:
             continue
-        names = [unit.output_file] + ([_mask_name(unit.output_file)] if create_mask else [])
+        names = [unit.output_file] + ([unit.mask_file] if create_mask and unit.mask_file else [])
         for name in names:
             key = os.path.normcase(os.path.abspath(name))
             if key in inputs:
@@ -181,7 +225,9 @@ def read_water_levels(path: str, source_datum: str, target_datum: str) -> WaterL
     """
     header: dict[str, str] = {}
     rows: list[TableRow] = []
-    with open(path, newline='') as f:
+    # utf-8-sig: a byte order mark, which Excel writes when it re-saves the
+    # table, is not part of the first comment line.
+    with open(path, newline='', encoding='utf-8-sig') as f:
         lines = []
         for line in f:
             if line.startswith('#'):
@@ -193,6 +239,19 @@ def read_water_levels(path: str, source_datum: str, target_datum: str) -> WaterL
         raise ValueError(
             f"The water-level table {path} is for {header.get('source')} to {header.get('target')}, "
             f"not {source_datum} to {target_datum}."
+        )
+    first = lines[0] if lines else ''
+    if ';' in first and ',' not in first:
+        raise ValueError(
+            f'The water-level table {path} uses ";" as its separator, as a spreadsheet re-save does; EGMTrans writes '
+            f'and reads comma-separated tables with decimal points. Use the file EGMTrans wrote, or save it as CSV '
+            f'with commas and points.'
+        )
+    if any(re.search(r'"\d+,\d+"', line) for line in lines[1:3]):
+        raise ValueError(
+            f'The water-level table {path} holds decimal commas, as a spreadsheet re-save in a locale with decimal '
+            f'commas does; EGMTrans reads decimal points. Use the file EGMTrans wrote, or save it as CSV with commas '
+            f'as separators and points as decimals.'
         )
     try:
         for record in csv.DictReader(lines):
@@ -218,7 +277,7 @@ def write_water_levels(path: str, bodies: list[WaterBody], source_datum: str, ta
     imports the table reproduces the exporting run's outputs exactly.
     """
     count = 0
-    with open(path, 'w', newline='') as f:
+    with open(path, 'w', newline='', encoding='utf-8') as f:
         f.write('# EGMTrans water levels: one row per crossing of a water body over a tile edge\n')
         f.write(f'# version: {__version__}\n')
         f.write(f'# source: {source_datum}\n')
@@ -253,15 +312,104 @@ def _failed_tile(tile_id: int, input_file: str, output_file: str | None, error: 
     )
 
 
-def _remove_if_present(path: str | None) -> None:
+def _remove_if_present(path: str | None) -> bool:
+    """Remove *path* and its ``.aux.xml`` sidecar; True when a file was there."""
     if not path:
-        return
+        return False
+    removed = False
     for candidate in (path, path + '.aux.xml'):
         if os.path.isfile(candidate):
             try:
                 os.remove(candidate)
+                removed = removed or candidate == path
             except OSError as e:
                 _state.get_logger().warning(f'Could not remove {candidate}: {e}')
+    return removed
+
+
+def _clear_failed_output(unit: WorkUnit) -> None:
+    """A unit that failed leaves nothing under its output names: not this
+    run's partial file, not an earlier run's file, which the log would
+    otherwise contradict."""
+    logger = _state.get_logger()
+    for path in (unit.output_file, unit.mask_file):
+        if _remove_if_present(path):
+            logger.warning(f'Removed {path}, which this run failed to write anew.')
+
+
+def _datum_of(path: str) -> str | None:
+    """The vertical datum a file declares, or None when it declares none or cannot be read."""
+    from egmtrans import cli
+
+    try:
+        return cli.file_datum_of(path)
+    except Exception:
+        return None
+
+
+def _existing_output_ok(unit: WorkUnit) -> bool:
+    """Whether the file at the unit's output path is a finished output of
+    this unit: a DTED file whose header validates, is the unit's cell and
+    has the right size, or a readable GeoTIFF."""
+    path = unit.output_file
+    if not path or not os.path.isfile(path):
+        return False
+    if path.lower().endswith(DTED_EXTENSIONS):
+        try:
+            header, issues = validate_file(path)
+        except (OSError, ValueError):
+            return False
+        if any(issue.severity == 'error' for issue in issues):
+            return False
+        return unit.cell is None or header.cell_id == unit.cell.cell_id
+    return is_valid_dem(path)
+
+
+def estimated_output_bytes(units: Sequence[WorkUnit], create_mask: bool) -> int:
+    """A rough size of what *units* will write: the exact size of each DTED
+    cell (four files for DTED0), the input's size for a GeoTIFF, and about a
+    quarter of the posts in bytes for a compressed mask."""
+    total = 0
+    for unit in units:
+        if unit.cell is not None:
+            cell = unit.cell
+            size = HEADER_LENGTH + cell.lon_lines * (DATA_RECORD_OVERHEAD + 2 * cell.lat_points)
+            total += size * (4 if cell.level == 0 else 1)
+            if create_mask:
+                total += cell.lon_lines * cell.lat_points
+        else:
+            try:
+                size = os.path.getsize(unit.input_file)
+            except OSError:
+                size = 0
+            total += size + (size // 2 if create_mask else 0)
+    return total
+
+
+def free_space_problem(output_dir: str, needed: int) -> str | None:
+    """Why the volume of *output_dir* cannot take *needed* bytes, or None."""
+    try:
+        free = shutil.disk_usage(output_dir).free
+    except OSError:
+        return None
+    if free >= needed:
+        return None
+    return (
+        f'The volume of {output_dir} has {free / 1e9:.1f} GB free, but the planned outputs need about '
+        f'{needed / 1e9:.1f} GB. Free space or choose another output folder.'
+    )
+
+
+def writable_file_problem(path: str, what: str) -> str | None:
+    """Why *path* cannot be written as a file, or None."""
+    folder = os.path.dirname(os.path.abspath(path)) or os.curdir
+    if os.path.isdir(path):
+        return f'{what} {path} is a folder, not a file'
+    if not os.path.isdir(folder):
+        return f'{what} {path}: the folder {folder} does not exist'
+    if not os.access(folder, os.W_OK):
+        return f'{what} {path}: the folder {folder} is not writable'
+    return None
 
 
 def _header_datum(path: str) -> str | None:
@@ -312,33 +460,45 @@ def run_batch(
     min_containment: float = DEFAULT_CONTAINMENT,
     dted_metadata: DtedMetadataSource | None = None,
     dted_level: int | None = None,
-    dted_naming: str = 'stem',
+    dted_naming: str = DEFAULT_DTED_NAMING,
+    skip_existing: bool = False,
+    should_stop: Callable[[], bool] | None = None,
 ) -> BatchResult:
     """Transform every DEM of a run with water bodies leveled across tiles.
 
     *paths* names a folder of DEMs (transformed into the output folder, the
-    tree copied first as before) or a single file.  *context_folders* are
-    searched for DEMs the same way, and every tile found that adjoins the run
-    (directly or through other context tiles) is analyzed but not written.
-    The prompts a run can need (the header datum disagreeing with
-    *source_datum*, source and target the same) are asked once, before
-    anything is copied.
+    folders and auxiliary files of the tree copied first, the DEMs
+    themselves and their pyramid sidecars not) or a single file.
+    *context_folders* are searched for DEMs the same way, and every tile
+    found that adjoins the run (directly or through other context tiles)
+    is analyzed but not written. The prompts a run can need (the header
+    datum disagreeing with *source_datum* in any input, source and target
+    the same) are asked once, before anything is copied.
 
     With *dted_level*, every GeoTIFF of the run becomes DTED of that level,
     one file per whole cell it covers, named by *dted_naming* (a preset or a
-    template, see :data:`~egmtrans.file_utils.DTED_NAMING_PRESETS`); DTED
-    inputs keep their level, nothing of the input tree is copied, and the
-    shared posts of the DTED outputs are compared after the run.
+    template, see :data:`~egmtrans.file_utils.DTED_NAMING_PRESETS`; the
+    default is the standard ``DTED/E006/N49.dt2`` tree); a DTED input must
+    be at that level, nothing of the input tree is copied, and the shared
+    posts of the DTED outputs are compared after the run. DTED is written in
+    EGM96 only: another target datum ends the run before anything is written.
 
-    A tile whose analysis or transform fails is reported, its untransformed
-    copy is removed from the output tree, and the run goes on; the exit code
-    is then 1.  The report of water bodies that touch an edge with no
+    A tile whose analysis or transform fails is reported, whatever sits
+    under its output names is removed, and the run goes on; the exit code
+    is then 1. The report of water bodies that touch an edge with no
     neighbor in the run is logged after the merge, so it exists even if a
     later transform fails.
 
     *dted_metadata* (the index and profile for DTED headers) is checked
     against every DTED output's cell before anything is copied: a cell the
     index does not hold, or a header that cannot be completed, ends the run.
+
+    With *skip_existing*, a planned output that already exists and verifies
+    as this unit's is left alone, so a cancelled or failed run can be rerun
+    without redoing the cells written; without it, the outputs that would be
+    replaced are listed in a warning. *should_stop* is asked between tiles
+    (ArcGIS Pro's Cancel); Ctrl-C in a terminal stops the run the same way,
+    and the summary says how far it got.
 
     Raises:
         NonInteractiveError: If a prompt is needed, stdin is closed, and
@@ -356,8 +516,9 @@ def run_batch(
     cli.verify_grids(source_datum, target_datum)
     converting = dted_level is not None
 
+    skipped: list[tuple[str, str]] = []
     if paths.mode == 'folder':
-        run_files = find_dems(paths.input_path)
+        run_files = find_dems(paths.input_path, skipped=skipped)
         output_for = {
             f: os.path.join(paths.output_path, os.path.relpath(f, paths.input_path)) for f in run_files
         }
@@ -368,33 +529,61 @@ def run_batch(
         output_for = {paths.input_path: paths.output_path}
         output_dir = os.path.dirname(os.path.abspath(paths.output_path))
         input_root = os.path.dirname(os.path.abspath(paths.input_path))
+    result.unreadable = len(skipped)
 
     if not run_files:
         logger.error(f'No DEM to transform under {paths.input_path}.')
         result.exit_code = 1
         return result
 
-    run_set = {os.path.abspath(f) for f in run_files}
+    if export_water_levels:
+        problem = writable_file_problem(export_water_levels, 'The water-level table')
+        if problem:
+            logger.error(f'{problem}\nAborting transformation.')
+            result.exit_code = 2
+            return result
+
+    # Water bodies are leveled between orthometric datums only, and only when
+    # flattening is on: without that, context tiles and a water-level table
+    # have nothing to contribute, and no mask can be written.
+    water_logic = (
+        flatten and 'WGS84' not in (source_datum, target_datum) and (source_datum != target_datum or converting)
+    )
+    if not water_logic and (context_folders or water_levels or create_mask):
+        why = 'flattening is off' if not flatten else (
+            'WGS84 is the source or target datum' if 'WGS84' in (source_datum, target_datum)
+            else 'the source and target datums are the same'
+        )
+        ignored = [name for name, given in (
+            ('the context folder(s)', context_folders), ('the water-level table', water_levels),
+            ('the mask', create_mask),
+        ) if given]
+        logger.warning(f'No water body is leveled because {why}: {", ".join(ignored)} are ignored.')
+        context_folders, water_levels = (), None
+
+    run_set = {os.path.normcase(os.path.abspath(f)) for f in run_files}
     context_files = []
     for folder in context_folders:
         for f in find_dems(folder):
-            if os.path.abspath(f) not in run_set:
+            if os.path.normcase(os.path.abspath(f)) not in run_set:
                 context_files.append(os.path.abspath(f))
     if context_files:
         found = len(context_files)
         context_files = adjoining_context(run_files, context_files)
-        logger.info(
-            f'Context: {found} DEM(s) found; {len(context_files)} adjoin the run and will be analyzed.'
-        )
-    if converting:
-        # A DTED context tile in another datum is a finished product, not a source.
+        # A context tile in another datum is a finished product (or another
+        # collection), not a source: analyzed as the source datum, its
+        # levels would be wrong for every water body it shares.
         kept = []
         for f in context_files:
-            if f.lower().endswith(DTED_EXTENSIONS) and _header_datum(f) not in (None, source_datum):
-                logger.warning(f'Context tile {os.path.basename(f)} is not in {source_datum}; it is left out.')
+            declared = _datum_of(f)
+            if declared and source_datum not in declared:
+                logger.warning(
+                    f'Context tile {os.path.basename(f)} declares {declared}, not {source_datum}; it is left out.'
+                )
                 continue
             kept.append(f)
         context_files = kept
+        logger.info(f'Context: {found} DEM(s) found; {len(context_files)} adjoin the run and will be analyzed.')
 
     # Checks that end the run happen before anything is copied or written.
     try:
@@ -406,7 +595,11 @@ def run_batch(
                     f'{os.path.basename(run_files[0])} covers {len(units)} cells; give a folder as the output '
                     f'and name the cells with --dted-naming'
                 )
-            units = [WorkUnit(units[0].input_file, output_for[run_files[0]], units[0].cell)]
+            output = output_for[run_files[0]]
+            units = [WorkUnit(
+                units[0].input_file, output, units[0].cell,
+                mask_output_name(output, units[0].input_file, units[0].cell.cell_id if units[0].cell else None),
+            )]
         else:
             units = plan_units(
                 [(f, output_for[f]) for f in run_files], dted_level, dted_naming, input_root, output_dir
@@ -432,6 +625,12 @@ def run_batch(
         return result
 
     dted_units = [u for u in units if u.output_file.lower().endswith(DTED_EXTENSIONS)]
+    if dted_units:
+        problem = dted_target_problem(target_datum)
+        if problem:
+            logger.error(f'{problem}\nAborting transformation.')
+            result.exit_code = 2
+            return result
     if algorithm != 'bilinear':
         if dted_units and cli.DTED_REQUIRES_BILINEAR:
             logger.error(
@@ -474,8 +673,30 @@ def run_batch(
             return result
         logger.info(f'Read {len(table.rows)} edge crossing(s) from the water-level table {water_levels}.')
 
+    # Every input's own datum, from its header or CRS (cheap), before anything
+    # is written: a cell already in the target datum would be shifted twice.
+    disagreeing = []
+    for f in run_files:
+        declared = _datum_of(f)
+        if declared and source_datum not in declared:
+            disagreeing.append((f, declared))
+    if disagreeing:
+        shown = ', '.join(f'{os.path.basename(f)} ({d})' for f, d in disagreeing[:5])
+        more = f' and {len(disagreeing) - 5} more' if len(disagreeing) > 5 else ''
+        logger.warning(
+            f'{len(disagreeing)} of the {len(run_files)} input(s) declare another vertical datum than the source '
+            f'datum {source_datum}: {shown}{more}.'
+        )
+        if arc_mode:
+            logger.warning(f'Ignoring the headers of those files, using {source_datum} instead.')
+        elif not cli.confirm(f'Proceed and ignore the vertical datum these {len(disagreeing)} file(s) declare?',
+                             assume_yes):
+            logger.error('Aborting transformation.')
+            result.exit_code = 1
+            return result
     first = units[0]
-    if not cli.check_file_datum(first.input_file, first.output_file, source_datum, arc_mode, assume_yes):
+    if not cli.check_file_datum(first.input_file, first.output_file, source_datum, arc_mode, assume_yes,
+                                prompt=False):
         result.exit_code = 1
         return result
     # With the datums the same, a DTED-to-DTED unit has nothing to do and
@@ -488,69 +709,125 @@ def run_batch(
         result.exit_code = 1
         return result
 
+    # Outputs that are already there: skipped when asked, listed otherwise.
+    existing = [u for u in units if u.output_file and os.path.exists(u.output_file)]
+    if skip_existing and existing:
+        finished = [u for u in existing if _existing_output_ok(u)]
+        if finished:
+            done = {id(u) for u in finished}
+            units = [u for u in units if id(u) not in done]
+            result.skipped_existing = len(finished)
+            result.outputs.extend(u.output_file for u in finished)
+            logger.info(f'Skipping {len(finished)} output(s) already written and verified under {output_dir}.')
+        if len(finished) < len(existing):
+            logger.warning(
+                f'{len(existing) - len(finished)} existing output(s) do not verify as finished and will be rewritten.'
+            )
+        if not units:
+            logger.info('Every planned output is already written; nothing to do.')
+            return result
+    elif existing:
+        shown = ', '.join(os.path.basename(u.output_file) for u in existing[:5])
+        more = f' and {len(existing) - 5} more' if len(existing) > 5 else ''
+        logger.warning(
+            f'{len(existing)} of the {len(units)} planned output(s) already exist under {output_dir} and will be '
+            f'replaced: {shown}{more}.'
+        )
+
+    problem = free_space_problem(output_dir, estimated_output_bytes(units, create_mask))
+    if problem:
+        logger.error(f'{problem}\nAborting transformation.')
+        result.exit_code = 1
+        return result
+
+    remove_leftover_temp_dirs(output_dir)
     if paths.mode == 'folder' and not converting:
-        copy_folder_structure(paths.input_path, paths.output_path)
+        companions = copy_folder_structure(paths.input_path, paths.output_path, skip=run_files)
+        if companions:
+            logger.warning(
+                f'{len(companions)} DTED0 companion file(s) (.avg, .min, .max) beside the inputs were not copied: '
+                f'they hold the source datum\'s statistics. The delivery needs them rebuilt from DTED1.'
+            )
     for unit in units:
         os.makedirs(os.path.dirname(os.path.abspath(unit.output_file)), exist_ok=True)
 
     needs_merge = (
-        flatten
-        and 'WGS84' not in (source_datum, target_datum)
-        and (source_datum != target_datum or converting)
+        water_logic
         and (len(units) + len(context_units) > 1 or table is not None or export_water_levels is not None)
     )
 
+    def stop_requested() -> bool:
+        return bool(should_stop and should_stop())
+
+    quiet = arc_mode and len(units) > QUIET_THRESHOLD
+    if quiet:
+        logger.info(
+            f'{len(units)} outputs: the messages show one line per tile; the log file keeps the detail.'
+        )
     tiles: list[TileAnalysis] = []
     levels: dict[int, TileLevels] = {}
     seams = []
     temp_root = None
     all_units = units + context_units
     try:
+        _state.set_quiet(quiet)
         if needs_merge:
             temp_root = _make_temp_dir(output_dir)
-            logger.info(
+            progress(
                 f'Pass 1: analyzing {len(units)} tile(s)'
                 + (f' and {len(context_units)} context tile(s)' if context_units else '')
                 + ' for water bodies that cross tile edges...'
             )
             for tile_id, unit in enumerate(all_units):
+                if stop_requested():
+                    result.cancelled = True
+                    break
                 tile_temp = os.path.join(temp_root, f'tile_{tile_id}')
                 os.makedirs(tile_temp, exist_ok=True)
-                logger.info(f'Analyzing {tile_id + 1}/{len(all_units)}: {unit.name}')
+                progress(f'Analyzing {tile_id + 1}/{len(all_units)}: {unit.name}')
                 try:
                     tile = analyze_tile(
                         unit.input_file, source_datum, target_datum, algorithm, min_patch_size,
                         tile_temp, tile_id, unit.output_file, cell=unit.cell,
                     )
+                except KeyboardInterrupt:
+                    result.cancelled = True
+                    break
                 except Exception as e:
                     logger.error(f'Could not analyze {unit.name}: {e}')
                     tile = _failed_tile(tile_id, unit.input_file, unit.output_file, str(e))
                     result.failed.append((unit.name, f'analysis failed: {e}'))
                     result.exit_code = 1
-                    if unit.output_file is not None and not converting:
-                        _remove_if_present(unit.output_file)
+                    if unit.output_file is not None:
+                        _clear_failed_output(unit)
                 finally:
                     _remove_temp_dir(tile_temp)
                 tiles.append(tile)
 
-            seams = find_seams(tiles)
-            levels, bodies = merge_patches(tiles, seams, table, min_containment)
-            for tile in tiles:
-                if tile.error is None:
-                    levels.setdefault(tile.tile_id, TileLevels()).array_crc = tile.array_crc
-            result.seams = len(seams)
-            result.water_bodies = bodies
-            result.tiles = tiles
-            for line in format_boundary_report(bodies, tiles):
-                logger.info(line)
-            logger.info(f'\nPass 2: transforming {len(units)} tile(s)...')
+            if not result.cancelled:
+                seams = find_seams(tiles)
+                levels, bodies = merge_patches(tiles, seams, table, min_containment)
+                for tile in tiles:
+                    if tile.error is None:
+                        levels.setdefault(tile.tile_id, TileLevels()).array_crc = tile.array_crc
+                result.seams = len(seams)
+                result.water_bodies = bodies
+                result.tiles = tiles
+                for line in format_boundary_report(bodies, tiles):
+                    logger.info(line)
+                progress(f'\nPass 2: transforming {len(units)} tile(s)...')
 
         failed_ids = {t.tile_id for t in tiles if t.error is not None}
         written: dict[int, str] = {}
         for tile_id, unit in enumerate(units):
+            if result.cancelled:
+                break
             if tile_id in failed_ids:
                 continue
-            logger.info(f'Processing file: {unit.output_file}')
+            if stop_requested():
+                result.cancelled = True
+                break
+            progress(f'Processing file: {unit.output_file}')
             tile_levels = levels.get(tile_id) if needs_merge else None
             try:
                 ok = cli.process_file(
@@ -560,23 +837,28 @@ def run_batch(
                     check_for_wrong_datum=False, arc_mode=arc_mode, assume_yes=True,
                     tile_levels=tile_levels, min_containment=min_containment,
                     dted_metadata=dted_metadata, dted_cell=unit.cell, dted_plan=False,
+                    mask_file=unit.mask_file,
                 )
             except cli.NonInteractiveError:
                 raise
+            except KeyboardInterrupt:
+                result.cancelled = True
+                _clear_failed_output(unit)
+                break
             except Exception as e:
                 logger.error(f'Error processing {unit.name}: {e}')
                 ok = False
             if ok is False:
                 result.failed.append((unit.name, 'transformation failed'))
                 result.exit_code = 1
-                if paths.mode == 'folder' and not converting:
-                    _remove_if_present(unit.output_file)
+                _clear_failed_output(unit)
                 continue
             result.files_processed += 1
             result.outputs.append(unit.output_file)
             written[tile_id] = unit.output_file
     finally:
         _remove_temp_dir(temp_root)
+        _state.set_quiet(False)
 
     if seams and len(written) > 1:
         try:
@@ -586,20 +868,37 @@ def run_batch(
         for line in format_seam_report(result.seam_checks):
             (logger.warning if line.startswith('  Seam') else logger.info)(line)
 
-    if export_water_levels:
+    if export_water_levels and not result.cancelled:
         count = write_water_levels(export_water_levels, result.water_bodies, source_datum, target_datum)
         water = sum(1 for body in result.water_bodies if body.water)
         logger.info(f'Wrote {count} edge crossing(s) of {water} water bod(ies) to {export_water_levels}')
 
     elapsed = time.time() - start_time
-    logger.info(
-        f'Transformed {result.files_processed} of {len(units)} DEM(s) in '
-        f'{elapsed / 60:.1f} minutes.' if elapsed >= 60 else
-        f'Transformed {result.files_processed} of {len(units)} DEM(s) in {elapsed:.1f} seconds.'
-    )
+    took = f'{elapsed / 60:.1f} minutes' if elapsed >= 60 else f'{elapsed:.1f} seconds'
+    progress(f'Transformed {result.files_processed} of {len(units)} DEM(s) in {took}.')
+    if result.skipped_existing:
+        progress(f'Skipped {result.skipped_existing} output(s) that were already written.')
+    if result.unreadable:
+        logger.warning(f'{result.unreadable} file(s) or folder(s) could not be read and were not in this run.')
+    if result.cancelled:
+        result.exit_code = 1
+        logger.warning(
+            f'Stopped on request after {result.files_processed} of {len(units)} DEM(s); rerun with the skip-existing '
+            f'option to write the rest.'
+        )
     for name, reason in result.failed:
         logger.error(f'  failed: {name} ({reason})')
+    if converting and result.files_processed and any(_under_dted_root(path, output_dir) for path in result.outputs):
+        how = ('run the Build DMED tool on' if arc_mode else 'egmtrans dmed') + f' "{output_dir}"'
+        logger.info(f'The cells are laid out as {DTED_ROOT}/<lon>/<lat>.dt{dted_level}. To add the DMED volume '
+                    f'file of the delivery: {how}')
     return result
+
+
+def _under_dted_root(path: str, output_dir: str) -> bool:
+    relative = os.path.relpath(os.path.abspath(path), os.path.abspath(output_dir))
+    parts = relative.replace(os.sep, '/').split('/')
+    return parts[0].upper() == DTED_ROOT or os.path.basename(os.path.normpath(output_dir)).upper() == DTED_ROOT
 
 
 @dataclass

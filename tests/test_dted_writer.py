@@ -22,7 +22,7 @@ from egmtrans.io import update_dted_header
 from tests.conftest import write_dted
 
 FIXTURE = os.path.join(os.path.dirname(__file__), 'data', 'srtm_n03e008_header.bin')
-PROFILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'samples', 'dted_profile_example.toml')
+PROFILE = os.path.join(os.path.dirname(__file__), 'data', 'dted_profile.toml')
 
 
 def level_0_profile(folder: str) -> str:
@@ -257,11 +257,11 @@ def test_update_dted_header_in_a_file(tmp_dir, profile, log_lines):
     # The sample profile is for level 2; a profile for another level is refused.
     source = DtedMetadataSource.load(index_path, PROFILE)
     with pytest.raises(HeaderAssemblyError, match='profile is for DTED level 2'):
-        update_dted_header(path, 'EGM2008', metadata=source.for_cell('N06E126'))
+        update_dted_header(path, 'EGM96', metadata=source.for_cell('N06E126'))
     source = DtedMetadataSource.load(index_path, level_0_profile(tmp_dir))
-    update_dted_header(path, 'EGM2008', metadata=source.for_cell('N06E126'))
+    update_dted_header(path, 'EGM96', metadata=source.for_cell('N06E126'))
     final = read_header(path)
-    assert final['dsi.vertical_datum'] == 'E08'
+    assert final['dsi.vertical_datum'] == 'E96'
     assert final['dsi.data_edition'] == '03' and final['acc.abs_vert_acc'] == '0007' == final['uhl.abs_vert_acc']
     # Accuracy columns that are NULL in every row are not in the index, so the
     # profile supplies them; a NULL among values means NA (see
@@ -272,8 +272,9 @@ def test_update_dted_header_in_a_file(tmp_dir, profile, log_lines):
     assert final['dsi.series'] == 'DTED0' and final['uhl.lat_points'] == '0121'
     with pytest.raises(LookupError):
         source.for_cell('N07E126')
-    with pytest.raises(ValueError, match='Unsupported target datum'):
-        update_dted_header(path, 'WGS84')
+    for target in ('WGS84', 'EGM2008'):
+        with pytest.raises(ValueError, match='EGM96 only'):
+            update_dted_header(path, target)
 
 
 def test_parse_overrides():
@@ -372,8 +373,34 @@ def test_coverage_and_plan_lines(tmp_dir, profile):
                                       derived=DerivedFields(vertical_datum='E96'))
     lines = header_plan_lines(source.describe(), 'N03E008', 'in/tile.tif', 'out/N03E008.dt2', header, sources, more=1)
     assert lines[0] == 'DTED header plan'
-    assert lines[1] == ('  metadata: index index.gpkg (2 cells), profile dted_profile_example.toml, '
+    assert lines[1] == ('  metadata: index index.gpkg (2 cells), profile dted_profile.toml, '
                         '1 override(s): producer_code=USNGA')
     assert lines[2] == '  example: cell N03E008, tile.tif -> N03E008.dt2 (and 1 more)'
     assert lines[3].startswith('Header fields by source: ')
     assert "    dsi.producer_code: 'USNGA   ' (override)" in lines and "    acc.abs_vert_acc: '0007' (index)" in lines
+
+
+def test_a_blank_required_value_is_not_a_source(tmp_dir):
+    from egmtrans.dted.profile import HarvestConfig, Profile
+
+    product = {
+        'dted_level': 2, 'security_code': 'U', 'data_edition': 1, 'match_merge_version': 'A',
+        'producer_code': '  ', 'compilation_date': '2026-01', 'abs_horiz_acc': 10, 'abs_vert_acc': 5,
+        'rel_horiz_acc': 'NA', 'rel_vert_acc': 3, 'dsi_free_text': '',
+    }
+    profile = Profile(path='<test>', product=product, harvest=HarvestConfig())
+    with pytest.raises(HeaderAssemblyError, match='producer_code is required and nothing supplies it'):
+        assemble_header(cell_geometry(6, 49, 2), metadata=DtedMetadata(None, [], profile),
+                        derived=DerivedFields(vertical_datum='E96', partial_cell=0))
+    coverage = DtedMetadataSource(None, profile).coverage(2)
+    assert 'producer_code' in coverage.missing_required and 'producer_code' not in coverage.from_profile
+    assert 'dsi_free_text' in coverage.from_profile, 'an optional text field may be blanked on purpose'
+    product['producer_code'] = 'USNGA'
+    header, sources = assemble_header(cell_geometry(6, 49, 2), metadata=DtedMetadata(None, [], profile),
+                                      derived=DerivedFields(vertical_datum='E96', partial_cell=0))
+    assert header['dsi.free_text'].strip() == '' and sources['dsi.free_text'] == 'profile'
+    # An index row with a blank producer code falls through to the profile.
+    row = new_row('N49E006', producer_code='   ')
+    header, sources = assemble_header(cell_geometry(6, 49, 2), metadata=DtedMetadata(row, [], profile),
+                                      derived=DerivedFields(vertical_datum='E96', partial_cell=0))
+    assert header['dsi.producer_code'] == 'USNGA   ' and sources['dsi.producer_code'] == 'profile'

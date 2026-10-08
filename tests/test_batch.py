@@ -51,8 +51,8 @@ def dted_tiles(folder, lake_to_east_edge=False):
     b[LAKE_ROWS, : (POSTS if lake_to_east_edge else 30)] = 150   # from the west edge of the east tile
     os.makedirs(folder, exist_ok=True)
     return (
-        write_dted(os.path.join(folder, "n06e126.dt0"), a, 126, 6),
-        write_dted(os.path.join(folder, "n06e127.dt0"), b, 127, 6),
+        write_dted(os.path.join(folder, "n06e126.dt0"), a, 126, 6, datum_code="E08"),
+        write_dted(os.path.join(folder, "n06e127.dt0"), b, 127, 6, datum_code="E08"),
     )
 
 
@@ -256,7 +256,7 @@ class TestContextDiscovery:
         os.makedirs(context)
         shutil.copy(src_b, context)
         far = _terrain(POSTS, 0, np.int16)
-        write_dted(os.path.join(tmp_dir, "context", "n10e140.dt0"), far, 140, 10)
+        write_dted(os.path.join(tmp_dir, "context", "n10e140.dt0"), far, 140, 10, datum_code="E08")
 
         result = _run(run_folder, os.path.join(tmp_dir, "out"), context_folders=[os.path.join(tmp_dir, "context")])
         analyzed = sorted(os.path.basename(t.input_file) for t in result.tiles)
@@ -429,7 +429,7 @@ def _convert(input_folder, output_folder, profile, level=2, naming='stem', **kwa
     options = dict(flatten=True, create_mask=False, min_patch_size=400, algorithm='bilinear', assume_yes=True,
                    dted_metadata=DtedMetadataSource.load(None, profile), dted_level=level, dted_naming=naming)
     options.update(kwargs)
-    return run_batch(paths, 'EGM2008', 'EGM2008', **options)
+    return run_batch(paths, 'EGM96', 'EGM96', **options)
 
 
 def _sha(path):
@@ -459,7 +459,7 @@ class TestConvertedCells:
             handle.write('not a DEM')
         profile = _profile(tmp_dir)
         expected = {
-            'stem': 'sub/tile_85_30.dt2', 'cell': 'N85E030.dt2', 'dted': 'E030/N85.dt2',
+            'stem': 'sub/tile_85_30.dt2', 'cell': 'N85E030.dt2', 'dted': 'DTED/E030/N85.dt2',
             'DTED{level}_{lon}{lat}': 'DTED2_E030N85.dt2',
         }
         for naming, name in expected.items():
@@ -467,12 +467,24 @@ class TestConvertedCells:
             result = _convert(os.path.join(tmp_dir, 'in'), out, profile, naming=naming, create_mask=True)
             assert result.exit_code == 0 and result.files_processed == 1, naming
             assert os.path.isfile(os.path.join(out, name)), naming
-            assert os.path.isfile(os.path.join(out, name[:-4] + '_mask.tif'))
+            # The mask sits beside its cell under the source tile's name, unique outside the tree.
+            assert os.path.isfile(os.path.join(out, os.path.dirname(name), 'tile_85_30_mask.tif')), naming
             assert not os.path.exists(os.path.join(out, 'readme.txt')), 'the input tree was copied'
             assert not os.path.exists(os.path.join(out, 'sub', 'tile_85_30.tif'))
         hashes = {_sha(os.path.join(tmp_dir, folder, name)) for folder, name in (
-            ('out_stem', 'sub/tile_85_30.dt2'), ('out_cell', 'N85E030.dt2'), ('out_dted', 'E030/N85.dt2'))}
+            ('out_stem', 'sub/tile_85_30.dt2'), ('out_cell', 'N85E030.dt2'), ('out_dted', 'DTED/E030/N85.dt2'))}
         assert len(hashes) == 1, 'the name changed the bytes'
+        # The default is the standard tree, and an output folder named DTED gets no second root.
+        from egmtrans.file_utils import DEFAULT_DTED_NAMING
+
+        assert DEFAULT_DTED_NAMING == 'dted'
+        default_out = os.path.join(tmp_dir, 'out_default')
+        result = _convert(os.path.join(tmp_dir, 'in'), default_out, profile, naming='dted')
+        assert result.exit_code == 0 and os.path.isfile(os.path.join(default_out, 'DTED', 'E030', 'N85.dt2'))
+        dted_out = os.path.join(tmp_dir, 'delivery', 'DTED')
+        result = _convert(os.path.join(tmp_dir, 'in'), dted_out, profile, naming='dted')
+        assert result.exit_code == 0 and os.path.isfile(os.path.join(dted_out, 'E030', 'N85.dt2'))
+        assert not os.path.exists(os.path.join(tmp_dir, 'delivery', 'DTED', 'DTED'))
 
     def test_collisions_and_duplicate_cells_stop_the_run(self, tmp_dir, log_lines):
         from tests.conftest import lattice_geotransform, synthetic_cell
@@ -597,16 +609,16 @@ class TestConvertedCells:
         lattice_tiles(folder, cells=((0, 0), (1, 0)))
         original = egm_io._verify_dted
 
-        def flaky(path, cell, posts):
+        def flaky(path, cell, posts, **kwargs):
             if cell.cell_id == 'N85E031':
                 raise RuntimeError('verification failed on purpose')
-            original(path, cell, posts)
+            original(path, cell, posts, **kwargs)
 
         monkeypatch.setattr(egm_io, '_verify_dted', flaky)
         out = os.path.join(tmp_dir, 'out')
         result = _convert(folder, out, _profile(tmp_dir), naming='cell', create_mask=True)
         assert result.exit_code == 1 and result.files_processed == 1
-        assert sorted(os.listdir(out)) == ['N85E030.dt2', 'N85E030_mask.tif']
+        assert sorted(os.listdir(out)) == ['N85E030.dt2', 'tile_85_30_mask.tif']
         assert result.failed == [('tile_85_31.tif [N85E031]', 'transformation failed')]
 
     def test_header_problems_stop_the_run_before_anything_is_written(self, tmp_dir, log_lines):
@@ -618,21 +630,21 @@ class TestConvertedCells:
         assert any('profile is for level 1, not 2' in line for line in log_lines)
         from egmtrans.dted.writer import DtedMetadataSource
 
-        result = run_batch(resolve_io_paths(folder, out, dted_level=2), 'EGM2008', 'EGM2008', True, False, 400,
+        result = run_batch(resolve_io_paths(folder, out, dted_level=2), 'EGM96', 'EGM96', True, False, 400,
                            'bilinear', assume_yes=True, dted_metadata=DtedMetadataSource(), dted_level=2)
         assert result.exit_code == 1 and not os.path.exists(out)
         assert any('needs --dted-profile and/or --dted-index' in line for line in log_lines)
 
 
-def test_an_empty_run_never_offers_to_delete_the_input_folder(tmp_dir):
-    from egmtrans.cli import _may_offer_delete
+def test_folder_within_tells_nested_folders_apart(tmp_dir):
+    from egmtrans.file_utils import folder_within
 
     folder = os.path.join(tmp_dir, 'data')
     os.makedirs(os.path.join(folder, 'sub'))
-    assert not _may_offer_delete(folder, folder)
-    assert not _may_offer_delete(folder, os.path.join(folder, 'sub'))
-    assert not _may_offer_delete(os.path.join(folder, 'sub'), folder)
-    assert _may_offer_delete(folder, os.path.join(tmp_dir, 'out'))
+    assert folder_within(folder, folder)
+    assert folder_within(os.path.join(folder, 'sub'), folder)
+    assert not folder_within(folder, os.path.join(folder, 'sub'))
+    assert not folder_within(os.path.join(tmp_dir, 'out'), folder)
 
 
 @requires_grids
@@ -656,3 +668,171 @@ class TestHeaderPlan:
         assert result.exit_code == 0 and result.files_processed == 1
         assert os.path.isfile(os.path.join(out, 'tile_85_30.dt2'))
         assert log_lines.count('DTED header plan') == 2, 'the plan is shown once per run, not once per unit'
+
+
+def _e08_tile(folder, name, lon0, lat0, datum_code='E08'):
+    os.makedirs(folder, exist_ok=True)
+    return write_dted(os.path.join(folder, name), _terrain(POSTS, 0, np.int16), lon0, lat0, datum_code=datum_code)
+
+
+@requires_grids
+class TestDatumChecksBeforeWriting:
+    def test_every_input_is_checked_and_a_no_writes_nothing(self, tmp_dir, monkeypatch, log_lines):
+        folder = os.path.join(tmp_dir, 'in')
+        _e08_tile(folder, 'n06e126.dt0', 126, 6)
+        _e08_tile(folder, 'n06e127.dt0', 127, 6, datum_code='E96')  # already in the target datum
+        out = os.path.join(tmp_dir, 'out')
+        monkeypatch.setattr('builtins.input', lambda *_: 'no')
+        result = _run(folder, out, assume_yes=False)
+        assert result.exit_code == 1 and result.files_processed == 0
+        assert not any(name.endswith('.dt0') for _, _, files in os.walk(out) for name in files)
+        assert any('1 of the 2 input(s) declare another vertical datum' in line and 'n06e127.dt0 (EGM96)' in line
+                   for line in log_lines)
+        monkeypatch.setattr('builtins.input', lambda *_: 'yes')
+        result = _run(folder, out, assume_yes=False)
+        assert result.exit_code == 0 and result.files_processed == 2
+
+    def test_a_context_tile_in_another_datum_is_left_out(self, tmp_dir, log_lines):
+        run_folder = os.path.join(tmp_dir, 'run')
+        context = os.path.join(tmp_dir, 'context')
+        _e08_tile(run_folder, 'n06e126.dt0', 126, 6)
+        _e08_tile(context, 'n06e127.dt0', 127, 6, datum_code='E96')
+        result = _run(run_folder, os.path.join(tmp_dir, 'out'), context_folders=[context])
+        assert result.exit_code == 0 and result.seams == 0 and result.tiles == []
+        assert any('n06e127.dt0 declares EGM96, not EGM2008; it is left out' in line for line in log_lines)
+        assert any('1 DEM(s) found; 0 adjoin the run' in line for line in log_lines)
+
+    def test_context_and_table_are_ignored_without_flattening(self, tmp_dir, log_lines):
+        run_folder = os.path.join(tmp_dir, 'run')
+        context = os.path.join(tmp_dir, 'context')
+        _e08_tile(run_folder, 'n06e126.dt0', 126, 6)
+        _e08_tile(context, 'n06e127.dt0', 127, 6)
+        result = _run(run_folder, os.path.join(tmp_dir, 'out'), context_folders=[context], flatten=False,
+                      water_levels=os.path.join(tmp_dir, 'no_such_table.csv'))
+        assert result.exit_code == 0 and result.tiles == [] and result.files_processed == 1
+        assert any('No water body is leveled because flattening is off: the context folder(s), the water-level '
+                   'table are ignored' in line for line in log_lines)
+
+
+class TestRerunsAndFailures:
+    def test_existing_outputs_are_listed_then_skipped_on_request(self, tmp_dir, log_lines):
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder, cells=((0, 0), (1, 0)))
+        out = os.path.join(tmp_dir, 'out')
+        profile = _profile(tmp_dir)
+        first = _convert(folder, out, profile, naming='cell')
+        assert first.exit_code == 0 and first.files_processed == 2
+        log_lines.clear()
+        second = _convert(folder, out, profile, naming='cell')
+        assert second.files_processed == 2
+        assert any('2 of the 2 planned output(s) already exist' in line and 'will be replaced' in line
+                   for line in log_lines)
+        log_lines.clear()
+        os.remove(os.path.join(out, 'N85E031.dt2'))
+        third = _convert(folder, out, profile, naming='cell', skip_existing=True)
+        assert third.skipped_existing == 1 and third.files_processed == 1 and third.exit_code == 0
+        assert sorted(os.path.basename(path) for path in third.outputs) == ['N85E030.dt2', 'N85E031.dt2']
+        assert any('Skipping 1 output(s) already written' in line for line in log_lines)
+        assert not any('will be replaced' in line for line in log_lines)
+        fourth = _convert(folder, out, profile, naming='cell', skip_existing=True)
+        assert fourth.skipped_existing == 2 and fourth.files_processed == 0 and fourth.exit_code == 0
+
+    def test_a_failed_cell_clears_an_earlier_output(self, tmp_dir, monkeypatch, log_lines):
+        from egmtrans import io as egm_io
+
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder)
+        out = os.path.join(tmp_dir, 'out')
+        profile = _profile(tmp_dir)
+        assert _convert(folder, out, profile, naming='cell', create_mask=True).exit_code == 0
+        assert os.path.isfile(os.path.join(out, 'N85E030.dt2'))
+        assert os.path.isfile(os.path.join(out, 'tile_85_30_mask.tif'))
+
+        def broken(path, cell, posts, **kwargs):
+            raise RuntimeError('verification failed on purpose')
+
+        monkeypatch.setattr(egm_io, '_verify_dted', broken)
+        result = _convert(folder, out, profile, naming='cell', create_mask=True)
+        assert result.exit_code == 1 and result.files_processed == 0
+        assert not os.path.exists(os.path.join(out, 'N85E030.dt2'))
+        assert not os.path.exists(os.path.join(out, 'tile_85_30_mask.tif'))
+        assert any('Removed' in line and 'failed to write anew' in line for line in log_lines)
+
+    def test_an_unwritable_export_path_stops_the_run_before_anything(self, tmp_dir, log_lines):
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder)
+        out = os.path.join(tmp_dir, 'out')
+        export = os.path.join(tmp_dir, 'nowhere', 'levels.csv')
+        result = _convert(folder, out, _profile(tmp_dir), export_water_levels=export)
+        assert result.exit_code == 2 and not os.path.exists(out)
+        assert any('does not exist' in line for line in log_lines)
+
+    def test_partial_cells_are_logged(self, tmp_dir, log_lines):
+        from tests.conftest import lattice_geotransform, synthetic_cell
+
+        folder = os.path.join(tmp_dir, 'in')
+        os.makedirs(folder)
+        heights = synthetic_cell(CELL_PER_DEGREE, base_cm=40000)
+        wide = np.concatenate([heights, heights[:, 1:CELL_PER_DEGREE // 2 + 1]], axis=1)  # 1.5 degrees wide
+        write_geotiff(os.path.join(folder, 'wide.tif'), wide,
+                      lattice_geotransform(CELL_LON0, CELL_LAT0, CELL_PER_DEGREE, CELL_PER_DEGREE), nodata=-32767.0)
+        result = _convert(folder, os.path.join(tmp_dir, 'out'), _profile(tmp_dir), naming='cell')
+        assert result.exit_code == 0 and result.files_processed == 1
+        assert any(f'Cell N85E{CELL_LON0 + 1:03d} is covered only in part by wide.tif and is skipped' in line
+                   for line in log_lines)
+
+    def test_a_stop_request_ends_the_run_between_tiles(self, tmp_dir, log_lines):
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder, cells=((0, 0), (1, 0)))
+        calls = []
+
+        def should_stop():
+            calls.append(1)
+            return len(calls) > 3  # the first tile passes, the second is never started
+
+        result = _convert(folder, os.path.join(tmp_dir, 'out'), _profile(tmp_dir), naming='cell',
+                          should_stop=should_stop)
+        assert result.cancelled and result.exit_code == 1 and result.files_processed == 1
+        assert any('Stopped on request after 1 of 2' in line for line in log_lines)
+        assert not os.path.isfile(os.path.join(tmp_dir, 'out', 'N85E031.dt2'))
+
+    def test_too_little_free_space_stops_the_run(self, tmp_dir, monkeypatch, log_lines):
+        from collections import namedtuple
+
+        from egmtrans import batch as batch_module
+
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder)
+        usage = namedtuple('usage', 'total used free')
+        monkeypatch.setattr(batch_module.shutil, 'disk_usage', lambda path: usage(10, 10, 1000))
+        result = _convert(folder, os.path.join(tmp_dir, 'out'), _profile(tmp_dir))
+        assert result.exit_code == 1 and result.files_processed == 0
+        assert any('GB free' in line and 'planned outputs need' in line for line in log_lines)
+        with_mask = batch_module.estimated_output_bytes(result.units, True)
+        assert with_mask > batch_module.estimated_output_bytes(result.units, False)
+
+
+def test_water_level_table_accepts_a_bom_and_names_a_spreadsheet_resave(tmp_dir):
+    body = (
+        '# EGMTrans water levels: one row per crossing of a water body over a tile edge\n'
+        '# version: test\n# source: EGM2008\n# target: EGM96\n# created: 2026-01-01\n'
+        'height_m,level_m,posts,tiles,side,line,start,end\n'
+        '150.00,149.25,400,2,E,127.0,6.3,6.4\n'
+    )
+    path = os.path.join(tmp_dir, 'levels.csv')
+    with open(path, 'w', encoding='utf-8-sig') as handle:
+        handle.write(body)
+    table = read_water_levels(path, 'EGM2008', 'EGM96')
+    assert len(table.rows) == 1 and table.rows[0].level == 149.25
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write(body.replace(',', ';'))
+    with pytest.raises(ValueError, match='uses ";" as its separator'):
+        read_water_levels(path, 'EGM2008', 'EGM96')
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write(body.replace('150.00,149.25', '"150,00";"149,25"').replace(',', ';').replace('";"', ';'))
+    with pytest.raises(ValueError, match='separator'):
+        read_water_levels(path, 'EGM2008', 'EGM96')
+    with open(path, 'w', encoding='utf-8') as handle:
+        handle.write(body.replace('150.00,149.25,400', '"150,00","149,25",400'))
+    with pytest.raises(ValueError, match='decimal commas'):
+        read_water_levels(path, 'EGM2008', 'EGM96')

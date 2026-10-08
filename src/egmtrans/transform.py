@@ -37,6 +37,7 @@ from egmtrans.arcpy_compat import batch_project_points_arcpy
 from egmtrans.config import BASE_PATH, DATUM_MAPPING, DTED_EXTENSIONS, DTED_NODATA
 from egmtrans.crs import create_compound_srs, get_proj4
 from egmtrans.download import GRID_FILES, verify_checksum
+from egmtrans.dted.companions import dted0_companions
 from egmtrans.dted.header import CellGeometry, read_header
 from egmtrans.dted.resample import (
     AxisMap,
@@ -49,7 +50,7 @@ from egmtrans.dted.resample import (
     thin,
 )
 from egmtrans.dted.writer import DtedMetadataSource
-from egmtrans.file_utils import ELEVATION_DATA_TYPES, copy_as_writable
+from egmtrans.file_utils import ELEVATION_DATA_TYPES, copy_as_writable, mask_output_name
 from egmtrans.flattening import (
     DEFAULT_CONTAINMENT,
     RaisedSpots,
@@ -626,6 +627,31 @@ def _wgs84_srs() -> osr.SpatialReference:
     return srs
 
 
+# A void value producers write without declaring it as NoData, and the floor
+# below which no height is a height (MIL-PRF-89020B: -12,000 m).
+UNDECLARED_VOID_VALUE = -9999
+UNDECLARED_VOID_FLOOR = -12000
+
+
+def undeclared_void_problem(values: np.ndarray, name: str) -> str | None:
+    """Why *values*, read from a band that declares no NoData value, cannot be
+    trusted as heights: they hold -9999 or values at or below -12,000 m, which
+    are voids left undeclared, not terrain. None when nothing looks like a void."""
+    sentinel = int(np.count_nonzero(values == UNDECLARED_VOID_VALUE))
+    floor = int(np.count_nonzero(values <= UNDECLARED_VOID_FLOOR))
+    if not sentinel and not floor:
+        return None
+    found = []
+    if sentinel:
+        found.append(f'{sentinel:,} post(s) at {UNDECLARED_VOID_VALUE}')
+    if floor:
+        found.append(f'{floor:,} post(s) at or below {UNDECLARED_VOID_FLOOR} m')
+    return (
+        f'{name} declares no NoData value but holds {" and ".join(found)}: voids left undeclared would be written '
+        f'as terrain. Set the band\'s NoData value (gdal_edit.py -a_nodata {UNDECLARED_VOID_VALUE}) and rerun.'
+    )
+
+
 def _load_cell(input_file: str, cell: CellGeometry) -> LoadedInput:
     """Read the cell's source window and resample it onto the level-2 grid."""
     logger = _state.get_logger()
@@ -641,6 +667,14 @@ def _load_cell(input_file: str, cell: CellGeometry) -> LoadedInput:
             window = band.ReadAsArray(
                 col_slice.start, row_slice.start, col_slice.stop - col_slice.start, row_slice.stop - row_slice.start
             )
+            mask = None
+            if nodata is None and band.GetMaskFlags() & gdal.GMF_PER_DATASET:
+                # No NoData value, but the file carries a mask band: it says
+                # which posts are void.
+                mask = band.GetMaskBand().ReadAsArray(
+                    col_slice.start, row_slice.start, col_slice.stop - col_slice.start,
+                    row_slice.stop - row_slice.start,
+                )
         finally:
             band = None
             ds = None
@@ -648,6 +682,13 @@ def _load_cell(input_file: str, cell: CellGeometry) -> LoadedInput:
         window = window.astype(np.float32)
     if nodata is not None:
         window[window == nodata] = np.nan
+    elif mask is not None:
+        window[mask == 0] = np.nan
+        logger.info(f'Cell {cell.cell_id}: {int((mask == 0).sum()):,} void post(s) taken from the mask band.')
+    else:
+        problem = undeclared_void_problem(window, os.path.basename(input_file))
+        if problem:
+            raise ValueError(problem)
     if not np.isfinite(window).any():
         raise ValueError(f'Cell {cell.cell_id} of {os.path.basename(input_file)} holds no valid post')
 
@@ -727,6 +768,10 @@ def load_input(input_file: str, temp_dir: str, *, cell: CellGeometry | None = No
             raise ValueError(f'Unsupported data type: {data_type}')
         input_nodata = input_band.GetNoDataValue()
         input_array = input_band.ReadAsArray()
+        if input_nodata is None and not input_file.lower().endswith(DTED_EXTENSIONS):
+            problem = undeclared_void_problem(input_array, os.path.basename(input_file))
+            if problem:
+                logger.warning(problem.replace(' and rerun.', ' if those posts are voids.'))
         input_array = np.where(input_array == input_nodata, np.nan, input_array)
         geotransform = input_ds.GetGeoTransform()
         projection = input_ds.GetProjection()
@@ -1174,44 +1219,58 @@ def write_output(
         if dted_metadata is not None and not dted_metadata.empty:
             metadata = dted_metadata.for_cell(cell.cell_id)
         values = thin(warp_array, cell.level)
+        companions = None
+        if cell.level == 0:
+            # MIL-PRF-89020B 3.9.3: the .avg, .min and .max files of a DTED0
+            # cell, "calculated from DTED Level 1", here from the finished
+            # level-1 grid of the same run.
+            level1 = restore_nodata(round_half_away(thin(warp_array, 1)), DTED_NODATA)
+            companions = dted0_companions(level1)
         logger.info(f'Writing cell {cell.cell_id} as {cell.series} ({values.shape[1]} x {values.shape[0]} posts)...')
-        write_dted(output_file, cell, values, tgt_datum, abs_horiz_accuracy, temp_dir, metadata=metadata)
+        write_dted(
+            output_file, cell, values, tgt_datum, abs_horiz_accuracy, temp_dir, metadata=metadata,
+            companions=companions,
+        )
         return
 
     if output_file.lower().endswith(DTED_EXTENSIONS):
         if not loaded.input_is_dted:
             raise ValueError('A DTED output needs a DTED input or a cell to convert')
         logger.info(f'Updating vertical datum to {tgt_datum}...')
+        # The copy is made under a scratch name in the output's folder and
+        # renamed onto the output name only once its header is rewritten, so
+        # an interrupted run leaves no source-datum file under a final name.
         # copy_as_writable, not shutil.copy: the latter carries the source's
         # read-only bit onto the copy and silently redirects into a directory.
-        copy_as_writable(loaded.source_file, output_file)
-
-        # Round to whole meters here, exactly as GDAL would on the write, so the
-        # value in the file is the one the containment count compared. DTED
-        # bands are Int16 and GDAL writes NaN as 0, so voids must be restored to
-        # -32767 or they come out of the transform at sea level.
-        dted_nodata = loaded.input_nodata if loaded.input_nodata is not None else DTED_NODATA
-        values = restore_nodata(round_half_away(warp_array), dted_nodata)
-        with gdal.Open(output_file, gdal.GA_Update) as final_ds:
-            band = final_ds.GetRasterBand(1)
-            band.WriteArray(values)
-            band.FlushCache()
-            band = None
-
+        scratch = _scratch_name(output_file)
+        copy_as_writable(loaded.source_file, scratch)
         try:
+            # Round to whole meters here, exactly as GDAL would on the write, so the
+            # value in the file is the one the containment count compared. DTED
+            # bands are Int16 and GDAL writes NaN as 0, so voids must be restored to
+            # -32767 or they come out of the transform at sea level.
+            dted_nodata = loaded.input_nodata if loaded.input_nodata is not None else DTED_NODATA
+            values = restore_nodata(round_half_away(warp_array), dted_nodata)
+            with gdal.Open(scratch, gdal.GA_Update) as final_ds:
+                band = final_ds.GetRasterBand(1)
+                band.WriteArray(values)
+                band.FlushCache()
+                band = None
+
             metadata = None
             if dted_metadata is not None and not dted_metadata.empty:
-                cell_id = read_header(output_file).cell_id
+                cell_id = read_header(scratch).cell_id
                 if cell_id is None:
                     raise ValueError('The DTED header has no readable origin, so its index row cannot be found')
                 metadata = dted_metadata.for_cell(cell_id)
-            update_dted_header(output_file, tgt_datum, abs_horiz_accuracy, metadata=metadata)
-        except Exception:
+            update_dted_header(scratch, tgt_datum, abs_horiz_accuracy, metadata=metadata)
+            os.replace(scratch, output_file)
+        finally:
             # The records already hold the target datum's heights under the
-            # input's header: a mislabeled file must not survive the failure.
-            if os.path.exists(output_file):
-                os.remove(output_file)
-            raise
+            # input's header: a mislabeled file must not survive a failure.
+            for leftover in (scratch, scratch + '.aux.xml'):
+                if os.path.exists(leftover):
+                    os.remove(leftover)
         return
 
     logger.info('Setting the compound CRS, optimizing compression, and saving as Cloud Optimized GeoTIFF...')
@@ -1250,16 +1309,53 @@ def write_output(
             'NUM_THREADS=ALL_CPUS',
         ],
     )
-    cog_ds = gdal.Translate(output_file, final_temp_file, options=translate_options)
-    cog_ds.Close()
+    # Written under a scratch name and renamed, so an interrupted write
+    # leaves no partial GeoTIFF under the output name.
+    scratch = _scratch_name(output_file)
+    try:
+        cog_ds = gdal.Translate(scratch, final_temp_file, options=translate_options)
+        cog_ds.Close()
+        os.replace(scratch, output_file)
+    finally:
+        for leftover in (scratch, scratch + '.aux.xml'):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+
+
+def _scratch_name(output_file: str) -> str:
+    """A scratch name beside *output_file*, renamed onto it when the file is complete."""
+    folder, name = os.path.split(os.path.abspath(output_file))
+    return os.path.join(folder, f'.{name}.{token_hex(4)}.part')
+
+
+# Temporary folders of a run, made in the output folder (the rename onto the
+# output name must stay on one volume) and removed when the run ends.
+TEMP_DIR_PREFIX = 'egmtrans_temp_'
 
 
 def _make_temp_dir(output_dir: str) -> str:
-    temp_dir = os.path.join(output_dir, f'temp_{token_hex(8)}')
+    temp_dir = os.path.join(output_dir, f'{TEMP_DIR_PREFIX}{token_hex(8)}')
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
     return temp_dir
+
+
+def remove_leftover_temp_dirs(output_dir: str) -> int:
+    """Remove the temporary folders an interrupted run left under *output_dir*;
+    returns how many there were."""
+    removed = 0
+    for root, dirs, _files in os.walk(output_dir):
+        for name in list(dirs):
+            if name.startswith(TEMP_DIR_PREFIX) or (name.startswith('temp_') and len(name) == 21):
+                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+                dirs.remove(name)
+                removed += 1
+    if removed:
+        _state.get_logger().warning(
+            f'Removed {removed} temporary folder(s) left under {output_dir} by an interrupted run.'
+        )
+    return removed
 
 
 def _remove_temp_dir(temp_dir: str | None) -> None:
@@ -1323,6 +1419,7 @@ def transform_vertical_datum(
     min_containment: float = DEFAULT_CONTAINMENT,
     dted_metadata: DtedMetadataSource | None = None,
     cell: CellGeometry | None = None,
+    mask_file: str | None = None,
 ) -> None:
     """Transform the vertical datum of a GeoTIFF or DTED elevation model, or
     convert a GeoTIFF cell to DTED.
@@ -1366,6 +1463,8 @@ def transform_vertical_datum(
             header apart from the fields the transform must change.
         cell: The DTED cell to make from a GeoTIFF on the whole-degree
             lattice; None for a transform.
+        mask_file: Where to write the flat mask; by default the name
+            :func:`~egmtrans.file_utils.mask_output_name` gives.
 
     Raises:
         ValueError: If the input data type is unsupported or CRS is missing.
@@ -1429,10 +1528,10 @@ def transform_vertical_datum(
 
         # After the output, so that a failed write leaves no mask behind.
         if create_mask and labeled is not None:
-            mask_file = os.path.join(
-                os.path.dirname(output_file),
-                f'{os.path.splitext(os.path.basename(output_file))[0]}_mask.tif',
-            )
+            if mask_file is None:
+                mask_file = mask_output_name(
+                    output_file, input_file if converting else None, loaded.cell.cell_id if converting else None,
+                )
             if converting:
                 mask = thin(labeled, loaded.cell.level)
                 create_flat_mask(mask, mask_file, loaded.cell.geotransform, loaded.projection)
@@ -1448,9 +1547,10 @@ def transform_vertical_datum(
             time_str = f"{minutes:.1f} minutes"
         logger.info(f'Total processing time: {time_str}')
 
-        aux_file = output_file + '.aux.xml'
-        if os.path.exists(aux_file):
-            os.remove(aux_file)
+        sidecars = [output_file + '.aux.xml'] + ([mask_file + '.aux.xml'] if mask_file else [])
+        for sidecar in sidecars:
+            if os.path.exists(sidecar):
+                os.remove(sidecar)
 
         logger.info(f'Transformed file: {output_file}')
         logger.info(f'\n{"=" * 80}\n')

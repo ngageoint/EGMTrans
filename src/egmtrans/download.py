@@ -43,11 +43,14 @@ GRID_FILES: dict[str, dict[str, str | int]] = {
 
 # Chunk size for streaming downloads (1 MB).
 _CHUNK_SIZE = 1024 * 1024
+# Seconds without a byte before a download is given up: a proxy that swallows
+# connections on a closed network must not hang the caller.
+DOWNLOAD_TIMEOUT = 60
 
 
 def _default_datums_dir() -> str:
     """Return the datums/ directory relative to the project root."""
-    # This file lives at src/egmtrans/download.py — three levels up is the
+    # This file lives at src/egmtrans/download.py; three levels up is the
     # project root, same convention as config.py.
     project_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,14 +81,15 @@ def download_file(
     ``arcpy.AddMessage`` for ArcGIS Pro).
 
     Raises:
-        RuntimeError: If the downloaded file fails checksum verification.
+        RuntimeError: If the downloaded file fails checksum verification, or
+            the server sends nothing for :data:`DOWNLOAD_TIMEOUT` seconds.
         urllib.error.URLError: On network errors.
     """
     filename = os.path.basename(dest_path)
     tmp_path = dest_path + ".part"
 
     try:
-        with urllib.request.urlopen(url) as response:
+        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
             total = int(response.headers.get("Content-Length", 0))
             total_mb = total / (1024 * 1024) if total else 0
             downloaded = 0
@@ -120,6 +124,13 @@ def download_file(
             )
 
         os.replace(tmp_path, dest_path)
+    except TimeoutError as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise RuntimeError(
+            f"No response from {url} within {DOWNLOAD_TIMEOUT} seconds. On a closed network, copy the grid "
+            f"files into the datums folder by hand and check their SHA-256 against datums/README.md."
+        ) from e
     except BaseException:
         # Clean up partial download on any failure (including KeyboardInterrupt).
         if os.path.exists(tmp_path):
