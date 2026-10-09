@@ -44,8 +44,10 @@ from egmtrans.dted.index import (
     COLUMNS_BY_NAME,
     HEADER_COLUMNS,
     INDEX_COLUMNS,
+    PRODUCT_CONSTANT_COLUMNS,
     DtedIndex,
     check_value,
+    normalize_value,
     parse_date,
     read_index,
     validate_index,
@@ -98,6 +100,10 @@ def parse_override(name: str, text: str, *, today: dt.date | None = None):
                 raise ValueError(f'{name}: {text!r} is not an integer') from None
     else:
         value = text
+    if column.required and column.type != 'int' and is_blank(value):
+        # A blank text or date would be ignored at write time but counted as a
+        # source before it (an accuracy's NA, None here, is a value).
+        raise ValueError(f'{name}: a required field needs a value')
     problem = check_value(column, value)
     if problem:
         raise ValueError(f'{name}: {problem}')
@@ -200,8 +206,11 @@ class DtedMetadataSource:
 
     def validate(self, level: int | None = None) -> list[Issue]:
         issues = []
+        product = self.profile.product if self.profile is not None else None
         if self.index is not None:
-            issues.extend(validate_index(self.index, level=level))
+            issues.extend(validate_index(self.index, level=level, supplied=self.overrides, profile_values=product))
+            if self.profile is not None:
+                issues.extend(profile_disagreements(self.index, self.profile))
         if self.profile is not None and level is not None and self.profile.level not in (None, level):
             issues.append(Issue('error', 'PROFILE', 'dted_level',
                                 f'the profile is for level {self.profile.level}, not {level}'))
@@ -274,6 +283,60 @@ class DtedMetadataSource:
         if level is None:
             level = self.index.level if self.index is not None and self.index.level is not None else self.level
         return MetadataCoverage(len(rows), level, from_index, partly, from_profile, overridden, missing, null_cells)
+
+
+def profile_disagreements(index: DtedIndex, profile: Profile) -> list[Issue]:
+    """One warning per product constant whose index values differ from the profile's.
+
+    Only the fields that are the same for every cell of a product count
+    (:data:`PRODUCT_CONSTANT_COLUMNS`): a profile's edition, markings, dates
+    or accuracies are defaults a cell may have its own value for. Both values
+    go through the index's normalization, so a date in any accepted form or a
+    padded code compare as the header gets them, and a NULL row is not a
+    disagreement.
+    """
+    issues: list[Issue] = []
+    present = index.columns
+    for column in INDEX_COLUMNS:
+        if column.name not in PRODUCT_CONSTANT_COLUMNS or column.name not in present:
+            continue
+        if column.name not in profile.product:
+            continue
+        try:
+            expected = normalize_value(column, profile.product[column.name])
+        except (TypeError, ValueError):
+            continue  # the profile's own validation reports it
+        if isinstance(expected, str):
+            expected = expected.strip()
+        differing = []
+        for cell, row in sorted(index.rows.items()):
+            value = row.get(column.name)
+            if value is None:
+                continue
+            try:
+                actual = normalize_value(column, value)
+            except (TypeError, ValueError):
+                continue  # check_value reports it
+            if isinstance(actual, str):
+                actual = actual.strip()
+            if actual is not None and actual != expected:
+                differing.append((cell, value))
+        if differing:
+            shown = ', '.join(f'{cell} {value!r}' for cell, value in differing[:5])
+            more = f' and {len(differing) - 5:,} more' if len(differing) > 5 else ''
+            issues.append(Issue('warning', 'INDEX', column.name,
+                                f"{len(differing):,} cell(s) hold a value other than the profile's "
+                                f'{profile.product[column.name]!r} ({shown}{more}); the index row takes precedence'))
+    return issues
+
+
+def header_warning_lines(tally: dict[str, list[str]]) -> list[str]:
+    """The end-of-run summary of the per-cell header warnings a batch tallied."""
+    lines = []
+    for message, cells in tally.items():
+        shown = ', '.join(cells[:5]) + (f' and {len(cells) - 5:,} more' if len(cells) > 5 else '')
+        lines.append(f'DTED header warning in {len(cells):,} cell(s) ({shown}): {message}')
+    return lines
 
 
 def _override_text(name: str, value) -> str:
@@ -500,7 +563,10 @@ def assemble_header(
                 'The assembled DTED header is not valid:\n  ' + '\n  '.join(str(e) for e in errors)
             )
         for issue in issues:
-            if issue.severity == 'warning':
+            # In a batch the warnings are tallied and summarized once at the end.
+            if issue.severity == 'warning' and not _state.tally_header_warning(
+                f'{issue.record}.{issue.key}: {issue.message}', cell.cell_id
+            ):
                 logger.warning(f'DTED header of cell {cell.cell_id}: {issue}')
     return header, sources
 

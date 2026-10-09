@@ -113,6 +113,7 @@ class TileAnalysis:
     error: str | None = None
     cell: object | None = None  # the DTED cell a converted tile is written as
     array_crc: int | None = None  # CRC-32 of the heights, for pass 2 to check
+    finished: bool = False  # written by an earlier run and skipped: analyzed as context
 
     @property
     def name(self) -> str:
@@ -582,7 +583,8 @@ def merge_patches(
                 sets.add((tile.tile_id, label))
 
     covers: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
-    height_conflicts: list[str] = []
+    # ((tile, label) of side a, (tile, label) of side b, message)
+    height_conflicts: list[tuple[tuple[int, int], tuple[int, int], str]] = []
     for seam in seams:
         if seam.a_cover:
             covers[(seam.a, seam.a_side)].append(seam.a_cover)
@@ -602,10 +604,11 @@ def merge_patches(
             if pa.height_cm == pb.height_cm:
                 sets.union((seam.a, la), (seam.b, lb))
             else:
-                height_conflicts.append(
+                height_conflicts.append((
+                    (seam.a, la), (seam.b, lb),
                     f"{a.name}:{seam.a_side} is {pa.height_cm / 100:.2f} m where {b.name}:{seam.b_side} is "
-                    f"{pb.height_cm / 100:.2f} m; the two were kept separate"
-                )
+                    f"{pb.height_cm / 100:.2f} m; the two were kept separate",
+                ))
 
     bodies: list[WaterBody] = []
     for members in sets.groups().values():
@@ -635,6 +638,16 @@ def merge_patches(
             spacing = min(by_id[tile_id].dx for tile_id, _ in members)
             _apply_table(body, table, spacing)
         bodies.append(body)
+    # A seam whose two sides differ in height is noted under the water body
+    # it concerns: side a's, or side b's when a's is not water. Between two
+    # areas that are not water it is nobody's concern.
+    body_of = {member: body for body in bodies for member in body.members}
+    for member_a, member_b, message in height_conflicts:
+        for member in (member_a, member_b):
+            body = body_of.get(member)
+            if body is not None and body.water:
+                body.notes.append(message)
+                break
     bodies.sort(key=lambda b: (not b.water, -b.posts, b.height_cm, b.members[0]))
 
     levels: dict[int, TileLevels] = {
@@ -648,8 +661,6 @@ def merge_patches(
                 else:
                     levels[tile_id].not_water.add(label)
                 levels[tile_id].expected_counts[label] = by_id[tile_id].patches[label].count
-    if height_conflicts and bodies:
-        bodies[0].notes.extend(height_conflicts)
     return levels, bodies
 
 
@@ -663,47 +674,137 @@ def single_tile_water_bodies(tile: TileAnalysis, min_containment: float = 0.8) -
 # ---------------------------------------------------------------------------
 
 
+REPORT_LEGEND = (
+    "Columns: height (in) is the flat area's height in the input; level (out) its level in the output, with "
+    "the whole meters written to DTED in parentheses and [table] when it comes from the water-level table; "
+    "tiles and posts count its parts.",
+    "Tiles are named with the sides (N,S,W,E) their part touches; * marks a side with no neighbor in the run, "
+    "(context) a tile analyzed but not written, (finished) a tile written by an earlier run and skipped.",
+)
+_COLUMNS = f"  {'height (in)':>12}   {'level (out)':<18} {'tiles':>5} {'posts':>10}   "
+
+
+def _level_text(body: WaterBody, is_dted: bool) -> str:
+    """The level column: the level, the whole meters DTED gets, and the table mark."""
+    level = f"{body.level:.2f} m"
+    if is_dted:
+        level += f" ({int(round_half_away(np.array(body.level)))} m)"
+    if body.table_level is not None:
+        level += " [table]"
+    return level
+
+
+def _tile_mark(tile: TileAnalysis) -> str:
+    if tile.finished:
+        return " (finished)"
+    return " (context)" if tile.is_context else ""
+
+
+def _tile_label(tile: TileAnalysis) -> str:
+    """The tile's name with its (context) or (finished) mark."""
+    return tile.name + _tile_mark(tile)
+
+
+def _sides_by_tile(body: WaterBody) -> dict[int, str]:
+    """The sides of each tile the body touches, in N,S,W,E order, * where no neighbor in the run covers the side."""
+    touched: dict[int, set[str]] = defaultdict(set)
+    for crossing in body.crossings:
+        touched[crossing.tile_id].add(crossing.side)
+    open_edges = set(body.open_edges)
+    return {
+        tile_id: ",".join(side + ("*" if (tile_id, side) in open_edges else "") for side in SIDES if side in sides)
+        for tile_id, sides in touched.items()
+    }
+
+
+def _row(body: WaterBody, is_dted: bool, parts: list[str]) -> str:
+    return (
+        f"  {body.height_cm / 100:>10.2f} m   {_level_text(body, is_dted):<18} {len(body.tile_ids):>5} "
+        f"{body.posts:>10,}   " + "  ".join(parts)
+    )
+
+
+def boundary_summary(bodies: list[WaterBody]) -> str:
+    """One sentence: how many water bodies span tiles, and how many touch the run boundary."""
+    water = [b for b in bodies if b.water]
+    spanning = sum(1 for b in water if len(b.tile_ids) > 1)
+    open_count = sum(1 for b in water if b.open_edges)
+    return (
+        f"{spanning} water bod{'y spans' if spanning == 1 else 'ies span'} more than one tile and "
+        f"{'was' if spanning == 1 else 'were'} set to one level each; {open_count} touch the run boundary."
+    )
+
+
 def format_boundary_report(bodies: list[WaterBody], tiles: list[TileAnalysis], limit: int = 100) -> list[str]:
-    """Lines describing the water bodies that touch an edge with no neighbor in the run."""
+    """Lines describing the water bodies that span tiles and those that touch an edge with no neighbor in the run.
+
+    The legend (only when a table follows), the table of the bodies that span
+    more than one tile, the table of the bodies with an open edge (a body
+    with both is in both), the summary sentence, then the notes.
+    """
     by_id = {t.tile_id: t for t in tiles}
     bodies = [b for b in bodies if b.water]
+    spanning_bodies = [b for b in bodies if len(b.tile_ids) > 1]
     open_bodies = [b for b in bodies if b.open_edges]
-    spanning = sum(1 for b in bodies if len(b.tile_ids) > 1)
     lines: list[str] = []
+    if spanning_bodies or open_bodies:
+        lines.extend(REPORT_LEGEND)
+    if spanning_bodies:
+        lines.append("Water bodies that span more than one tile, set to one level each:")
+        lines.append(_COLUMNS + "tile:sides")
+        for body in spanning_bodies[:limit]:
+            sides = _sides_by_tile(body)
+            parts = []
+            for tile_id in body.tile_ids:
+                t = by_id[tile_id]
+                parts.append(f"{t.name}:{sides[tile_id]}{_tile_mark(t)}" if tile_id in sides else _tile_label(t))
+            lines.append(_row(body, by_id[body.members[0][0]].is_dted, parts))
+        if len(spanning_bodies) > limit:
+            lines.append(f"  ... and {len(spanning_bodies) - limit} more")
     if open_bodies:
         lines.append(
             "Water bodies touching an edge of this run. A neighboring tile transformed separately "
             "may get a different level:"
         )
-        lines.append(f"  {'height (in)':>12}   {'level (out)':<18} {'tiles':>5} {'posts':>10}   open edges")
+        lines.append(_COLUMNS + "open edges")
         for body in open_bodies[:limit]:
-            tile = by_id[body.members[0][0]]
-            level = f"{body.level:.2f} m"
-            if tile.is_dted:
-                level += f" ({int(round_half_away(np.array(body.level)))} m)"
-            if body.table_level is not None:
-                level += " [table]"
             edges: dict[int, list[str]] = defaultdict(list)
             for tile_id, side in body.open_edges:
                 edges[tile_id].append(side)
-            named = []
-            for tile_id in sorted(edges):
-                t = by_id[tile_id]
-                named.append(f"{t.name}:{','.join(edges[tile_id])}" + (" (context)" if t.is_context else ""))
-            lines.append(
-                f"  {body.height_cm / 100:>10.2f} m   {level:<18} {len(body.tile_ids):>5} {body.posts:>10,}   "
-                + "  ".join(named)
-            )
+            parts = [f"{by_id[i].name}:{','.join(edges[i])}{_tile_mark(by_id[i])}" for i in sorted(edges)]
+            lines.append(_row(body, by_id[body.members[0][0]].is_dted, parts))
         if len(open_bodies) > limit:
             lines.append(f"  ... and {len(open_bodies) - limit} more")
-    lines.append(
-        f"{spanning} water bod{'y spans' if spanning == 1 else 'ies span'} more than one tile and "
-        f"{'was' if spanning == 1 else 'were'} set to one level each; {len(open_bodies)} touch the run boundary."
-    )
-    for body in bodies:
-        for note in body.notes:
-            lines.append(f"  note: water body at {body.height_cm / 100:.2f} m: {note}")
+    lines.append(boundary_summary(bodies))
+    notes = [f"  note: water body at {body.height_cm / 100:.2f} m: {note}" for body in bodies for note in body.notes]
+    lines.extend(notes[:limit])
+    if len(notes) > limit:
+        lines.append(f"  ... and {len(notes) - limit} more notes")
     return lines
+
+
+def format_tile_patches(tile: TileAnalysis, limit: int = 5) -> str:
+    """One line of pass 1 per tile: its edge-touching flat areas, largest first, with the sides they touch.
+
+    These are flat areas, not yet water bodies: whether one is water, and at
+    what level, is decided when the patches are merged across the seams.
+    """
+    label = _tile_label(tile)
+    if not tile.patches:
+        return f"{label}: no flat area reaches a tile edge."
+    sides: dict[int, list[str]] = defaultdict(list)
+    for side in SIDES:
+        edge = tile.edges.get(side)
+        if edge is not None:
+            for patch_label in np.unique(edge.labels).tolist():
+                sides[patch_label].append(side)
+    ordered = sorted(tile.patches.items(), key=lambda item: (-item[1].count, item[1].height_cm, item[0]))
+    listed = ", ".join(
+        f"{stats.height_cm / 100:.2f} m ({stats.count:,} posts, {','.join(sides.get(patch_label, []))})"
+        for patch_label, stats in ordered[:limit]
+    )
+    more = f" and {len(ordered) - limit} more" if len(ordered) > limit else ""
+    return f"{label}: {len(ordered)} edge-touching flat area(s): {listed}{more}."
 
 
 # ---------------------------------------------------------------------------

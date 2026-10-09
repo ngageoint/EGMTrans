@@ -15,7 +15,10 @@ several tiles gets one level everywhere:
 Context tiles are analyzed but never written: a producer who holds the
 neighboring source tiles gets the level the neighbor's producer would compute.
 A water-level table exported by a run over a larger area gives a later, partial
-run the same levels whatever the order of production.
+run the same levels whatever the order of production. With ``skip_existing``,
+the inputs of the outputs already written are analyzed the same way, so a
+resumed run gives the water bodies it shares with them the levels an
+uninterrupted run would, and their seams are checked with the new outputs.
 
 With a DTED level, every GeoTIFF of the run becomes one work unit per whole
 cell it covers (:func:`plan_units`), named by the ``--dted-naming`` template,
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import functools
 import os
 import re
 import shutil
@@ -41,7 +45,7 @@ from egmtrans.config import DATUM_MAPPING, DTED_EXTENSIONS, DTED_ROOT, dted_targ
 from egmtrans.dted.header import CellGeometry, DtedHeader, read_header
 from egmtrans.dted.schema import DATA_RECORD_OVERHEAD, HEADER_LENGTH
 from egmtrans.dted.validate import validate_file
-from egmtrans.dted.writer import DtedMetadataSource, HeaderAssemblyError, header_plan_lines
+from egmtrans.dted.writer import DtedMetadataSource, HeaderAssemblyError, header_plan_lines, header_warning_lines
 from egmtrans.file_utils import (
     DEFAULT_DTED_NAMING,
     IOPaths,
@@ -61,11 +65,13 @@ from egmtrans.tiling import (
     TileLevels,
     WaterBody,
     WaterLevelTable,
+    boundary_summary,
     compare_seams,
     connected_tiles,
     find_seams,
     format_boundary_report,
     format_seam_report,
+    format_tile_patches,
     merge_patches,
 )
 from egmtrans.transform import (
@@ -442,6 +448,47 @@ def adjoining_context(run_files: list[str], context_files: list[str]) -> list[st
     return [t.input_file for t in geometry if t.tile_id >= len(run_files) and t.tile_id in reached]
 
 
+def _pass_explanation(min_patch_size: int, min_containment: float, with_table: bool, with_finished: bool) -> list[str]:
+    """The lines that say what pass 1 does with the run's values, logged once before it starts."""
+    lines = [
+        f'Pass 1 looks in every tile for the flat areas of at least {min_patch_size} posts at one height (the same '
+        f'whole centimeter; whole meters in DTED) that reach a tile edge, and records each one\'s height, post '
+        f'count and lowest transformed value.',
+        f'Flat areas that meet across a seam at the same height are joined into one water body; a body is kept as '
+        f'water when at least {min_containment:.0%} of its boundary lies above it, and is set to the lowest '
+        f'transformed value among its parts'
+        + (', or lower when the water-level table gives a lower level' if with_table else '') + '.',
+        'Pass 2 transforms the tiles with those levels; a flat area that stays inside one tile is decided in pass 2, '
+        'tile by tile. The tables at the end of pass 1 list the bodies that span tiles and the ones that touch an '
+        'edge with no neighbor in the run.',
+    ]
+    if with_finished:
+        lines.append(
+            'The inputs of the skipped outputs are analyzed too, so the water bodies they share with the rest of the '
+            'run get the levels an uninterrupted run would give.'
+        )
+    return lines
+
+
+def _summarize_header_warnings(function):
+    """Tally the per-cell DTED header warnings of a run (the pre-flight and the
+    writes raise the same ones) and log each distinct warning once at the end,
+    with the number of cells, instead of once per cell and pass."""
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        _state.begin_header_warnings()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            logger = _state.get_logger()
+            for line in header_warning_lines(_state.end_header_warnings()):
+                logger.warning(line)
+
+    return wrapper
+
+
+@_summarize_header_warnings
 def run_batch(
     paths: IOPaths,
     source_datum: str,
@@ -495,8 +542,11 @@ def run_batch(
 
     With *skip_existing*, a planned output that already exists and verifies
     as this unit's is left alone, so a cancelled or failed run can be rerun
-    without redoing the cells written; without it, the outputs that would be
-    replaced are listed in a warning. *should_stop* is asked between tiles
+    without redoing the cells written; its input is still analyzed in pass 1,
+    like a context tile, so the water bodies it shares with the rest of the
+    run get the levels an uninterrupted run would give, and its seams are
+    checked with the outputs of this run. Without it, the outputs that would
+    be replaced are listed in a warning. *should_stop* is asked between tiles
     (ArcGIS Pro's Cancel); Ctrl-C in a terminal stops the run the same way,
     and the summary says how far it got.
 
@@ -710,12 +760,19 @@ def run_batch(
         return result
 
     # Outputs that are already there: skipped when asked, listed otherwise.
+    # A skipped output's input is still analyzed in pass 1, like a context
+    # tile, so the water bodies it shares with the rest of the run get the
+    # levels an uninterrupted run would give; its seams are checked too.
+    finished_units: list[WorkUnit] = []
+    finished_written: list[str] = []
     existing = [u for u in units if u.output_file and os.path.exists(u.output_file)]
     if skip_existing and existing:
         finished = [u for u in existing if _existing_output_ok(u)]
         if finished:
             done = {id(u) for u in finished}
             units = [u for u in units if id(u) not in done]
+            finished_units = [WorkUnit(input_file=u.input_file, output_file=None, cell=u.cell) for u in finished]
+            finished_written = [u.output_file for u in finished]
             result.skipped_existing = len(finished)
             result.outputs.extend(u.output_file for u in finished)
             logger.info(f'Skipping {len(finished)} output(s) already written and verified under {output_dir}.')
@@ -753,7 +810,11 @@ def run_batch(
 
     needs_merge = (
         water_logic
-        and (len(units) + len(context_units) > 1 or table is not None or export_water_levels is not None)
+        and (
+            len(units) + len(context_units) + len(finished_units) > 1
+            or table is not None
+            or export_water_levels is not None
+        )
     )
 
     def stop_requested() -> bool:
@@ -768,16 +829,24 @@ def run_batch(
     levels: dict[int, TileLevels] = {}
     seams = []
     temp_root = None
-    all_units = units + context_units
+    # Finished units last, so the ids of the units match enumerate(units) in pass 2.
+    all_units = units + context_units + finished_units
+    analyzed = len(units) + len(context_units)  # the tile id of the first finished unit
     try:
         _state.set_quiet(quiet)
         if needs_merge:
             temp_root = _make_temp_dir(output_dir)
+            counted = [f'{len(units)} tile(s)']
+            if context_units:
+                counted.append(f'{len(context_units)} context tile(s)')
+            if finished_units:
+                counted.append(f'{len(finished_units)} finished tile(s)')
             progress(
-                f'Pass 1: analyzing {len(units)} tile(s)'
-                + (f' and {len(context_units)} context tile(s)' if context_units else '')
+                'Pass 1: analyzing ' + ', '.join(counted[:-1]) + (' and ' if len(counted) > 1 else '') + counted[-1]
                 + ' for water bodies that cross tile edges...'
             )
+            for line in _pass_explanation(min_patch_size, min_containment, table is not None, bool(finished_units)):
+                logger.info(line)
             for tile_id, unit in enumerate(all_units):
                 if stop_requested():
                     result.cancelled = True
@@ -803,6 +872,9 @@ def run_batch(
                 finally:
                     _remove_temp_dir(tile_temp)
                 tiles.append(tile)
+                tile.finished = tile_id >= analyzed
+                if tile.error is None:
+                    logger.info(format_tile_patches(tile))
 
             if not result.cancelled:
                 seams = find_seams(tiles)
@@ -815,6 +887,8 @@ def run_batch(
                 result.tiles = tiles
                 for line in format_boundary_report(bodies, tiles):
                     logger.info(line)
+                if quiet:
+                    progress(boundary_summary(bodies) + ' The log file holds the tables.')
                 progress(f'\nPass 2: transforming {len(units)} tile(s)...')
 
         failed_ids = {t.tile_id for t in tiles if t.error is not None}
@@ -860,9 +934,11 @@ def run_batch(
         _remove_temp_dir(temp_root)
         _state.set_quiet(False)
 
-    if seams and len(written) > 1:
+    checked = dict(written)
+    checked.update({analyzed + k: path for k, path in enumerate(finished_written)})
+    if seams and len(checked) > 1:
         try:
-            result.seam_checks = compare_seams(tiles, seams, written)
+            result.seam_checks = compare_seams(tiles, seams, checked)
         except Exception as e:
             logger.warning(f'The seam check of the DTED outputs failed: {e}')
         for line in format_seam_report(result.seam_checks):

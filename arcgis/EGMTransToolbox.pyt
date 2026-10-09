@@ -67,11 +67,37 @@ DTED_GROUP = (
     "dted_summary",
 )
 WATER_GROUP = ("context_folder", "water_levels", "containment")
+# ArcGIS Pro's browse dialog opens a raster on a double click and lists its
+# bands; a band chosen there (N49.dt2\Band_1) stands for its file.
+RASTER_BAND = re.compile(r"band_\d+", re.IGNORECASE)
 
 
 def _by_name(parameters):
     """The parameters keyed by name, so an insertion never shifts an index."""
     return {parameter.name: parameter for parameter in parameters}
+
+
+def _dataset_of(path):
+    """*path* without a trailing raster band (N49.dt2\\Band_1 is N49.dt2), else *path* as it is."""
+    if not path:
+        return path
+    head, tail = os.path.split(path.rstrip("\\/"))
+    return head if RASTER_BAND.fullmatch(tail) and os.path.isfile(head) else path
+
+
+def _input_path(parameter):
+    """The file or folder an input parameter stands for: a raster layer's data source, a band's file."""
+    value = parameter.value
+    path = value.dataSource if hasattr(value, "dataSource") else parameter.valueAsText
+    return _dataset_of(path)
+
+
+def _show_dataset(parameter):
+    """Put a band's file in the input box in place of the band, so the dialog shows what the tool reads."""
+    text = parameter.valueAsText
+    dataset = _dataset_of(text)
+    if dataset != text:
+        parameter.value = dataset
 
 
 def _override_pairs(parameter):
@@ -437,6 +463,7 @@ class Tool:
         options, then fill the read-only summary of the DTED header fields
         from the index, the profile and the overrides as they are chosen."""
         p = _by_name(parameters)
+        _show_dataset(p["input"])
         input_value = p["input"].valueAsText or ""
 
         # A DTED file input is written at its own level: the format follows
@@ -522,25 +549,35 @@ class Tool:
         except Exception as e:
             p["dted_index" if index_given else "dted_profile"].setErrorMessage(str(e))
             return
+        # ArcGIS keeps one message per parameter, so the warnings of a parameter are joined.
+        warned = {}
         for issue in issues:
             target = {"INDEX": "dted_index", "PROFILE": "dted_profile", "OVERRIDE": "dted_overrides"}.get(
                 issue.record, "dted_profile" if profile_given else "dted_index"
             )
             if issue.severity == "error":
                 p[target].setErrorMessage(str(issue))
-            elif issue.severity == "warning" and issue.key == "producer_code":
-                p[target].setWarningMessage(str(issue))
-        if coverage is None:
-            return
-        if coverage.missing_required and converting:
-            p["dted_profile" if (profile_given or not index_given) else "dted_index"].setErrorMessage(
-                "Nothing supplies the required header field(s) " + ", ".join(coverage.missing_required)
-                + ": add them to the profile, the index or the overrides."
-            )
-        if coverage.null_accuracy_cells and index_given:
-            p["dted_index"].setWarningMessage(
-                f"{coverage.null_accuracy_cells} cell(s) of the index have a NULL accuracy; the header will say NA."
-            )
+            elif issue.severity == "warning":
+                warned.setdefault(target, []).append(str(issue))
+        if coverage is not None and coverage.missing_required and converting:
+            # Blocked only when no cell has a source for the field; a NULL in some
+            # rows is a warning, since the run stops before writing when it meets them.
+            whole = [name for name, n in coverage.missing_required.items() if n >= coverage.cells]
+            partial = [(name, n) for name, n in coverage.missing_required.items() if n < coverage.cells]
+            if whole:
+                p["dted_profile" if (profile_given or not index_given) else "dted_index"].setErrorMessage(
+                    "Nothing supplies the required header field(s) " + ", ".join(whole)
+                    + ": add them to the profile, the index or the overrides (for the compilation date, a DTED "
+                    "Header Overrides row compilation_date = today)."
+                )
+            if partial:
+                shown = "; ".join(f"{name} is NULL in {n:,} of {coverage.cells:,} cells" for name, n in partial)
+                warned.setdefault("dted_index", []).append(
+                    f"{shown}, and nothing else supplies it: a run that includes those cells stops before writing. "
+                    "Fill the index, or add the field to the profile or the overrides."
+                )
+        for target, texts in warned.items():
+            p[target].setWarningMessage("\n".join(texts))
 
     def updateMessages(self, parameters):
         """Modify the messages created by internal validation for each tool
@@ -641,13 +678,8 @@ class Tool:
     def execute(self, parameters, messages):
         """The source code of the tool."""
         p = _by_name(parameters)
-        input_param = p["input"]
-
-        # Check if the input is a raster layer and get its data source path
-        if hasattr(input_param.value, 'dataSource'):
-            input_path = input_param.value.dataSource
-        else:
-            input_path = input_param.valueAsText
+        # A raster layer's data source, or the file or folder; a band is read as its file.
+        input_path = _input_path(p["input"])
 
         output_path = p["output"].valueAsText
         output_format = _format_of(p)
@@ -697,8 +729,11 @@ class Tool:
             for issue in errors:
                 arcpy.AddError(str(issue))
             if errors:
-                arcpy.AddError("The DTED metadata index is not valid; see the DTED Header Report tool.")
+                arcpy.AddError("The DTED metadata index is not valid; see 'egmtrans dted-index validate'.")
                 return
+            for issue in issues:
+                if issue.severity == 'warning':
+                    arcpy.AddWarning(str(issue))
 
         EGMTrans.setup_logger(io_paths.log_path if save_log else None, save_log, is_arc_mode=True)
         arcpy.AddMessage(EGMTrans.versions_line())
@@ -823,7 +858,7 @@ class Tool:
                 arcpy.SetParameter(list(p).index("output_layer"), result_layer.getOutput(0))
             except Exception as e:
                 arcpy.AddWarning(f"Could not create output layer for map display: {e}")
-        elif not hasattr(input_param.value, 'dataSource'):
+        elif not hasattr(p["input"].value, 'dataSource'):
             messages.addMessage("Several files were written, or none. Skipping automatic layer addition to map.")
 
         return
@@ -913,10 +948,12 @@ class DtedHeaderReport:
     def getParameterInfo(self):
         params = []
 
+        # A raster layer or dataset first, so the browse dialog's OK selects a
+        # DTED file it shows as a raster; a file for the DTED0 companions.
         input_param = arcpy.Parameter(
             displayName="DTED File or Folder",
             name="input",
-            datatype=["DEFile", "DEFolder"],
+            datatype=["GPRasterLayer", "DEFile", "DEFolder"],
             parameterType="Required",
             direction="Input")
         params.append(input_param)
@@ -963,6 +1000,7 @@ class DtedHeaderReport:
         return True
 
     def updateParameters(self, parameters):
+        _show_dataset(_by_name(parameters)["input"])
         return
 
     def updateMessages(self, parameters):
@@ -976,7 +1014,7 @@ class DtedHeaderReport:
         from egmtrans.dted.validate import count, validate_file
 
         p = _by_name(parameters)
-        input_path = p["input"].valueAsText
+        input_path = _input_path(p["input"])
         report_format = p["report_format"].valueAsText or "text"
         output_file = p["output_file"].valueAsText
         check_data = bool(p["check_data"].value)

@@ -128,6 +128,7 @@ class TestOverlappingDted:
         text = "\n".join(log_lines)
         assert "n06e127.dt0:E" in text and "1 touch the run boundary" in text
         assert "n06e126.dt0" not in text.split("open edges")[-1].split("\n")[1]
+        assert "n06e126.dt0:E  n06e127.dt0:W,E*" in text, "the spanning table names both parts of the lake"
 
     def test_result_independent_of_folder_layout(self, tmp_dir):
         flat = os.path.join(tmp_dir, "flat")
@@ -281,6 +282,72 @@ class TestAbuttingGeotiff:
         alone_b = _alone(src_b, os.path.join(tmp_dir, "alone_b.tif"))[LAKE_ROWS, :30]
         assert abs(alone_a[0, 0] - alone_b[0, 0]) > 0.05, "the test tiles do not disagree on their own"
         assert lake_a[0] == min(alone_a[0, 0], alone_b[0, 0])
+
+
+@requires_grids
+class TestResumedRuns:
+    """With skip_existing, the inputs of the finished outputs are analyzed as
+    context, so the tiles a resumed run writes get the levels of a full run."""
+
+    def test_resumed_run_gives_the_uninterrupted_levels(self, tmp_dir, log_lines):
+        src_a, src_b = geotiff_tiles(os.path.join(tmp_dir, "in"))
+        out = os.path.join(tmp_dir, "out")
+        full = _run(os.path.join(tmp_dir, "in"), out)
+        assert full.exit_code == 0 and full.files_processed == 2
+        out_a, out_b = os.path.join(out, "N06E126_DEM.tif"), os.path.join(out, "N06E127_DEM.tif")
+        full_a = read_band(out_a)
+        with open(out_b, "rb") as f:
+            kept = f.read()
+        # Tile A's part of the lake is the higher one: on its own, A gets another level.
+        alone = _alone(src_a, os.path.join(tmp_dir, "alone_a.tif"))
+        assert not np.array_equal(alone, full_a), "the test tiles agree on their own, so the test proves nothing"
+
+        os.remove(out_a)
+        log_lines.clear()
+        resumed = _run(os.path.join(tmp_dir, "in"), out, skip_existing=True)
+        assert resumed.exit_code == 0 and resumed.skipped_existing == 1 and resumed.files_processed == 1
+        with open(out_b, "rb") as f:
+            assert f.read() == kept, "the finished tile must not be rewritten"
+        assert np.array_equal(read_band(out_a), full_a)
+        body = resumed.water_bodies[0]
+        assert body.tile_ids == [0, 1] and body.open_edges == []
+        assert any("1 finished tile(s)" in line for line in log_lines)
+        assert any("N06E127_DEM.tif:W (finished)" in line for line in log_lines)
+
+    def test_resumed_dted_run_checks_the_seam_with_the_finished_cell(self, tmp_dir):
+        """Two DTED2 cells from one raster with a lake across their shared column
+        (the synthetic DTED0 tiles have no compilation date, so their outputs
+        never verify as finished); the resumed run's seam check covers the
+        finished cell, and the cell written again matches the full run."""
+        from tests.conftest import lattice_geotransform, synthetic_cell
+
+        folder = os.path.join(tmp_dir, "in")
+        os.makedirs(folder)
+        left = synthetic_cell(CELL_PER_DEGREE, base_cm=40000)
+        right = synthetic_cell(CELL_PER_DEGREE, seed_offset=1, base_cm=40000)
+        right[:, 0] = left[:, -1]
+        left[100:200, 250:] = 350.0
+        right[100:200, :60] = 350.0
+        wide = np.concatenate([left, right[:, 1:]], axis=1)
+        write_geotiff(os.path.join(folder, "wide.tif"), wide,
+                      lattice_geotransform(CELL_LON0, CELL_LAT0, CELL_PER_DEGREE, CELL_PER_DEGREE, extent_x=2))
+        out = os.path.join(tmp_dir, "out")
+        profile = _profile(tmp_dir)
+        full = _shifted(folder, out, profile)
+        assert full.exit_code == 0 and full.files_processed == 2
+        assert len(full.seam_checks) == 1 and full.seam_checks[0].clean
+        west, east = os.path.join(out, "N85E030.dt2"), os.path.join(out, "N85E031.dt2")
+        kept, reference = _sha(west), _sha(east)
+
+        os.remove(east)
+        resumed = _shifted(folder, out, profile, skip_existing=True)
+        assert resumed.exit_code == 0 and resumed.skipped_existing == 1 and resumed.files_processed == 1
+        assert _sha(west) == kept and _sha(east) == reference
+        assert len(resumed.seam_checks) == 1
+        check = resumed.seam_checks[0]
+        assert check.clean and check.shared == full.seam_checks[0].shared
+        body = resumed.water_bodies[0]
+        assert body.tile_ids == [0, 1] and body.open_edges == []
 
 
 @requires_grids
@@ -439,14 +506,14 @@ def _sha(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
-def _shifted(input_folder, output_folder, profile, context=(), table=None, export=None):
+def _shifted(input_folder, output_folder, profile, context=(), table=None, export=None, **kwargs):
     """A conversion batch from EGM2008 to EGM96 with the cell naming preset."""
     from egmtrans.dted.writer import DtedMetadataSource
 
     return run_batch(
         resolve_io_paths(input_folder, output_folder, dted_level=2), 'EGM2008', 'EGM96', True, False, 400,
         'bilinear', assume_yes=True, dted_metadata=DtedMetadataSource.load(None, profile), dted_level=2,
-        dted_naming='cell', context_folders=context, water_levels=table, export_water_levels=export,
+        dted_naming='cell', context_folders=context, water_levels=table, export_water_levels=export, **kwargs,
     )
 
 
@@ -621,6 +688,21 @@ class TestConvertedCells:
         assert sorted(os.listdir(out)) == ['N85E030.dt2', 'tile_85_30_mask.tif']
         assert result.failed == [('tile_85_31.tif [N85E031]', 'transformation failed')]
 
+    def test_header_warnings_are_summarized_once_per_run(self, tmp_dir, log_lines):
+        folder = os.path.join(tmp_dir, 'in')
+        lattice_tiles(folder, cells=((0, 0), (1, 0)))
+        profile = _profile(tmp_dir)
+        with open(profile) as handle:
+            text = handle.read().replace('producer_code = "USNGA"', 'producer_code = "ZZTEST"')
+        with open(profile, 'w') as handle:
+            handle.write(text)  # ZZ is not a FIPS 10-4 country code: a warning on every header
+        result = _convert(folder, os.path.join(tmp_dir, 'out'), profile)
+        assert result.exit_code == 0 and result.files_processed == 2
+        summary = [line for line in log_lines if line.startswith('DTED header warning in 2 cell(s) (')]
+        assert len(summary) == 1 and 'ZZ' in summary[0] and 'FIPS 10-4' in summary[0]
+        assert sum(1 for line in log_lines if 'ZZ is not a FIPS' in line) == 1, 'once per run, not per cell and pass'
+        assert not any('DTED header of cell' in line and 'ZZ' in line for line in log_lines), 'no per-cell warning'
+
     def test_header_problems_stop_the_run_before_anything_is_written(self, tmp_dir, log_lines):
         folder = os.path.join(tmp_dir, 'in')
         lattice_tiles(folder)
@@ -734,6 +816,7 @@ class TestRerunsAndFailures:
         assert sorted(os.path.basename(path) for path in third.outputs) == ['N85E030.dt2', 'N85E031.dt2']
         assert any('Skipping 1 output(s) already written' in line for line in log_lines)
         assert not any('will be replaced' in line for line in log_lines)
+        assert any('1 finished tile(s)' in line for line in log_lines), "the skipped cell's input is analyzed"
         fourth = _convert(folder, out, profile, naming='cell', skip_existing=True)
         assert fourth.skipped_existing == 2 and fourth.files_processed == 0 and fourth.exit_code == 0
 

@@ -6,7 +6,7 @@
 # EGMTrans
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.10.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.10.1-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -18,14 +18,17 @@ It runs as an ArcGIS Pro toolbox (ArcGIS Pro 3.7 or later, Python 3.13) or on th
 
 1. Unzip the release anywhere ArcGIS Pro can read, for example `C:\Tools\EGMTrans`.
 2. Put the two one-arc-minute geoid grids in the `datums` folder: `us_nga_egm96_1.tif` and `us_nga_egm08_1.tif`, from the [geoid grid release](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1). On a closed network, copy them over by hand and check their SHA-256 against `datums/README.md` (see [Offline setup](#offline-setup)); the toolbox downloads them itself when the computer is online.
-3. In the Catalog pane, right-click Toolboxes, choose Add Toolbox, and pick `arcgis\EGMTransToolbox.pyt`. Nothing is installed: the toolbox finds the package in `src` beside it.
-4. Run **DTED Self-Test**. It converts two built-in tiles and compares the bytes with the pinned reference, so you know this computer reproduces the reference before a real run.
-5. Run **EGMTrans Tool**: the input tile or folder, the output folder, the Output Format (DTED2 by default), the Source Datum of your tiles, and, in the DTED output group, the product profile and the metadata index. The Target Datum is EGM96; the dialog shows the header plan of the first cell before you run.
+3. Give ArcGIS Pro a Python environment with Numba. The default environment `arcgispro-py3` cannot take packages, and without Numba a one-degree tile takes tens of minutes instead of about a minute (the bytes are the same). In Project > Package Manager: under Environments, clone `arcgispro-py3` (the copy takes several minutes); make the clone the active environment; open Add Packages, search for `numba` and click Install (upper right); then **restart ArcGIS Pro**, because the running Pro keeps the environment it started with and the tool would report "Numba is not available". On a closed network, see [Offline setup](#offline-setup).
+
+   **ArcGIS Pro Package Manager**  
+   <img src="img/ArcGIS_package_manager.png" alt="ArcGIS Pro Package Manager" width="800">
+
+4. In the Catalog pane, right-click Toolboxes, choose Add Toolbox, and pick `arcgis\EGMTransToolbox.pyt`. Nothing is installed: the toolbox finds the package in `src` beside it.
+5. Run **DTED Self-Test**. It converts two built-in tiles and compares the bytes with the pinned reference, so you know this computer reproduces the reference before a real run.
+6. Run **EGMTrans Tool**: the input tile or folder, the output folder, the Output Format (DTED2 by default), the Source Datum of your tiles, and, in the DTED output group, the product profile and the metadata index. The Target Datum is EGM96; the dialog shows the header plan of the first cell before you run.
 
 **EGMTrans Tool in ArcGIS Pro**  
 <img src="img/EGMTrans_toolbox.png" alt="EGMTrans Tool in ArcGIS Pro" width="300">
-
-Large batches run 20 to 50 times faster with Numba, which ArcGIS Pro's default environment does not have; see [Offline setup](#offline-setup) for the cloned environment. The results are the same without it.
 
 ## Quick start on the command line
 
@@ -88,7 +91,7 @@ Pass `-y`: a container has no terminal to answer a prompt, so without it EGMTran
 Everything below is what a closed network needs; nothing else reaches the internet.
 
 - **The two geoid grids** `us_nga_egm96_1.tif` and `us_nga_egm08_1.tif` go in `datums/`. Copy them from the [release page](https://github.com/ngageoint/EGMTrans/releases/tag/datum-grids-v1) on a connected computer and compare their SHA-256 with the values in `datums/README.md` (`certutil -hashfile <file> SHA256` on Windows, `sha256sum` elsewhere). The tool and the toolbox verify the hashes before a DTED cell is written and download only the grids a run needs, so these two are enough for every transform. The three other grids serve the Explorer map only. `python download_grids.py` fetches all five and needs the internet.
-- **Numba in ArcGIS Pro.** The default environment `arcgispro-py3` cannot take packages: clone it (Package Manager, or `conda create --clone`), activate the clone, and install `numba`. Online, Package Manager installs it from Esri's channel. On a closed network, carry the `numba` and `llvmlite` packages for the clone's Python version over and install them with `conda install --offline`; the procedure is checked on ArcGIS Pro 3.7. Without Numba a one-degree 0.4-arc-second tile takes tens of minutes instead of about a minute; the bytes are the same.
+- **Numba in ArcGIS Pro.** Step 3 of the quick start installs it from Esri's channel, which needs the internet. On a closed network, clone the environment the same way, carry the `numba` and `llvmlite` packages for the clone's Python version over, install them with `conda install --offline`, and restart ArcGIS Pro; the procedure is checked on ArcGIS Pro 3.7. Without Numba a one-degree 0.4-arc-second tile takes tens of minutes instead of about a minute; the bytes are the same.
 - **The Python package.** `pip install -e .` fetches setuptools when the environment lacks it; `pip install --no-build-isolation -e .` with setuptools already present stays offline, and `python EGMTrans.py` needs no installation at all.
 - **Docker.** The image builds online only (it downloads the grids and the conda packages); move it with `docker save` and `docker load`.
 - **The Explorer** map's OpenStreetMap basemap and its locators need the internet; the geoid layers do not.
@@ -109,7 +112,7 @@ Everything below is what a closed network needs; nothing else reaches the intern
 | Retain Flat Areas | `-f` | Keep the ocean at 0 and every water body at one level across the run; on by default. Off, or with WGS84 as either datum, nothing is leveled and the three water options below are ignored. |
 | Create Mask | `-m` | A mask beside each output: 1 for the ocean, one value per water body. Beside a DTED cell it is named for the source tile. |
 | Save Log File | `-l` | The log, beside a single output or inside the output folder; appended on a rerun, UTF-8. |
-| Skip Existing Cells | `--skip-existing` | Leave outputs that already exist and verify alone, so a cancelled or failed run can be continued. Otherwise existing outputs are listed before they are replaced. |
+| Skip Existing Cells | `--skip-existing` | Leave outputs that already exist and verify alone, so a cancelled or failed run can be continued; their inputs are still analyzed, so the water levels match an uninterrupted run. Otherwise existing outputs are listed before they are replaced. |
 | Neighboring Tiles (not processed) | `--context FOLDER` | Additional tiles in the source datum that constrain the run: analyzed, never written. May be repeated on the command line. |
 | Water Levels Table | `--water-levels FILE` | A table from an earlier run's `--export-water-levels`. |
 | Minimum Containment (0-1) | `-c` | The share of a flat area's boundary that must lie above it for the area to be water; default 0.8. |
@@ -122,7 +125,7 @@ Everything below is what a closed network needs; nothing else reaches the intern
 | | `-y` | Answer the prompts (a datum the headers contradict, the header plan) for unattended runs. |
 | | `--export-water-levels FILE` | Write the levels of the water bodies that touch a tile edge. |
 
-Subcommands: `egmtrans dted-header FILE...`, `egmtrans dted-index build|validate`, `egmtrans dted-selftest [--keep FOLDER]`, `egmtrans dmed FOLDER [--out PATH] [--check]`. The toolbox has the same four tools: EGMTrans Tool, DTED Header Report, DTED Self-Test and Build DMED.
+Subcommands: `egmtrans dted-header FILE...`, `egmtrans dted-index build|validate|columns`, `egmtrans dted-selftest [--keep FOLDER]`, `egmtrans dmed FOLDER [--out PATH] [--check]`. The toolbox has the same four tools: EGMTrans Tool, DTED Header Report, DTED Self-Test and Build DMED.
 
 ### DTED output
 
@@ -149,7 +152,9 @@ You are asked before the run goes on when the source and target datums are the s
 - **EPSG lookups fail** (`proj_create_from_database: Open of .../share/proj failed`): PROJ 9.9 lists the user's own PROJ directory first, and when it exists without a `proj.db` every lookup fails. EGMTrans points GDAL at the directory that holds the database; if the error remains, set `PROJ_DATA` to it, for example `<env>/share/proj`.
 - **The toolbox shows the previous version** after an upgrade: restart ArcGIS Pro; the toolbox reloads its shim but not the package, and it warns when the two versions differ.
 - **Red "!" icons on the Explorer's geoid layers**: the project was opened before the grids were in `datums/`; close and reopen it.
-- **A run in ArcGIS Pro says little** for a large batch: the messages pane shows one line per cell and the warnings; the log file keeps the detail.
+- **A run in ArcGIS Pro says little** for a large batch: the messages pane shows one line per cell, the water-body counts and the warnings; the log file keeps the detail, including the tables at the end of pass 1 of the water bodies that span tiles and of those that touch the run boundary.
+- **A lake that spans tiles is not named**: look at the end of pass 1 in the log. One table lists the water bodies that span more than one tile with the tiles and sides each part touches; the other lists the bodies that touch an edge with no neighbor in the run. `*` marks such a side, (context) a tile analyzed but not written, (finished) a tile written by an earlier run and skipped.
+- **The run says Numba is not available** although it is installed: ArcGIS Pro was not restarted after the install, or another environment is active (Package Manager shows the active one).
 
 ### More
 

@@ -460,7 +460,15 @@ def test_dted_parameters_messages_and_summary(monkeypatch, tmp_dir):
     assert summary_p.value.startswith('2 cell(s); level 0; from the index: security_code, data_edition')
     assert 'abs_vert_acc (NULL in 1)' in summary_p.value
     assert 'abs_horiz_acc' in summary_p.value and _errors(index_p) == []
-    assert any('NULL accuracy' in text for text in _warnings(index_p))
+    # A NULL accuracy is NA as intended: no warning, unless the profile holds a number for it.
+    assert not any('the header will say NA' in text for text in _warnings(index_p))
+    with_number = os.path.join(tmp_dir, 'level0_number.toml')
+    with open(with_number, 'w', encoding='utf-8') as handle:
+        handle.write('schema = 1\n[product]\ndted_level = 0\nabs_vert_acc = 6\n')
+    profile_p.value = with_number
+    _validate(tool, params)
+    assert any("not the profile's 6 m" in text for text in _warnings(index_p))
+    profile_p.value = None
     index_p.value = os.path.join(tmp_dir, 'missing.gpkg')
     _validate(tool, params)
     assert _errors(index_p) and 'not found' in _errors(index_p)[0].lower() and not _errors(profile_p)
@@ -479,6 +487,41 @@ def test_dted_parameters_messages_and_summary(monkeypatch, tmp_dir):
         handle.write('schema = 1\n[product]\ndted_level = 0\nproducer_code = "GB"\n')
     _validate(tool, params)
     assert any('Gabon' in text for text in _warnings(profile_p))
+
+
+def test_a_null_in_some_rows_warns_instead_of_blocking(monkeypatch, tmp_dir):
+    """A required value missing in a few cells warns (the run stops when it meets them); a field
+    no cell has a source for blocks Run."""
+    from egmtrans.dted.index import new_row, write_index
+
+    toolbox, _fake = _load_toolbox(monkeypatch)
+    tool = toolbox.Tool()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    p['input'].value = os.path.join(tmp_dir, 'tiles')
+    p['output'].value = os.path.join(tmp_dir, 'out')
+    p['output_format'].value = 'DTED2'
+    p['source_datum'].value = 'EGM2008'
+    index_path = os.path.join(tmp_dir, 'index.gpkg')
+    complete = dict(security_code='U', data_edition=1, match_merge_version='A', compilation_date='2024-07',
+                    abs_horiz_acc=3, abs_vert_acc=5, rel_horiz_acc=3, rel_vert_acc=3)
+    write_index(index_path, {
+        'N06E126': new_row('N06E126', producer_code='USNGA', **complete),
+        'N07E126': new_row('N07E126', producer_code=None, **complete),
+    }, level=2)
+    p['dted_index'].value = index_path
+    _validate(tool, params)
+    assert _errors(p['dted_index']) == [] and _errors(p['dted_profile']) == []
+    assert any('producer_code is NULL in 1 of 2 cells' in text and 'stops before writing' in text
+               for text in _warnings(p['dted_index']))
+    # No cell has a producer code: the error names the field and the fix for a date.
+    write_index(index_path, {cell: new_row(cell, **complete) for cell in ('N06E126', 'N07E126')}, level=2)
+    p['dted_index'].value = None
+    _validate(tool, params)
+    p['dted_index'].value = index_path
+    _validate(tool, params)
+    assert any('Nothing supplies the required header field(s) producer_code' in text
+               and 'compilation_date = today' in text for text in _errors(p['dted_index']))
 
 
 def _prepare_tool(toolbox, tmp_dir, *, input_path, output_path, output_format, source, target='EGM96'):
@@ -608,7 +651,42 @@ def test_display_names_and_help_match_the_xml_files(monkeypatch):
             assert name in {param.name for param in tool_class().getParameterInfo()}, (tool_class.__name__, name)
 
 
-def test_the_dmed_tool(monkeypatch, tmp_dir):
+def test_a_band_chosen_in_the_browse_dialog_is_read_as_its_file(monkeypatch, tmp_dir):
+    """ArcGIS Pro's browse dialog opens a raster on a double click and lists
+    its bands: a band chosen there (N49.dt0/Band_1) stands for its file, in
+    the dialog and in the run."""
+    toolbox, fake = _load_toolbox(monkeypatch)
+    cell = _write_dted0(os.path.join(tmp_dir, 'n49.dt0'), 6, 49)
+    band = os.path.join(cell, 'Band_1')
+
+    report = toolbox.DtedHeaderReport()
+    params = report.getParameterInfo()
+    p = _by_name(params)
+    # A raster first, so the dialog's OK selects a DTED file; a file for the DTED0 companions, or a folder.
+    assert p['input'].datatype == ['GPRasterLayer', 'DEFile', 'DEFolder']
+    p['input'].value = band
+    _validate(report, params)
+    assert p['input'].value == cell and not p['input'].messages
+    # A band that reaches the run, or a raster layer's data source, is read as its file.
+    for value in (band, types.SimpleNamespace(dataSource=band)):
+        p['input'].value = value
+        fake.messages.clear()
+        report.execute(params, _Messages())
+        assert any(text.startswith('n49.dt0: ') for _kind, text in fake.messages), fake.messages
+        assert not any('Not found' in text for _kind, text in fake.messages)
+
+    # The transform tool: the band's file, whose DTED level then sets the format.
+    tool = toolbox.Tool()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    p['input'].value = band
+    p['source_datum'].value = 'EGM2008'
+    _validate(tool, params)
+    assert p['input'].value == cell and p['output_format'].value == 'DTED0'
+    # A folder that happens to be named like a band is a folder.
+    folder = os.path.join(tmp_dir, 'Band_2')
+    os.mkdir(folder)
+    assert toolbox._dataset_of(folder) == folder and toolbox._dataset_of(None) is None
     toolbox, fake = _load_toolbox(monkeypatch)
     tool = toolbox.DtedDmed()
     params = tool.getParameterInfo()

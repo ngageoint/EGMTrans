@@ -207,7 +207,12 @@ def update_dted_header(
     # as they always were; they are reported so the producer can fix them.
     for issue in validate_header(header, extension=os.path.splitext(output_file)[1]):
         if issue.severity in ('error', 'warning'):
-            logger.warning(f'DTED header: {issue}')
+            # In a batch the findings are tallied and summarized once at the end.
+            carried = f'{issue.record}.{issue.key}: {issue.message}'
+            if issue.severity == 'error':
+                carried += ' (an error the input header had)'
+            if not _state.tally_header_warning(carried, cell.cell_id):
+                logger.warning(f'DTED header: {issue}')
 
 
 def _assemble_from_file(path: str, tgt_datum: str, abs_horiz_accuracy: int | None, metadata: DtedMetadata | None):

@@ -30,12 +30,15 @@ import json
 import os
 import re
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from egmtrans.dted.fips import producer_code_warning
 from egmtrans.dted.header import cell_id as make_cell_id
 from egmtrans.dted.header import parse_cell_id
 from egmtrans.dted.schema import (
+    ALL_FIELDS,
+    FIELDS_BY_KEY,
     MAX_COORDINATES,
     MAX_SUBREGIONS,
     MIN_COORDINATES,
@@ -116,6 +119,13 @@ COLUMNS_BY_NAME: dict[str, Column] = {column.name: column for column in INDEX_CO
 HEADER_COLUMNS: tuple[Column, ...] = tuple(c for c in INDEX_COLUMNS if c.dted_key and not c.check_only)
 ACCURACY_COLUMNS = ('abs_horiz_acc', 'abs_vert_acc', 'rel_horiz_acc', 'rel_vert_acc')
 ALWAYS_WRITTEN = ('cell_id', 'dted_level', 'updated')
+# The header fields that are the same for every cell of a product, as against
+# the markings, references, editions, dates and accuracies a cell has its own of.
+PRODUCT_CONSTANT_COLUMNS = (
+    'security_control', 'producer_code', 'product_spec', 'product_spec_amend', 'product_spec_date',
+    'vertical_datum', 'horizontal_datum', 'digitizing_system', 'acc_nima_reserved', 'dsi_nima_text',
+    'dsi_producer_text', 'dsi_free_text',
+)
 
 SUBREGION_COLUMNS: tuple[Column, ...] = (
     Column('cell_id', 'str', None, 7, True),
@@ -215,6 +225,73 @@ def normalize_value(column: Column, value):
     if column.type == 'date':
         return parse_date(value)
     return str(value)
+
+
+def _as_int(value) -> int | None:
+    """*value* as an integer, or None when it is not one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _coerce(column: Column, value):
+    """A value read from a file by the index's own rules: an int column from
+    text or a real number (blank or NA is NULL, a whole number is the value),
+    a date column from text. A text column keeps what was read.
+
+    Raises:
+        ValueError: If the value is not a whole number (of meters, for an
+            accuracy) or not a date.
+    """
+    if value is None:
+        return None
+    if column.type == 'int':
+        unit = ' of meters' if column.name in ACCURACY_COLUMNS else ''
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            raise ValueError(f'{value!r} is not a whole number{unit}')
+        text = str(value).strip()
+        if text == '' or (column.name in ACCURACY_COLUMNS and text.upper() == 'NA'):
+            return None
+        if text.lstrip('-').isdigit():
+            return int(text)
+        raise ValueError(f'{value!r} is not a whole number{unit}')
+    if column.type == 'date':
+        return parse_date(value)
+    return value
+
+
+def _coerce_record(record: dict, columns: tuple[Column, ...], path: str, cell: str) -> None:
+    """Coerce the known columns of *record* in place; a refused value names the cell and the column."""
+    problems = []
+    for column in columns:
+        if column.name in record:
+            try:
+                record[column.name] = _coerce(column, record[column.name])
+            except ValueError as e:
+                problems.append(f'{column.name} {e}')
+    if problems:
+        raise ValueError(f'{os.path.basename(path)}: cell {cell}: ' + '; '.join(problems))
+
+
+def _accuracy_number(value) -> int | None:
+    """The whole meters a profile gives an accuracy, or None for NA, blank or no value."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    return int(text) if text.isdigit() else None
 
 
 def cell_polygon(cell_id: str) -> list[tuple[float, float]]:
@@ -343,11 +420,14 @@ def _meta_for(rows: dict[str, dict], meta: dict | None, level: int | None) -> di
     return merged
 
 
-def columns_to_write(rows: dict[str, dict]) -> tuple[Column, ...]:
+def columns_to_write(rows: dict[str, dict], *, all_columns: bool = False) -> tuple[Column, ...]:
     """The index columns an index holds: the key, the level and the timestamp
     always, any other column only when some row has a value. An absent column
     is one the profile supplies; a NULL among values means NA (accuracies) or
-    "nothing from the index" (the rest)."""
+    "nothing from the index" (the rest). With *all_columns*, every column: a
+    complete table to review in a GIS, in which a NULL accuracy means NA."""
+    if all_columns:
+        return INDEX_COLUMNS
     return tuple(
         column for column in INDEX_COLUMNS
         if column.name in ALWAYS_WRITTEN or any(row.get(column.name) is not None for row in rows.values())
@@ -487,13 +567,39 @@ def _write_gpkg(path: str, rows: dict[str, dict], subregions: dict[str, list[dic
 
 
 def _ogr_value(feature, index: int, column: Column | None):
+    """A field's value by the index's rules: an int column from an integer, a
+    real or a text field (blank or NA is NULL), a date column from a date or a
+    text field; anything else as text.
+
+    Raises:
+        ValueError: If the stored value is not a whole number or not a date.
+    """
     if not feature.IsFieldSetAndNotNull(index):
         return None
-    if column is not None and column.type == 'date':
-        return parse_date(feature.GetFieldAsString(index))
-    if column is not None and column.type == 'int':
-        return feature.GetFieldAsInteger(index)
-    return feature.GetFieldAsString(index)
+    if column is None or column.type == 'str':
+        return feature.GetFieldAsString(index)
+    from osgeo import ogr
+
+    kind = feature.GetFieldDefnRef(index).GetType()
+    if column.type == 'int' and kind in (ogr.OFTInteger, ogr.OFTInteger64):
+        return feature.GetFieldAsInteger64(index)
+    if column.type == 'int' and kind == ogr.OFTReal:
+        return _coerce(column, feature.GetFieldAsDouble(index))
+    return _coerce(column, feature.GetFieldAsString(index))
+
+
+def _read_feature(feature, names: list[str], columns: dict[str, Column], path: str) -> dict:
+    """A feature's fields by the index's rules; a value the rules refuse names the cell and the column."""
+    row, problems = {}, []
+    for i, name in enumerate(names):
+        try:
+            row[name] = _ogr_value(feature, i, columns.get(name))
+        except ValueError as e:
+            problems.append(f'{name} {e}')
+    if problems:
+        cell = str(row.get('cell_id') or '?').upper()
+        raise ValueError(f'{os.path.basename(path)}: cell {cell}: ' + '; '.join(problems))
+    return row
 
 
 def _read_ogr(path: str, driver_name: str | None = None) -> DtedIndex:
@@ -517,9 +623,7 @@ def _read_ogr(path: str, driver_name: str | None = None) -> DtedIndex:
         elif not _holds_header_column(names):
             raise _not_an_index(path, 'it has neither the index metadata nor a header column', names, 'columns')
     for feature in cells:
-        row = {}
-        for i, name in enumerate(names):
-            row[name] = _ogr_value(feature, i, COLUMNS_BY_NAME.get(name))
+        row = _read_feature(feature, names, COLUMNS_BY_NAME, path)
         cell = str(row.get('cell_id') or '').upper()
         if not cell:
             continue
@@ -531,7 +635,7 @@ def _read_ogr(path: str, driver_name: str | None = None) -> DtedIndex:
         names = [definition.GetFieldDefn(i).GetName() for i in range(definition.GetFieldCount())]
         columns = {c.name: c for c in SUBREGION_COLUMNS}
         for feature in outlines:
-            item = {name: _ogr_value(feature, i, columns.get(name)) for i, name in enumerate(names)}
+            item = _read_feature(feature, names, columns, path)
             geometry = feature.GetGeometryRef()
             ring = parse_polygon_wkb(bytes(geometry.ExportToWkb())) if geometry is not None else []
             item['outline'] = [(lat, lon) for lon, lat in ring]
@@ -630,9 +734,7 @@ def _read_parquet(path: str) -> DtedIndex:
         cell = str(record.get('cell_id') or '').upper()
         if not cell:
             continue
-        for column in INDEX_COLUMNS:
-            if column.name in record and column.type == 'date':
-                record[column.name] = parse_date(record[column.name])
+        _coerce_record(record, INDEX_COLUMNS, path, cell)
         record['cell_id'] = cell
         _add_row(index, cell, record)
     sub_path = _subregions_path(path)
@@ -642,6 +744,7 @@ def _read_parquet(path: str) -> DtedIndex:
             ring = parse_polygon_wkb(blob) if blob else []
             record['outline'] = [(lat, lon) for lon, lat in ring]
             cell = str(record.get('cell_id') or '').upper()
+            _coerce_record(record, SUBREGION_COLUMNS, sub_path, cell)
             record['cell_id'] = cell
             index.subregions.setdefault(cell, []).append(record)
     return index
@@ -654,6 +757,7 @@ def write_index(
     meta: dict | None = None,
     *,
     level: int | None = None,
+    all_columns: bool = False,
 ) -> DtedIndex:
     """Write an index (.gpkg or .parquet) and return it as loaded.
 
@@ -661,7 +765,7 @@ def write_index(
     subregion is a dict with ``cell_id``, ``seq``, the four accuracies and an
     ``outline`` of (lat, lon) pairs. A column that is NULL in every row is
     left out of the file (see :func:`columns_to_write`), and out of the
-    returned index.
+    returned index, unless *all_columns* asks for the complete table.
     """
     driver = _driver_for(path)
     prepared_rows = _prepare_rows(rows)
@@ -670,7 +774,7 @@ def write_index(
         if cell not in prepared_rows:
             raise ValueError(f'Subregions for {cell}, which has no row in the index')
     table = _meta_for(prepared_rows, meta, level)
-    columns = columns_to_write(prepared_rows)
+    columns = columns_to_write(prepared_rows, all_columns=all_columns)
     if driver == 'gpkg':
         _write_gpkg(path, prepared_rows, prepared_subregions, table, columns)
     elif _parquet_available():
@@ -687,8 +791,31 @@ def write_index(
     return DtedIndex(path=path, rows=rows_as_written, subregions=prepared_subregions, meta=table)
 
 
+def _check_meta_level(index: DtedIndex) -> None:
+    """Refuse a level in the index metadata that is not 0, 1 or 2 (another tool's 'DTED2')."""
+    value = index.meta.get('dted_level')
+    if value in (None, '') or _as_int(value) in (0, 1, 2):
+        return
+    where = META_TABLE if index.path.lower().endswith('.gpkg') else 'the index metadata'
+    raise ValueError(f'{os.path.basename(index.path)}: {where} says dted_level {value!r}, which is not 0, 1 or 2')
+
+
 def read_index(path: str) -> DtedIndex:
-    """Load an index from a .gpkg or .parquet file."""
+    """Load an index from a .gpkg or .parquet file.
+
+    Raises:
+        FileNotFoundError: If there is no such file.
+        ValueError: If the file is not an index, a value is not what its
+            column holds (a text accuracy that is not a whole number or NA, a
+            text date that is not a date), or the metadata level is not 0-2.
+        RuntimeError: If a GeoParquet file cannot be read for lack of a reader.
+    """
+    index = _read_index(path)
+    _check_meta_level(index)
+    return index
+
+
+def _read_index(path: str) -> DtedIndex:
     if not os.path.isfile(path):
         raise FileNotFoundError(f'Index not found: {path}')
     driver = _driver_for(path)
@@ -708,7 +835,7 @@ def read_index(path: str) -> DtedIndex:
             names = [definition.GetFieldDefn(i).GetName() for i in range(definition.GetFieldCount())]
             columns = {c.name: c for c in SUBREGION_COLUMNS}
             for feature in layer:
-                item = {name: _ogr_value(feature, i, columns.get(name)) for i, name in enumerate(names)}
+                item = _read_feature(feature, names, columns, sub_path)
                 geometry = feature.GetGeometryRef()
                 ring = parse_polygon_wkb(bytes(geometry.ExportToWkb())) if geometry is not None else []
                 item['outline'] = [(lat, lon) for lon, lat in ring]
@@ -720,9 +847,25 @@ def read_index(path: str) -> DtedIndex:
     raise RuntimeError('Reading a GeoParquet index needs pyarrow or a GDAL with the Parquet driver')
 
 
-def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]:
+def validate_index(
+    index: DtedIndex,
+    *,
+    level: int | None = None,
+    supplied: Iterable[str] = (),
+    profile_values: dict | None = None,
+) -> list[Issue]:
     """Problems with an index: cells with several rows, bad keys, values out
-    of range, level mismatch, subregion rules, missing required columns."""
+    of range, level mismatch, subregion rules, missing required columns.
+
+    *supplied* names the header fields a run gives every cell (its
+    ``--dted-set`` overrides): the index may leave them out, or NULL, without
+    a warning, and its own values for them are not checked against FIPS 10-4,
+    since no header gets them. *profile_values* are the profile's product
+    values: a NULL accuracy column is reported as information, or as a warning
+    when the profile holds a number for it, since the header will say NA and
+    not that number.
+    """
+    supplied = set(supplied)
     issues: list[Issue] = []
     if index.duplicates:
         shown = ', '.join(f'{cell} ({count} rows)' for cell, count in sorted(index.duplicates.items())[:5])
@@ -731,13 +874,14 @@ def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]
                                                          f'{shown}{more}; an index holds one row per cell'))
     present = index.columns
     for column in INDEX_COLUMNS:
-        if column.required and column.name not in present:
+        if column.required and column.name not in present and column.name not in supplied:
             issues.append(Issue('warning', 'INDEX', column.name,
                                 'required column is missing; the profile must supply it for every cell'))
     if level is not None and index.level is not None and index.level != level:
         issues.append(Issue('error', 'INDEX', 'dted_level', f'the index is for level {index.level}, not {level}'))
     blank_required: dict[str, list[str]] = {}
     nation_warnings: dict[str, list[str]] = {}
+    null_accuracies: dict[str, list[str]] = {}
     for cell, row in sorted(index.rows.items()):
         try:
             parse_cell_id(cell)
@@ -751,19 +895,20 @@ def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]
             if problem:
                 issues.append(Issue('error', 'INDEX', f'{cell}.{column.name}', problem))
         row_level = row.get('dted_level')
-        if row_level is not None and level is not None and int(row_level) != level:
+        if row_level is not None and level is not None and _as_int(row_level) not in (None, level):
             issues.append(Issue('error', 'INDEX', f'{cell}.dted_level',
                                 f'{row_level} is not the requested level {level}'))
         for name in ACCURACY_COLUMNS:
             if name in row and row[name] is None:
-                issues.append(Issue('info', 'INDEX', f'{cell}.{name}', 'NULL, so the header will say NA'))
+                null_accuracies.setdefault(name, []).append(cell)
         for column in HEADER_COLUMNS:
-            if column.required and column.name not in ACCURACY_COLUMNS and column.name in row:
+            if (column.required and column.name not in ACCURACY_COLUMNS and column.name in row
+                    and column.name not in supplied):
                 value = row[column.name]
                 if value is None or (isinstance(value, str) and not value.strip()):
                     blank_required.setdefault(column.name, []).append(cell)
         producer = row.get('producer_code')
-        if isinstance(producer, str) and producer.strip():
+        if isinstance(producer, str) and producer.strip() and 'producer_code' not in supplied:
             nation = producer_code_warning(producer)
             if nation:
                 nation_warnings.setdefault(nation, []).append(cell)
@@ -774,6 +919,19 @@ def validate_index(index: DtedIndex, *, level: int | None = None) -> list[Issue]
     for message, cells in sorted(nation_warnings.items()):
         shown = ', '.join(cells[:5]) + (f' and {len(cells) - 5} more' if len(cells) > 5 else '')
         issues.append(Issue('warning', 'INDEX', 'producer_code', f'{message}; {len(cells)} cell(s): {shown}'))
+    for name in ACCURACY_COLUMNS:
+        cells = null_accuracies.get(name)
+        if not cells:
+            continue
+        shown = ', '.join(cells[:5]) + (f' and {len(cells) - 5:,} more' if len(cells) > 5 else '')
+        number = _accuracy_number((profile_values or {}).get(name))
+        if number is None:
+            issues.append(Issue('info', 'INDEX', name,
+                                f'NULL in {len(cells):,} cell(s) ({shown}); the header will say NA'))
+        else:
+            issues.append(Issue('warning', 'INDEX', name,
+                                f"NULL in {len(cells):,} cell(s) ({shown}): the header will say NA, not the profile's "
+                                f'{number} m; a NULL accuracy never falls through to the profile'))
     for cell, items in sorted(index.subregions.items()):
         if cell not in index.rows:
             issues.append(Issue('error', 'INDEX', cell, 'subregions for a cell that has no row'))
@@ -809,3 +967,161 @@ def new_row(cell_id: str, **values) -> dict:
     row['cell_id'] = make_cell_id(*parse_cell_id(cell_id))
     row.update(values)
     return row
+
+
+# -- The field tables of docs/dted_index.md, generated so they cannot drift ------
+
+# How EGMTrans fills every header field that has no index column.
+_GEOMETRY = 'derived from the cell geometry'
+_RESERVED = 'blank (reserved)'
+_SUBREGIONS = 'from the subregions layer `dted_acc_subregions`; the no-subregion value without one'
+FILLED_BY: dict[str, str] = {
+    'uhl.sentinel': 'fixed by the standard: `UHL`',
+    'uhl.fixed': 'fixed by the standard: `1`',
+    'uhl.origin_lon': _GEOMETRY,
+    'uhl.origin_lat': _GEOMETRY,
+    'uhl.lon_interval': _GEOMETRY,
+    'uhl.lat_interval': _GEOMETRY,
+    'uhl.abs_vert_acc': 'copied from the ACC absolute vertical accuracy',
+    'uhl.security_code': 'copied from the DSI security code',
+    'uhl.lon_lines': _GEOMETRY,
+    'uhl.lat_points': _GEOMETRY,
+    'uhl.multiple_accuracy': _SUBREGIONS,
+    'uhl.reserved': _RESERVED,
+    'dsi.sentinel': 'fixed by the standard: `DSI`',
+    'dsi.reserved_1': _RESERVED,
+    'dsi.series': 'derived from the level: `DTED0`, `DTED1` or `DTED2`',
+    'dsi.reserved_2': _RESERVED,
+    'dsi.reserved_3': _RESERVED,
+    'dsi.reserved_4': _RESERVED,
+    'dsi.origin_lat': _GEOMETRY,
+    'dsi.origin_lon': _GEOMETRY,
+    'dsi.sw_lat': _GEOMETRY,
+    'dsi.sw_lon': _GEOMETRY,
+    'dsi.nw_lat': _GEOMETRY,
+    'dsi.nw_lon': _GEOMETRY,
+    'dsi.ne_lat': _GEOMETRY,
+    'dsi.ne_lon': _GEOMETRY,
+    'dsi.se_lat': _GEOMETRY,
+    'dsi.se_lon': _GEOMETRY,
+    'dsi.orientation': 'fixed by the standard: `0000000.0`',
+    'dsi.lat_interval': _GEOMETRY,
+    'dsi.lon_interval': _GEOMETRY,
+    'dsi.lat_lines': _GEOMETRY,
+    'dsi.lon_lines': _GEOMETRY,
+    'dsi.partial_cell': 'derived from the data: the share of void posts',
+    'acc.sentinel': 'fixed by the standard: `ACC`',
+    'acc.reserved_1': _RESERVED,
+    'acc.reserved_2': _RESERVED,
+    'acc.outline_flag': _SUBREGIONS,
+    'acc.subregions': _SUBREGIONS,
+    'acc.nima_trailer': 'blank (reserved for NIMA use)',
+    'acc.reserved_trailer': _RESERVED,
+}
+
+# What a column holds beyond its type, for the index note.
+INDEX_NOTES: dict[str, str] = {
+    'cell_id': 'N or S and two digits, then E or W and three digits (N38E045); the key',
+    'dted_level': '0, 1 or 2, the level the row describes; checked against the run',
+    'security_code': 'U, R, C or S; also written to UHL 33-35',
+    'security_control': 'blank allowed',
+    'unique_ref_uhl': 'blank allowed',
+    'unique_ref_dsi': 'zero filled when nothing supplies it',
+    'match_merge_version': 'one letter A-Z',
+    'maintenance_date': 'NULL writes 0000',
+    'match_merge_date': 'NULL writes 0000',
+    'maintenance_code': '0000, or a letter and three digits',
+    'producer_code': 'a FIPS 10-4 country code first (US, UK, GM, FR, ...), then up to six characters of the producer',
+    'product_spec': 'PRF89020B for this specification',
+    'product_spec_amend': 'two digits; 00',
+    'product_spec_date': '2000-05 for this specification',
+    'vertical_datum': 'MSL, E96 or E08; compared with the output, which is always E96',
+    'horizontal_datum': 'WGS84; compared with the output',
+    'compilation_date': 'the month the cell is made; usually given at run time with --dted-set compilation_date=today',
+    'abs_vert_acc': 'also written to UHL 29-32',
+    'partial_cell': 'the header gets its own value from the data',
+    'updated': 'ISO time of the row\'s last write',
+}
+COLUMN_TABLE_HEADINGS = ('#', 'Column', 'Header field', 'Record', 'Characters', 'Status', 'Required', 'Index note')
+DERIVED_TABLE_HEADINGS = ('#', 'Header field', 'Record', 'Characters', 'Value')
+
+
+def _characters(item) -> str:
+    """The specification's one-based character positions of a field."""
+    return str(item.start) if item.length == 1 else f'{item.start}-{item.start + item.length - 1}'
+
+
+def _type_note(column: Column) -> str:
+    if column.type == 'int':
+        if column.name in ACCURACY_COLUMNS:
+            return 'whole meters 0-9999; NULL means NA and never falls through to the profile'
+        low, high = _RANGES.get(column.name, (None, None))
+        return f'integer {low}-{high}' if low is not None else 'integer'
+    if column.type == 'date':
+        return 'date YYYY-MM, 1980-2079, written as YYMM' if column.dted_key else 'date, any year'
+    if column.max_len == 1:
+        return 'one character'
+    return f'text, up to {column.max_len} characters' if column.max_len else 'text'
+
+
+def column_table_rows() -> list[dict]:
+    """The index columns, one row each, as the documentation table shows them."""
+    rows = []
+    for number, column in enumerate(INDEX_COLUMNS, start=1):
+        item = FIELDS_BY_KEY[column.dted_key] if column.dted_key else None
+        if column.name in ('cell_id', 'dted_level'):
+            status = 'key'
+        elif column.check_only:
+            status = 'check only'
+        elif column.dted_key:
+            status = 'written'
+        else:
+            status = 'catalog'
+        note = _type_note(column)
+        if column.name in INDEX_NOTES:
+            note += '; ' + INDEX_NOTES[column.name]
+        rows.append({
+            '#': number, 'Column': f'`{column.name}`', 'Header field': item.title if item else '',
+            'Record': item.record if item else '', 'Characters': _characters(item) if item else '',
+            'Status': status, 'Required': 'required' if column.required else 'optional', 'Index note': note,
+        })
+    return rows
+
+
+def derived_table_rows() -> list[dict]:
+    """The header fields with no index column, one row each, with where their value comes from."""
+    indexed = {column.dted_key for column in INDEX_COLUMNS if column.dted_key}
+    rows = []
+    for item in ALL_FIELDS:
+        if item.key in indexed:
+            continue
+        rows.append({'#': len(rows) + 1, 'Header field': item.title, 'Record': item.record,
+                     'Characters': _characters(item), 'Value': FILLED_BY[item.key]})
+    return rows
+
+
+def _markdown_table(rows: list[dict], headings: tuple[str, ...]) -> str:
+    lines = ['| ' + ' | '.join(headings) + ' |', '|' + '---|' * len(headings)]
+    lines.extend('| ' + ' | '.join(str(row[heading]) for heading in headings) + ' |' for row in rows)
+    return '\n'.join(lines)
+
+
+def render_column_tables(fmt: str = 'markdown') -> str:
+    """The two tables of docs/dted_index.md as Markdown, or the index columns as CSV."""
+    if fmt == 'csv':
+        import csv
+        import io
+
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=COLUMN_TABLE_HEADINGS, lineterminator='\n')
+        writer.writeheader()
+        for row in column_table_rows():
+            writer.writerow({key: str(value).replace('`', '') for key, value in row.items()})
+        return buffer.getvalue()
+    return (
+        '**Index columns** (layer `dted_cells`; the number is the order the index writes them in)\n\n'
+        + _markdown_table(column_table_rows(), COLUMN_TABLE_HEADINGS)
+        + '\n\n**Header fields EGMTrans fills itself** (no index column: the value comes from the cell, the data, '
+        'the subregions layer or the standard)\n\n'
+        + _markdown_table(derived_table_rows(), DERIVED_TABLE_HEADINGS) + '\n'
+    )
