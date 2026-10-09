@@ -4,7 +4,7 @@
 # target, with the network off. Every input is synthetic: the self-test's tiles.
 #
 #   docker/smoke_test.sh                   build egmtrans:smoke, then test it
-#   docker/smoke_test.sh egmtrans:1.10.0   test an image that is already built
+#   docker/smoke_test.sh egmtrans:1.10.1   test an image that is already built
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
