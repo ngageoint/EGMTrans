@@ -16,6 +16,7 @@ from egmtrans.tiling import (
     extract_edges,
     find_seams,
     format_boundary_report,
+    format_tile_patches,
     merge_patches,
     single_tile_water_bodies,
 )
@@ -172,6 +173,28 @@ class TestMerge:
         a, b = self._pair(height_b=15001)
         _, bodies = merge_patches([a, b], find_seams([a, b]))
         assert len(bodies) == 2
+
+    def test_height_conflict_note_lands_on_the_body_concerned(self):
+        """The note about a seam whose two sides differ in height is listed under
+        the water body on side a, not under the largest body of the run."""
+        far = (20.5, 1.0, 0.0, 4.5, 0.0, -1.0)  # x = 21..25: no seam with the pair
+        a = _tile(1, _band(2), GT_A, {2: (15000, 149.6, 10)})
+        b = _tile(2, _band(3), GT_SHARED_EAST, {3: (15100, 149.4, 15)})
+        c = _tile(3, _band(4), far, {4: (20000, 199.0, 1000)})
+        _, bodies = merge_patches([a, b, c], find_seams([a, b, c]))
+        assert bodies[0].members == [(3, 4)] and bodies[0].notes == []
+        noted = [body for body in bodies if body.notes]
+        assert len(noted) == 1 and noted[0].members == [(1, 2)]
+        assert noted[0].notes == ["tile1.dt0:E is 150.00 m where tile2.dt0:W is 151.00 m; the two were kept separate"]
+
+        # When side a is not water, the note goes to side b's body; when neither is, it is dropped.
+        a = _tile(1, _band(2), GT_A, {2: (15000, 149.6, 10, 0, 100)})
+        _, bodies = merge_patches([a, b, c], find_seams([a, b, c]))
+        noted = [body for body in bodies if body.notes]
+        assert len(noted) == 1 and noted[0].members == [(2, 3)]
+        b = _tile(2, _band(3), GT_SHARED_EAST, {3: (15100, 149.4, 15, 0, 100)})
+        _, bodies = merge_patches([a, b, c], find_seams([a, b, c]))
+        assert not any(body.notes for body in bodies)
 
     def test_one_centimeter_steps_do_not_chain(self):
         """A 1 cm tolerance joined 150.00 to 150.01 and 150.01 to 150.02 but not
@@ -387,6 +410,7 @@ class TestReport:
         text = "\n".join(lines)
         assert "150.00 m" in text and "149.41 m (149 m)" in text
         assert "tile1.dt0:W" in text
+        assert "tile1.dt0:W*,E  tile2.dt0:W (context)" in text
         assert "1 water body spans more than one tile" in text and "1 touch the run boundary" in text
 
     def test_context_tile_is_marked(self):
@@ -406,11 +430,79 @@ class TestReport:
         assert sum(1 for line in lines if line.strip().endswith("tile1.dt0:N")) == 100
         assert any(line.strip() == "... and 50 more" for line in lines)
 
-    def test_no_open_bodies_gives_the_summary_only(self):
+    def test_interior_spanning_body_is_listed(self):
+        """A lake inside the run that spans two tiles is named, not only counted."""
         a = _tile(1, _band(2, cols=slice(2, 5)), GT_A, {2: (15000, 149.41, 6)})
         b = _tile(2, _band(3, cols=slice(0, 3)), GT_SHARED_EAST, {3: (15000, 149.55, 6)})
         _, bodies = merge_patches([a, b], find_seams([a, b]))
         lines = format_boundary_report(bodies, [a, b])
-        assert lines == [
+        text = "\n".join(lines)
+        assert lines[0].startswith("Columns:")
+        assert "Water bodies that span more than one tile, set to one level each:" in lines
+        rows = [line for line in lines if "tile1.dt0:E  tile2.dt0:W" in line]
+        assert len(rows) == 1 and "*" not in rows[0] and "149.41 m (149 m)" in rows[0]
+        assert "touching an edge of this run" not in text and "open edges" not in text
+        assert lines[-1] == (
             "1 water body spans more than one tile and was set to one level each; 0 touch the run boundary."
+        )
+
+    def test_spanning_table_is_capped(self):
+        from egmtrans.tiling import Crossing
+
+        a = _tile(1, np.zeros((5, 5)), GT_A, {})
+        b = _tile(2, np.zeros((5, 5)), GT_SHARED_EAST, {})
+        bodies = [
+            WaterBody(
+                height_cm=100 * i, level=float(i), posts=10, members=[(1, i + 2), (2, i + 2)],
+                crossings=[Crossing(1, "E", 4.0, 1.0, 2.0), Crossing(2, "W", 4.0, 1.0, 2.0)],
+            )
+            for i in range(150)
         ]
+        lines = format_boundary_report(bodies, [a, b], limit=100)
+        assert sum(1 for line in lines if line.endswith("tile1.dt0:E  tile2.dt0:W")) == 100
+        assert any(line.strip() == "... and 50 more" for line in lines)
+        assert not any("open edges" in line for line in lines)
+        assert lines[-1].startswith("150 water bodies span more than one tile")
+
+    def test_finished_tile_is_marked(self):
+        a = _tile(1, _band(2, cols=slice(2, 5)), GT_A, {2: (15000, 149.41, 6)})
+        b = _tile(2, _band(3), GT_SHARED_EAST, {3: (15000, 149.55, 10)}, output=False)
+        b.finished = True
+        _, bodies = merge_patches([a, b], find_seams([a, b]))
+        lines = format_boundary_report(bodies, [a, b])
+        text = "\n".join(lines)
+        assert "tile1.dt0:E  tile2.dt0:W,E* (finished)" in text
+        assert "tile2.dt0:E (finished)" in text
+        assert not any("(context)" in line for line in lines[2:]), "the legend alone may say (context)"
+
+    def test_notes_are_capped(self):
+        tile = _tile(1, np.zeros((5, 5)), GT_A, {})
+        body = WaterBody(height_cm=15000, level=149.0, posts=10, members=[(1, 2)], notes=[f"n{i}" for i in range(7)])
+        lines = format_boundary_report([body], [tile], limit=5)
+        assert sum(1 for line in lines if line.startswith("  note: water body at 150.00 m: n")) == 5
+        assert lines[-1] == "  ... and 2 more notes"
+
+
+class TestTilePatches:
+    def test_line_lists_the_largest_first_with_their_sides(self):
+        labeled = np.zeros((8, 8), dtype=np.int32)
+        labeled[0, 0:4] = 2      # N and W
+        labeled[0, 5:8] = 3      # N and E
+        labeled[7, 0:3] = 4      # S and W
+        labeled[7, 4:8] = 5      # S and E
+        labeled[2:4, 0] = 6      # W
+        labeled[2:5, 7] = 7      # E
+        labeled[5, 0] = 8        # W
+        gt = (-0.5, 1.0, 0.0, 7.5, 0.0, -1.0)
+        patches = {2: (15000, 149.6, 40), 3: (15100, 150.6, 30), 4: (15200, 151.6, 25), 5: (15300, 152.6, 2000),
+                   6: (15400, 153.6, 15), 7: (15500, 154.6, 10), 8: (15600, 155.6, 5)}
+        tile = _tile(1, labeled, gt, patches, output=False)
+        assert format_tile_patches(tile) == (
+            "tile1.dt0 (context): 7 edge-touching flat area(s): 153.00 m (2,000 posts, S,E), "
+            "150.00 m (40 posts, N,W), 151.00 m (30 posts, N,E), 152.00 m (25 posts, S,W), "
+            "154.00 m (15 posts, W) and 2 more."
+        )
+
+    def test_empty_form(self):
+        tile = _tile(1, np.zeros((5, 5)), GT_A, {})
+        assert format_tile_patches(tile) == "tile1.dt0: no flat area reaches a tile edge."

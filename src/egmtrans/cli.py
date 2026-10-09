@@ -70,8 +70,9 @@ def log_numba_availability() -> None:
         logger.info(f'Numba {numba.__version__} is available: compiled kernels are in use.')
     else:
         logger.warning(
-            'Numba is not available: the kernels run as plain Python, which is much slower on large tiles. '
-            'A custom ArcGIS Pro environment with Numba installed is faster; the results are the same.'
+            'Numba is not available in this environment: the run uses plain Python, 20 to 50 times slower on '
+            'large tiles. Install numba in a cloned ArcGIS Pro environment (Package Manager), make it the active '
+            'environment and restart ArcGIS Pro; the results are the same.'
         )
 
 
@@ -157,7 +158,10 @@ def _configure_runtime(arc_mode: bool) -> None:
         init_arcpy()
         log_numba_availability()
     elif not NUMBA_AVAILABLE:
-        logger.warning("Numba is not available. Processing will be slower.")
+        logger.warning(
+            'Numba is not available: the run uses plain Python, 20 to 50 times slower on large tiles; the results '
+            'are the same. Install numba in this environment (conda install numba).'
+        )
 
 
 def file_datum_of(input_file: str) -> str | None:
@@ -623,7 +627,8 @@ def main() -> None:
     parser.add_argument(
         "--skip-existing", action="store_true",
         help="Leave a planned output that already exists and verifies as finished alone, so a cancelled or "
-             "failed run can be rerun without redoing the cells it wrote.",
+             "failed run can be rerun without redoing the cells it wrote. The inputs of skipped outputs are still "
+             "analyzed, so water levels match an uninterrupted run.",
     )
     parser.add_argument(
         "--dted-set", action="append", default=[], metavar="FIELD=VALUE",
@@ -688,6 +693,8 @@ def main() -> None:
         for issue in issues:
             if issue.severity == 'error':
                 logger.error(str(issue))
+            elif issue.severity == 'warning':
+                logger.warning(str(issue))
         if count_issues(issues, 'error'):
             logger.error("The DTED metadata index is not valid; see 'egmtrans dted-index validate'.")
             end_logger(save_log=args.log_file)

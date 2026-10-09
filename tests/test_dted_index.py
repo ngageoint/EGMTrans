@@ -141,7 +141,7 @@ def test_validate_index_reports_problems():
     assert any('leaves the cell' in m for m in messages)
     assert any('no row' in m for m in messages)
     assert any('2 vertices' in m for m in messages)
-    assert any('NULL, so the header will say NA' in m for m in messages)
+    assert any('abs_vert_acc' in m and 'the header will say NA' in m for m in messages)
 
 
 def test_polygon_helpers():
@@ -580,3 +580,138 @@ def test_a_blank_required_value_is_null_and_reported(tmp_dir):
     assert len(blank) == 1 and blank[0].severity == 'warning'
     assert 'N06E126' in blank[0].message and 'N06E127' in blank[0].message
     assert 'the profile must supply it' in blank[0].message
+
+
+# -- 1.10.1: the complete index, typed reads, aggregated accuracy lines ---------
+
+@pytest.mark.parametrize('extension', FORMATS)
+def test_all_columns_writes_every_column(tmp_dir, extension):
+    from egmtrans.dted.index import INDEX_COLUMNS
+
+    rows = {
+        'N03E008': new_row('N03E008', security_code='U', data_edition=1, abs_vert_acc=7),
+        'N04E008': new_row('N04E008', security_code='U', data_edition=1, abs_vert_acc=None),
+    }
+    sparse = write_index(os.path.join(tmp_dir, f'sparse.{extension}'), rows, level=2)
+    assert 'rel_horiz_acc' not in sparse.columns and 'producer_code' not in sparse.columns
+    path = os.path.join(tmp_dir, f'complete.{extension}')
+    written = write_index(path, rows, level=2, all_columns=True)
+    every = {column.name for column in INDEX_COLUMNS}
+    assert written.columns == every
+    index = read_index(path)
+    assert index.columns == every and len(index) == 2
+    row = index.get('N04E008')
+    assert row['abs_vert_acc'] is None and row['producer_code'] is None and row['compilation_date'] is None
+    assert row['security_code'] == 'U' and index.get('N03E008')['abs_vert_acc'] == 7
+
+
+def test_null_accuracies_are_reported_once_per_column():
+    index = DtedIndex(path='<memory>', rows={
+        'N03E008': new_row('N03E008', security_code='U', abs_horiz_acc=None, abs_vert_acc=None, rel_vert_acc=4),
+        'N04E008': new_row('N04E008', security_code='U', abs_horiz_acc=None, abs_vert_acc=3, rel_vert_acc=None),
+    })
+    issues = [issue for issue in validate_index(index) if 'the header will say NA' in issue.message]
+    by_key = {issue.key: issue for issue in issues}
+    # new_row holds every column, so rel_horiz_acc is NULL in both rows too.
+    assert sorted(by_key) == ['abs_horiz_acc', 'abs_vert_acc', 'rel_horiz_acc', 'rel_vert_acc'], 'one line per column'
+    assert by_key['abs_horiz_acc'].severity == 'info'
+    assert by_key['abs_horiz_acc'].message.startswith('NULL in 2 cell(s) (N03E008, N04E008)')
+    assert by_key['abs_vert_acc'].message.startswith('NULL in 1 cell(s) (N03E008)')
+    # Over a profile that holds a number, the line is a warning: the NULL writes NA, not the number.
+    issues = validate_index(index, profile_values={'abs_horiz_acc': 14, 'abs_vert_acc': 'NA', 'rel_vert_acc': '9'})
+    by_key = {issue.key: issue for issue in issues if 'the header will say NA' in issue.message}
+    assert by_key['abs_horiz_acc'].severity == 'warning' and "not the profile's 14 m" in by_key['abs_horiz_acc'].message
+    assert 'never falls through to the profile' in by_key['abs_horiz_acc'].message
+    assert by_key['abs_vert_acc'].severity == 'info'
+    assert by_key['rel_vert_acc'].severity == 'warning' and "not the profile's 9 m" in by_key['rel_vert_acc'].message
+
+
+def _cells_layer(path, fields, rows):
+    """A dted_cells layer with the given OGR field types (name, ogr type) and rows."""
+    from osgeo import ogr, osr
+
+    driver = ogr.GetDriverByName('GPKG')
+    source = driver.CreateDataSource(path)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    layer = source.CreateLayer('dted_cells', srs, ogr.wkbPolygon)
+    for name, kind in fields:
+        layer.CreateField(ogr.FieldDefn(name, kind))
+    for values in rows:
+        feature = ogr.Feature(layer.GetLayerDefn())
+        for (name, _kind), value in zip(fields, values):
+            if value is None:
+                feature.SetFieldNull(name)
+            else:
+                feature.SetField(name, value)
+        feature.SetGeometry(ogr.CreateGeometryFromWkt(polygon_wkt(cell_polygon(values[0]))))
+        layer.CreateFeature(feature)
+        feature = None
+    source = None
+    return path
+
+
+def test_text_typed_values_are_read_by_the_index_rules(tmp_dir):
+    """A spreadsheet round trip types the accuracies as text: 'NA' must stay NA, not become 0 m."""
+    from osgeo import ogr
+
+    fields = [('cell_id', ogr.OFTString), ('abs_vert_acc', ogr.OFTString), ('rel_vert_acc', ogr.OFTString),
+              ('abs_horiz_acc', ogr.OFTReal), ('data_edition', ogr.OFTString), ('compilation_date', ogr.OFTString)]
+    path = _cells_layer(os.path.join(tmp_dir, 'typed.gpkg'), fields, [
+        ('N03E008', 'NA', '12', 12.0, '', '2024-07'),
+        ('N04E008', '0012', ' 7 ', None, '3', '2024/07/01'),
+    ])
+    index = read_index(path)
+    row = index.get('N03E008')
+    assert row['abs_vert_acc'] is None and row['rel_vert_acc'] == 12 and row['abs_horiz_acc'] == 12
+    assert row['data_edition'] is None and row['compilation_date'] == dt.date(2024, 7, 1)
+    row = index.get('N04E008')
+    assert row['abs_vert_acc'] == 12 and row['rel_vert_acc'] == 7 and row['data_edition'] == 3
+    assert not [issue for issue in validate_index(index) if issue.severity == 'error']
+
+    for value, column, reason in [
+        ('12.7', 'abs_vert_acc', "abs_vert_acc '12.7' is not a whole number of meters"),
+        ('abc', 'rel_vert_acc', "rel_vert_acc 'abc' is not a whole number of meters"),
+        (12.5, 'abs_horiz_acc', 'abs_horiz_acc 12.5 is not a whole number of meters'),
+        ('0724', 'compilation_date', "compilation_date not a date (YYYY-MM or YYYY-MM-DD): '0724'"),
+    ]:
+        values = {'cell_id': 'N05E008', 'abs_vert_acc': '5', 'rel_vert_acc': '5', 'abs_horiz_acc': 5.0,
+                  'data_edition': '1', 'compilation_date': '2024-07'}
+        values[column] = value
+        bad = _cells_layer(os.path.join(tmp_dir, f'bad_{column}.gpkg'), fields,
+                           [tuple(values[name] for name, _ in fields)])
+        with pytest.raises(ValueError, match=f'cell N05E008: {reason}'.replace('(', r'\(').replace(')', r'\)')):
+            read_index(bad)
+
+
+@pytest.mark.skipif('parquet' not in FORMATS, reason='no GeoParquet reader')
+def test_parquet_strings_and_floats_are_read_by_the_index_rules(tmp_dir):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def table(abs_vert, rel_vert):
+        return pa.table({
+            'cell_id': pa.array(['N03E008', 'N04E008']), 'security_code': pa.array(['U', 'U']),
+            'abs_vert_acc': pa.array(abs_vert, pa.string()), 'rel_vert_acc': pa.array(rel_vert, pa.float64()),
+        })
+
+    path = os.path.join(tmp_dir, 'typed.parquet')
+    pq.write_table(table(['NA', '12'], [12.0, None]), path)
+    index = read_index(path)
+    assert index.get('N03E008')['abs_vert_acc'] is None and index.get('N04E008')['abs_vert_acc'] == 12
+    assert index.get('N03E008')['rel_vert_acc'] == 12 and index.get('N04E008')['rel_vert_acc'] is None
+    pq.write_table(table(['12.7', '12'], [12.0, 12.5]), path)
+    with pytest.raises(ValueError, match="cell N03E008: abs_vert_acc '12.7' is not a whole number of meters"):
+        read_index(path)
+
+
+def test_a_bad_level_in_the_meta_table_names_the_file(tmp_dir):
+    path = os.path.join(tmp_dir, 'index.gpkg')
+    write_index(path, sample_rows(), meta={'dted_level': 'DTED2'})
+    message = r"index.gpkg: dted_index_meta says dted_level .DTED2., which is not 0, 1 or 2"
+    with pytest.raises(ValueError, match=message):
+        read_index(path)
+    # A row level that is not an integer is a finding, not a traceback.
+    index = DtedIndex(path='<memory>', rows={'N03E008': {'cell_id': 'N03E008', 'dted_level': 'x'}})
+    messages = [str(issue) for issue in validate_index(index, level=2)]
+    assert any("'x' is not an integer" in m for m in messages)

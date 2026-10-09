@@ -65,3 +65,29 @@ def set_quiet(value: bool) -> None:
     """Set or clear the quiet mode of the ArcGIS Pro log handler."""
     global _quiet
     _quiet = value
+
+
+_header_warnings: dict[str, list[str]] | None = None
+
+
+def begin_header_warnings() -> None:
+    """Start collecting the per-cell DTED header warnings of a batch for one summary at its end."""
+    global _header_warnings
+    _header_warnings = {}
+
+
+def tally_header_warning(message: str, cell: str) -> bool:
+    """Record a header warning of *cell* when a tally is active; True when it was recorded."""
+    if _header_warnings is None:
+        return False
+    cells = _header_warnings.setdefault(message, [])
+    if cell not in cells:
+        cells.append(cell)
+    return True
+
+
+def end_header_warnings() -> dict[str, list[str]]:
+    """Stop collecting and return the tally, message to cells in order of first appearance."""
+    global _header_warnings
+    tally, _header_warnings = _header_warnings or {}, None
+    return tally

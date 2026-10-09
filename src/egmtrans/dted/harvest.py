@@ -25,6 +25,7 @@ from egmtrans.dted.index import (
     _parquet_available,
     check_value,
     new_row,
+    normalize_value,
     parse_date,
     parse_polygon_wkb,
     read_index,
@@ -611,6 +612,31 @@ def merge_rows(base: dict[str, dict], incoming: dict[str, dict]) -> dict[str, di
     return merged
 
 
+def fill_from_profile(rows: dict[str, dict], profile: Profile) -> dict[str, int]:
+    """Fill the profile's header values into every row that has NULL for them,
+    so a complete table shows what the header gets; returns how many cells each
+    column was filled in. A profile value that means NULL ("NA", a blank) fills
+    nothing: NULL already says it. An accuracy column that some cell fills is
+    left as it is, since its NULLs mean NA and never fall through to the profile."""
+    filled: dict[str, int] = {}
+    for column in INDEX_COLUMNS:
+        if column.dted_key is None or column.name not in profile.product:
+            continue
+        if column.name in ACCURACY_COLUMNS and any(row.get(column.name) is not None for row in rows.values()):
+            continue
+        try:
+            value = normalize_value(column, profile.product[column.name])
+        except (TypeError, ValueError):
+            continue  # the profile's own validation reports it
+        if value is None:
+            continue
+        for row in rows.values():
+            if row.get(column.name) is None:
+                row[column.name] = value
+                filled[column.name] = filled.get(column.name, 0) + 1
+    return filled
+
+
 def build_index(
     out: str,
     *,
@@ -627,13 +653,16 @@ def build_index(
     level: int | None = None,
     update: bool = False,
     product: str | None = None,
+    all_columns: bool = False,
 ) -> DtedIndex:
     """Harvest rows from the given sources and write (or update) the index at *out*.
 
     *from_table* (or *from_footprints*, the same thing) is any attribute
     table, imported through :func:`rows_from_table`; the import is reported
     in the log. Sources merge in the order table, rasters, DTED headers, a
-    later non-NULL value over an earlier one.
+    later non-NULL value over an earlier one. With *all_columns* the index
+    holds every column, and the profile's constants fill the rows that have
+    no value of their own (:func:`fill_from_profile`).
     """
     logger = _state.get_logger()
     rows: dict[str, dict] = {}
@@ -671,8 +700,12 @@ def build_index(
     for row in rows.values():
         if row.get('dted_level') is None and level is not None:
             row['dted_level'] = level
+    if all_columns and profile is not None:
+        filled = fill_from_profile(rows, profile)
+        if filled:
+            logger.info('filled from the profile: ' + ', '.join(f'{name} ({n} cell(s))' for name, n in filled.items()))
     if product:
         meta['product'] = product
     if profile is not None:
         meta['profile'] = os.path.basename(profile.path)
-    return write_index(out, rows, subregions, meta, level=level)
+    return write_index(out, rows, subregions, meta, level=level, all_columns=all_columns)

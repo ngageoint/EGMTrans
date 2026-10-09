@@ -404,3 +404,66 @@ def test_a_blank_required_value_is_not_a_source(tmp_dir):
     header, sources = assemble_header(cell_geometry(6, 49, 2), metadata=DtedMetadata(row, [], profile),
                                       derived=DerivedFields(vertical_datum='E96', partial_cell=0))
     assert header['dsi.producer_code'] == 'USNGA   ' and sources['dsi.producer_code'] == 'profile'
+
+
+# -- 1.10.1: blank overrides, index against profile, warnings tallied ----------
+
+def test_blank_overrides_on_required_fields_are_refused():
+    from egmtrans.dted.writer import parse_overrides
+
+    for bad in ('producer_code=', 'producer_code=   ', 'compilation_date=', 'match_merge_version= '):
+        with pytest.raises(ValueError, match='a required field needs a value'):
+            parse_overrides([bad])
+    assert parse_overrides(['dsi_free_text='])['dsi_free_text'] == '', 'an optional text field may be blanked'
+    assert parse_overrides(['security_handling=  '])['security_handling'] == '  '
+
+
+def test_index_and_profile_disagreement_is_a_warning(profile):
+    import datetime as dt
+
+    from egmtrans.dted.index import DtedIndex
+
+    index = DtedIndex(path='<memory>', rows={
+        'N03E008': new_row('N03E008', producer_code='FRIGN', compilation_date=dt.date(2000, 2, 1), abs_horiz_acc=12,
+                           rel_horiz_acc=5, security_code='U', data_edition=2, digitizing_system='LIDAR',
+                           product_spec_date=dt.date(2000, 5, 1)),
+        'N04E008': new_row('N04E008', producer_code='USCNIMA ', security_code='U', product_spec='PRF89020B'),
+        'N05E008': new_row('N05E008', producer_code='FRIGN'),
+    })
+    issues = DtedMetadataSource(index, profile).validate(2)
+    disagreements = {issue.key: issue for issue in issues
+                     if issue.severity == 'warning' and 'other than the profile' in issue.message}
+    # The padded producer code, the equal specification values (a date in another form among
+    # them) and the NULL rows are no disagreement; nor are the edition and the relative accuracy,
+    # which a cell has its own of; the producer code of two cells and the digitizing system are.
+    assert sorted(disagreements) == ['digitizing_system', 'producer_code']
+    assert ("2 cell(s) hold a value other than the profile's 'USCNIMA' (N03E008 'FRIGN', N05E008 'FRIGN')"
+            in disagreements['producer_code'].message)
+    assert 'the index row takes precedence' in disagreements['producer_code'].message
+    assert "other than the profile's 'SRTM' (N03E008 'LIDAR')" in disagreements['digitizing_system'].message
+
+
+def test_header_warnings_are_tallied_during_a_batch(profile, log_lines):
+    from egmtrans import _state
+    from egmtrans.dted.writer import header_warning_lines
+
+    def build(cell_id, lat):
+        row = new_row(cell_id, producer_code='ZZTEST')  # ZZ is not a FIPS 10-4 country code
+        return assemble_header(cell_geometry(6, lat, 2), metadata=DtedMetadata(row, [], profile),
+                               derived=DerivedFields(vertical_datum='E96', partial_cell=0))
+
+    assert _state.end_header_warnings() == {}, 'no tally is active between batches'
+    _state.begin_header_warnings()
+    build('N49E006', 49)
+    build('N50E006', 50)
+    build('N49E006', 49)  # the same cell again (the pre-flight and the write) counts once
+    tally = _state.end_header_warnings()
+    assert len(tally) == 1
+    (message, cells), = tally.items()
+    assert 'ZZ' in message and 'FIPS 10-4' in message and cells == ['N49E006', 'N50E006']
+    assert not [line for line in log_lines if 'DTED header of cell' in line], 'tallied, not logged per cell'
+    lines = header_warning_lines(tally)
+    assert len(lines) == 1 and lines[0].startswith('DTED header warning in 2 cell(s) (N49E006, N50E006): ')
+    # Without a tally, the warning is logged per cell as before.
+    build('N49E006', 49)
+    assert any('DTED header of cell N49E006' in line and 'ZZ' in line for line in log_lines)

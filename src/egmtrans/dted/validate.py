@@ -71,14 +71,25 @@ def _printable_problems(raw: str) -> list[str]:
     return found
 
 
+def _unprintable(problems: list[str]) -> str:
+    """The warning for bytes that are not printable characters, for a reader who does not know the format."""
+    where = ', '.join(problems[:3]) + (', ...' if len(problems) > 3 else '')
+    return (f'{len(problems)} byte(s) that are not printable characters ({where}), read as blanks: the specification '
+            'fills unused positions with blanks, the program that wrote this file put other bytes there; readers '
+            'ignore them and the elevations are not affected')
+
+
+def _as_printable(raw: str) -> str:
+    return ''.join(ch if 32 <= ord(ch) <= 126 else ' ' for ch in raw)
+
+
 def _check_field(item: Field, raw: str, issues: list[Issue]) -> bool:
     """Format checks of one field; returns False when its value cannot be decoded."""
     problems = _printable_problems(raw)
     if problems:
-        where = ', '.join(problems[:3]) + (', ...' if len(problems) > 3 else '')
-        issues.append(Issue('error', item.record, _short_key(item.key),
-                            f'{len(problems)} non-printable byte(s) ({where}); the spec blank-fills unused positions'))
-        return False
+        # Readers take these positions as blanks, and so do the checks below.
+        issues.append(Issue('warning', item.record, _short_key(item.key), _unprintable(problems)))
+        raw = _as_printable(raw)
 
     if item.kind == 'reserved':
         if raw.strip():
@@ -273,7 +284,7 @@ def _check_subregions(header: DtedHeader, ok: set[str], issues: list[Issue]) -> 
             if overall.get(key) is not None and overall[key] < value:
                 issues.append(Issue('info', 'ACC', _short_key(key),
                                     f'{overall[key]} m is better than the worst subregion ({value} m); '
-                                    f'the overall accuracy should be the worst (3.12 e note)'))
+                                    f'3.12 e takes the worst'))
     if flag is not None and flag == 0 and has_visible_text(block):
         issues.append(Issue('error', 'ACC', 'subregions', 'no subregions announced but the block is not blank'))
     if len(present) > MAX_SUBREGIONS:
@@ -290,9 +301,7 @@ def validate_header(
         if item.kind == 'subregions':
             problems = _printable_problems(header[item.key])
             if problems:
-                where = ', '.join(problems[:3]) + (', ...' if len(problems) > 3 else '')
-                issues.append(Issue('error', 'ACC', 'subregions',
-                                    f'{len(problems)} non-printable byte(s) ({where}); unused slots are blank filled'))
+                issues.append(Issue('warning', 'ACC', 'subregions', _unprintable(problems)))
             continue
         if _check_field(item, header[item.key], issues):
             ok.add(item.key)

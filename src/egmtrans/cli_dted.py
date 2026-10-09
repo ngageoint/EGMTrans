@@ -7,7 +7,8 @@
                          | --from-table FILE [--layer NAME] [--cell-field NAME]
                            [--map INDEX_COLUMN=TABLE_COLUMN]... [--set INDEX_COLUMN=VALUE]...
                            [--prefer TABLE_COLUMN]) [--profile FILE] [--level N] [--product NAME] [--update]
-    egmtrans dted-index validate INDEX [--profile FILE] [--level N]
+    egmtrans dted-index validate INDEX [--profile FILE] [--level N] [--dted-set FIELD=VALUE]...
+    egmtrans dted-index columns [--format markdown|csv]
     egmtrans dted-selftest [--keep FOLDER] [--print-reference]
 
 Reports go to stdout (or ``--out``), log messages to stderr, so a JSON or
@@ -25,10 +26,11 @@ import sys
 from egmtrans import _state
 from egmtrans.dted.companions import COMPANION_EXTENSIONS
 from egmtrans.dted.harvest import build_index, parse_column_map, parse_constants
-from egmtrans.dted.index import HEADER_COLUMNS, DtedIndex, read_index, validate_index
+from egmtrans.dted.index import ACCURACY_COLUMNS, HEADER_COLUMNS, read_index, render_column_tables, validate_index
 from egmtrans.dted.profile import load_profile
 from egmtrans.dted.report import FORMATS, build_report, render_report
 from egmtrans.dted.validate import count, validate_file
+from egmtrans.dted.writer import DtedMetadataSource, parse_overrides
 
 SUBCOMMANDS = ('dted-header', 'dted-index', 'dted-selftest', 'dmed')
 
@@ -92,10 +94,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help='Fill an index column with one value for every row of the table (may be repeated)')
     build.add_argument('--prefer', metavar='TABLE_COLUMN',
                        help='When several rows share a cell, keep the one with the greatest value here')
-    build.add_argument('--profile', metavar='FILE', help='Product profile (TOML) with the harvest mappings')
+    build.add_argument('--profile', metavar='FILE',
+                       help='Product profile (TOML): its harvest mappings for --from-rasters, its level when --level '
+                            'is not given, and its constants with --all-columns')
     build.add_argument('--level', type=int, choices=(0, 1, 2), help='DTED level the index is for')
     build.add_argument('--product', metavar='NAME', help='Product name recorded in the index meta table')
     build.add_argument('--update', action='store_true', help='Update an existing index instead of replacing it')
+    build.add_argument('--all-columns', action='store_true',
+                       help='Write every index column, NULL included, as a complete table to review and edit in a '
+                            'GIS, and fill the product constants of --profile into every row where the cell has no '
+                            'value (a NULL accuracy in such a table means NA)')
 
     validate = index_commands.add_parser(
         'validate', help='Check an index against the schema.',
@@ -111,6 +119,15 @@ def build_parser() -> argparse.ArgumentParser:
         help='A value the run writes in every header, as the transform\'s --dted-set (may be repeated): a field '
              'the index and the profile leave to the run, such as compilation_date=today, counts as supplied',
     )
+
+    columns = index_commands.add_parser(
+        'columns', help='Print the index columns and the header fields EGMTrans fills itself.',
+        description='The two tables of docs/dted_index.md: every index column with its header field, record, '
+                    'character positions, status and rules, then every header field EGMTrans fills itself. The '
+                    'Markdown is what the documentation holds; the CSV is the index schema as data.',
+    )
+    columns.add_argument('--format', choices=('markdown', 'csv'), default='markdown',
+                         help='Markdown tables (default) or the index columns as CSV')
 
     selftest = subparsers.add_parser(
         'dted-selftest', help='Convert built-in synthetic tiles to DTED and compare the bytes with the reference.',
@@ -186,21 +203,35 @@ def run_header(args: argparse.Namespace, logger: logging.Logger) -> int:
     return exit_code
 
 
-def supply_lines(index: DtedIndex, profile) -> list[str]:
-    """Which required header columns the index lacks, split by whether the profile supplies them."""
-    absent = [column.name for column in HEADER_COLUMNS if column.required and column.name not in index.columns]
-    if not absent:
-        return ['Every required header column is in the index.']
-    product = profile.product if profile is not None else {}
-    from_profile = [name for name in absent if name in product]
-    from_nothing = [name for name in absent if name not in product]
+def supply_lines(source: DtedMetadataSource, level: int | None) -> list[str]:
+    """Where each required header field comes from, as the run will see it: the
+    index for every cell, the index with the profile (or nothing) behind its NULL
+    rows, the profile alone, the run's overrides, or nothing yet."""
+    coverage = source.coverage(level)
+    required = [column.name for column in HEADER_COLUMNS if column.required]
+    present = source.index.columns if source.index is not None else set()
     lines = []
+    whole = [name for name in coverage.from_index if name in required]
+    if whole:
+        lines.append('Required header fields the index supplies for every cell: ' + ', '.join(whole))
+    for name, nulls in coverage.partly_from_index.items():
+        if name not in required or name in ACCURACY_COLUMNS:
+            continue  # a NULL accuracy is NA; the validator says so
+        if name in coverage.from_profile:
+            lines.append(f'{name}: NULL in {nulls:,} cell(s); the profile supplies it there')
+        elif name in coverage.missing_required:
+            lines.append(f'{name}: NULL in {nulls:,} cell(s) and nothing supplies it there; a run stops at those cells')
+    from_profile = [name for name in coverage.from_profile if name in required and name not in present]
     if from_profile:
-        lines.append('Required header columns the profile supplies: ' + ', '.join(from_profile))
-    if from_nothing:
-        lines.append('Required header columns nothing supplies yet (a profile, or --dted-set at run time, must): '
-                     + ', '.join(from_nothing))
-    return lines
+        lines.append('Required header fields the profile supplies: ' + ', '.join(from_profile))
+    overridden = [name for name in coverage.overrides if name in required]
+    if overridden:
+        lines.append("Required header fields the run's --dted-set supplies: " + ', '.join(overridden))
+    nothing = [name for name in coverage.missing_required if name in required and name not in present]
+    if nothing:
+        lines.append('Required header fields nothing supplies yet (a profile, or --dted-set at run time, must): '
+                     + ', '.join(nothing))
+    return lines or ['Every required header field has a source.']
 
 
 def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -229,25 +260,24 @@ def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
             args.out, from_dted=args.from_dted, from_rasters=args.from_rasters, from_table=table,
             cell_field=args.cell_field, layer=args.layer, column_map=column_map, constants=constants,
             prefer=args.prefer, profile=profile, level=args.level, update=args.update, product=args.product,
+            all_columns=args.all_columns,
         )
     except (OSError, ValueError, RuntimeError) as e:
         logger.error(f'Index not written: {e}')
         return 1
     logger.info(f'{os.path.basename(args.out)}: {len(index)} cell(s), '
                 f'{sum(len(s) for s in index.subregions.values())} subregion(s), level {index.level}')
-    issues = validate_index(index, level=args.level)
+    issues = validate_index(index, level=args.level, profile_values=profile.product if profile is not None else None)
     for issue in issues:
         logger.log(logging.ERROR if issue.severity == 'error' else logging.WARNING if issue.severity == 'warning'
                    else logging.INFO, str(issue))
-    for line in supply_lines(index, profile):
+    for line in supply_lines(DtedMetadataSource(index, profile), args.level if args.level is not None else index.level):
         logger.info(line)
     return 1 if count(issues, 'error') else 0
 
 
 def run_index_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Check an index as a run with the same profile and overrides would see it."""
-    from egmtrans.dted.writer import DtedMetadataSource, parse_overrides
-
     try:
         overrides = parse_overrides(args.dted_set)
     except ValueError as e:
@@ -269,10 +299,12 @@ def run_index_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
         if level is not None and profile.level not in (None, level):
             logger.error(f'The profile is for level {profile.level}, not {level}')
             return 1
-        missing = [c.name for c in HEADER_COLUMNS if c.required and c.name not in index.columns
-                   and c.name not in profile.product and c.name not in overrides]
+        # The run's own rule (coverage): a NULL row and a blank profile value are no source.
+        missing = DtedMetadataSource(index, profile, overrides).coverage(level).missing_required
         if missing:
-            logger.error(f'Neither the index, the profile nor --dted-set supplies: {", ".join(missing)}')
+            described = [name if name not in index.columns else f'{name} (NULL in {n:,} of {len(index):,} cells)'
+                         for name, n in missing.items()]
+            logger.error(f'Neither the index, the profile nor --dted-set supplies: {", ".join(described)}')
             return 1
     issues = DtedMetadataSource(index, profile, overrides).validate(level)
     logger.info(f'{os.path.basename(args.index)}: {len(index)} cell(s), level {index.level}, '
@@ -360,4 +392,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_dmed(args, logger)
     if args.index_command == 'build':
         return run_index_build(args, logger)
+    if args.index_command == 'columns':
+        sys.stdout.write(render_column_tables(args.format))
+        return 0
     return run_index_validate(args, logger)

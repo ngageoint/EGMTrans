@@ -598,3 +598,11 @@ def test_a_patch_size_below_one_is_refused(tmp_dir, log_lines, monkeypatch):
         assert process_file(src, os.path.join(tmp_dir, "out.dt0"), "EGM2008", "EGM96", True, False, bad,
                             "bilinear", check_for_wrong_datum=False) is False
     assert sum("minimum patch size must be at least 1 post" in line for line in log_lines) == 3
+
+
+def test_the_numba_message_names_the_fix(monkeypatch, log_lines):
+    monkeypatch.setattr(cli, 'NUMBA_AVAILABLE', False)
+    cli.log_numba_availability()
+    message = next(line for line in log_lines if 'Numba is not available' in line)
+    assert 'cloned ArcGIS Pro environment' in message and 'restart ArcGIS Pro' in message
+    assert 'the results are the same' in message

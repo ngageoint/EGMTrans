@@ -43,13 +43,21 @@ def test_sentinels_and_fixed_values(srtm):
     assert {'sentinel', 'fixed'} <= errors(validate_header(srtm))
 
 
-def test_non_printable_bytes_are_errors(srtm):
+def test_non_printable_bytes_are_warnings_read_as_blanks(srtm):
+    """GDAL-written headers carry NUL bytes where the specification blank-fills; readers
+    take them as blanks, so the report says what they are and goes on checking the value."""
     srtm.set_raw('dsi.security_control', '\x00 ')
     srtm.set_raw('uhl.reserved', '\x00' + ' ' * 23)
     srtm.set_raw('acc.subregions', '\x00' + ' ' * 2555)
+    srtm.set_raw('acc.abs_horiz_acc', 'NA\x00 ')
     issues = validate_header(srtm)
-    assert {'security_control', 'reserved', 'subregions'} <= errors(issues)
-    assert any('NUL at character 1' in issue.message for issue in issues)
+    assert {'security_control', 'reserved', 'subregions', 'abs_horiz_acc'} <= warnings(issues)
+    assert errors(issues) == set(), 'NA with a NUL decodes as NA once the byte is read as a blank'
+    message = next(issue.message for issue in issues if issue.key == 'security_control')
+    assert message.startswith('1 byte(s) that are not printable characters (NUL at character 1), read as blanks: ')
+    assert 'the elevations are not affected' in message
+    srtm.set_raw('dsi.data_edition', '\x00\x00')
+    assert 'data_edition' in errors(validate_header(srtm)), 'a value that is blank once read stays wrong'
 
 
 def test_na_justification(srtm):

@@ -44,9 +44,13 @@ product_spec = "PRF89020B"
 product_spec_amend = "00"
 product_spec_date = "2000-05"
 
-# Compilation date, YYYY-MM (DSI 160-163). Usually per cell in the index; this
-# is the fallback for a cell whose row leaves it NULL.
-compilation_date = "<YYYY-MM>"
+# Compilation date, YYYY-MM (DSI 160-163): the month the cell is made. Usually
+# per cell in the index, with this value as the fallback for a cell whose row
+# leaves it NULL. To give the production month at run time instead, so that no
+# run writes a stale date, remove this line and run with
+# --dted-set compilation_date=today (a DTED Header Overrides row in ArcGIS Pro);
+# "egmtrans dted-index validate" takes the same --dted-set.
+compilation_date = "<YYYY-MM, or remove this line>"
 
 # Accuracies in whole meters, or "NA" (ACC 4-19): absolute horizontal (CE90),
 # absolute vertical (LE90), relative horizontal, relative vertical. Usually the

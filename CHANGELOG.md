@@ -9,11 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `egmtrans dted-index build --all-columns` writes every index column, NULL included, as a complete table to review and edit in a GIS, and fills the product constants of `--profile` into every row where the cell has no value; a header written from the complete table alone equals the one written from the sparse index and the profile. The template recipe is in `docs/dted_index.md`.
+- `egmtrans dted-index columns` prints the index columns with their header fields, character positions, status and rules, and the header fields EGMTrans fills itself, as Markdown (what `docs/dted_index.md` holds; a test keeps the two in step) or as CSV.
 - `egmtrans dted-index validate --dted-set FIELD=VALUE` takes the overrides of the run an index is meant for, as the transform does: a field the run gives every cell, such as `compilation_date=today` for a profile without a compilation date, counts as supplied instead of stopping the check, and is not reported as missing from the index.
+- The batch log lists the water bodies that span more than one tile, with the tiles and sides each one touches, in a table before the one of the bodies that touch the run boundary; `*` marks a side with no neighbor in the run, `(context)` a tile analyzed but not written, `(finished)` a tile written by an earlier run and skipped.
+- Pass 1 explains what it does with the run's settings when it starts, and lists for every tile the flat areas that reach one of its edges, largest first, with the sides they touch.
 
 ### Changed
 
-- `egmtrans dted-index validate` checks the producer codes of the profile and of the overrides against FIPS 10-4, as a run does; it checked only the producer codes of the index.
+- `egmtrans dted-index validate` reports a NULL accuracy column once, with the number of cells, instead of once per cell, and as a warning when the profile holds a number for that column, since the header says NA and never falls back to the profile for an accuracy; it warns when the index and the profile disagree on a constant (the index row is written); it checks the producer codes of the profile and of the overrides against FIPS 10-4, as a run does; and its list of the fields nothing supplies follows the run's own rule, so a required column that is NULL in some cells, or a blank profile value, counts as missing there.
+- The header report treats bytes that are not printable characters (the NUL bytes other software writes where the specification blank-fills) as blanks and reports them as a warning that says what they are, instead of an error; `egmtrans dted-header` exits 0 on such a file (1 with `--strict`).
+- A run shows the validator's warnings about the index, the profile and the overrides once, before the header plan, and summarizes the warnings of the headers it writes once at the end with the number of cells, instead of once per cell and pass.
+- In ArcGIS Pro, a required header value missing in some cells of the index is a warning naming them (the run stops before writing when it meets them); only a field no cell has a source for blocks Run. The message names the fix for a date: a DTED Header Overrides row `compilation_date = today`.
+- `--skip-existing` (Skip Existing Cells) still analyzes the inputs of the outputs it skips, so a water body shared with a finished cell gets the level an uninterrupted run would give, and the seams between the finished cells and the new outputs are checked.
+- The README's quick start for ArcGIS Pro walks through the Package Manager steps for Numba, restart included, and the tool's message names them when Numba is missing.
+
+### Fixed
+
+- An accuracy stored as text in an index (`NA`, `12`) is read by the index's own rules: NA stays NA instead of becoming 0 m, and a value that is not a whole number of meters, or a text date that is not a date, is refused naming the cell and the column.
+- A blank `--dted-set` value on a required field is refused instead of being ignored at write time while counting as supplied.
+- An index whose metadata names a level that is not 0, 1 or 2 is refused with a message instead of a traceback.
+- The DTED Header Report tool takes a raster layer or dataset as well as a file or a folder, so ArcGIS Pro's browse dialog selects a DTED file with OK; it offered only Open, which opens the file and lists its bands. In both tools, a band chosen in the dialog (`N49.dt2\Band_1`) is read as its file, and the dialog shows the file.
+- The note about a seam whose two sides differ in height is listed under the water body it concerns, not under the largest water body of the run.
+- The note on an overall accuracy better than its worst subregion states the rule (3.12 e takes the worst) without arguing a policy.
 
 ## [1.10.0] - 2026-10-08
 
