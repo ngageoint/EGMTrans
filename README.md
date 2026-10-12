@@ -6,7 +6,7 @@
 # EGMTrans
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.10.1-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.11.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -25,7 +25,7 @@ It runs as an ArcGIS Pro toolbox (ArcGIS Pro 3.7 or later, Python 3.13) or on th
 
 4. In the Catalog pane, right-click Toolboxes, choose Add Toolbox, and pick `arcgis\EGMTransToolbox.pyt`. Nothing is installed: the toolbox finds the package in `src` beside it.
 5. Run **DTED Self-Test**. It converts two built-in tiles and compares the bytes with the pinned reference, so you know this computer reproduces the reference before a real run.
-6. Run **EGMTrans Tool**: the input tile or folder, the output folder, the Output Format (DTED2 by default), the Source Datum of your tiles, and, in the DTED output group, the product profile and the metadata index. The Target Datum is EGM96; the dialog shows the header plan of the first cell before you run.
+6. Run **EGMTrans Tool**: the input tile or folder, the output folder, the Output Format (DTED2 by default), the Source Datum of your tiles, and, in the DTED output group, the product profile and the metadata index. The Target Datum is EGM96; the dialog shows the header plan of the first cell before you run. If you have no index yet, **Build DTED Index** makes one from a folder of DTED files, and **Validate DTED Index** checks an edited one.
 
 **EGMTrans Tool in ArcGIS Pro**  
 <img src="img/EGMTrans_toolbox.png" alt="EGMTrans Tool in ArcGIS Pro" width="300">
@@ -67,6 +67,13 @@ egmtrans dmed delivery
 A single tile to a single cell needs no level: `egmtrans -i N49E006_DEM.tif -o N49.dt2 -s EGM2008 -t EGM96 -y --dted-profile product.toml`. A run that was cancelled or failed is continued with `--skip-existing`; the cells already written and verified are left alone.
 
 **Check a header.** `egmtrans dted-header N49.dt2` prints every field with its byte positions and the specification's findings; `--check-data` checks the records too; `--format json|csv|md` and `--out` write a report. The DTED Header Report tool does the same in ArcGIS Pro.
+
+**Build an index from a delivery.** The headers of the DTED files under a folder become one index row per cell, subregions included, every column written; `--level` picks the level when the folder holds several, and `--set` writes one value in every row, such as the datum code a transformed delivery will carry. A file that cannot be read is reported and gets no row, the index is still written for the other cells, and the command exits 1. The Build DTED Index and Validate DTED Index tools do the same in ArcGIS Pro.
+
+```bash
+egmtrans dted-index build --out collection.gpkg --from-dted delivery --level 2 --set vertical_datum=E96
+egmtrans dted-index validate collection.gpkg --profile product.toml --level 2
+```
 
 **Neighbors and water levels.** Tiles that share a lake or river belong in one run. When the neighbors are produced in another run, give them as `--context FOLDER` (Neighboring Tiles in ArcGIS Pro): they are analyzed with the input but never written. Or export the levels of an earlier run over the larger area with `--export-water-levels levels.csv` and pass them to the later runs with `--water-levels levels.csv`, so the level does not depend on the order of production. See [docs/water_bodies.md](docs/water_bodies.md).
 
@@ -125,7 +132,12 @@ Everything below is what a closed network needs; nothing else reaches the intern
 | | `-y` | Answer the prompts (a datum the headers contradict, the header plan) for unattended runs. |
 | | `--export-water-levels FILE` | Write the levels of the water bodies that touch a tile edge. |
 
-Subcommands: `egmtrans dted-header FILE...`, `egmtrans dted-index build|validate|columns`, `egmtrans dted-selftest [--keep FOLDER]`, `egmtrans dmed FOLDER [--out PATH] [--check]`. The toolbox has the same four tools: EGMTrans Tool, DTED Header Report, DTED Self-Test and Build DMED.
+Subcommands: `egmtrans dted-header FILE...`, `egmtrans dted-index build|validate|columns`, `egmtrans dted-selftest [--keep FOLDER]`, `egmtrans dmed FOLDER [--out PATH] [--check]`. The toolbox has six tools: EGMTrans Tool (the parameters above), DTED Header Report, DTED Self-Test, Build DMED, Build DTED Index and Validate DTED Index.
+
+| Tool | Parameters | Command line |
+|---|---|---|
+| Build DTED Index | DTED File or Folder, DTED Level, Output Index, Index Overrides, DTED Product Profile | `egmtrans dted-index build --out INDEX --from-dted PATH [--level N] [--set COLUMN=VALUE] [--profile FILE]` |
+| Validate DTED Index | DTED Metadata Index, DTED Product Profile, DTED Header Overrides, DTED Level | `egmtrans dted-index validate INDEX [--profile FILE] [--dted-set FIELD=VALUE] [--level N]` |
 
 ### DTED output
 
@@ -158,7 +170,7 @@ You are asked before the run goes on when the source and target datums are the s
 
 ### More
 
-- [docs/dted_index.md](docs/dted_index.md): the metadata index, the product profile, header precedence, the producer code, DTED-to-DTED headers and the header report.
+- [docs/dted_index.md](docs/dted_index.md): the metadata index, the product profile, header precedence, the producer code, building an index from a delivery, DTED-to-DTED headers and the header report.
 - [docs/water_bodies.md](docs/water_bodies.md): flattening, containment, enclosed low spots, seams, neighboring tiles and water-level tables.
 - [docs/algorithms.md](docs/algorithms.md): the interpolation algorithms, why DTED takes bilinear only, and the geoid grids.
 - [docs/determinism.md](docs/determinism.md): how a DTED cell is made from a GeoTIFF, the companion files, and the same bytes on every computer.

@@ -318,3 +318,121 @@ def test_header_report_reads_non_printable_bytes_as_blanks(dt0, capsys):
     assert 'WARNING' in out and 'read as blanks' in out and 'the elevations are not affected' in out
     assert 'ERROR' not in out and '0 error(s)' in err
     assert cli_dted.main(['dted-header', dt0, '--strict']) == 1
+
+
+# -- 1.11.0: build from a folder of DTED files, with a level, overrides and a failure policy; dted-header on folders
+
+
+def _two_levels(tmp_dir):
+    from tests.test_dted_index import _codec_cell
+
+    folder = os.path.join(tmp_dir, 'cells')
+    os.makedirs(folder)
+    write_dted(os.path.join(folder, 'n06e126.dt0'), np.full((121, 121), 3, dtype=np.int16), 126, 6)
+    _codec_cell(os.path.join(folder, 'n07e126.dt1'), 126, 7, level=1)
+    return folder
+
+
+def test_build_from_a_folder_with_two_levels(tmp_dir, capsys):
+    folder = _two_levels(tmp_dir)
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-dted', folder]) == 1
+    err = capsys.readouterr().err
+    assert f'Found 2 DTED file(s) under {folder}: 1 .dt0, 1 .dt1' in err
+    assert 'Index not written: The input holds several DTED levels (1 .dt0, 1 .dt1)' in err
+    assert 'give --level 0 or --level 1 (the DTED Level parameter in ArcGIS Pro)' in err
+    assert not os.path.exists(out)
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-dted', folder, '--level', '1']) == 0
+    err = capsys.readouterr().err
+    assert 'Reading 1 .dt1 file(s) for level 1; skipped: 1 .dt0' in err
+    assert 'index.gpkg: 1 cell(s), 0 subregion(s), level 1' in err
+    assert list(read_index(out).rows) == ['N07E126']
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-dted', folder, '--level', '2']) == 1
+    assert 'Index not written: No .dt2 file under' in capsys.readouterr().err
+
+
+def test_build_continues_past_an_unreadable_file_and_exits_1(dt0, tmp_dir, capsys):
+    with open(os.path.join(tmp_dir, 'n07e126.dt0'), 'wb') as handle:
+        handle.write(b'UHL1')
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-dted', tmp_dir]) == 1
+    err = capsys.readouterr().err
+    assert 'n07e126.dt0: is too short for a DTED header (4 bytes); no row' in err
+    assert '1 file(s) have no row in the index; the index holds the 1 other cell(s)' in err
+    assert list(read_index(out).rows) == ['N06E126']
+    os.remove(dt0)  # only the unreadable file left: nothing to write, and the old index is left alone
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-dted', tmp_dir]) == 1
+    assert 'Index not written: no source gave a row; nothing to write' in capsys.readouterr().err
+    assert list(read_index(out).rows) == ['N06E126']
+
+
+def test_build_sets_a_column_in_every_cell_of_a_dted_source(dt0, tmp_dir, capsys):
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    build = ['dted-index', 'build', '--out', out, '--from-dted', tmp_dir]
+    assert cli_dted.main(build + ['--set', 'vertical_datum=E96', '--set', 'compilation_date=2024-07']) == 0
+    err = capsys.readouterr().err
+    assert 'set in 1 cell(s): vertical_datum = E96' in err and 'set in 1 cell(s): compilation_date = 2024-07-01' in err
+    row = read_index(out).get('N06E126')
+    assert row['vertical_datum'] == 'E96' and str(row['compilation_date']) == '2024-07-01'
+    assert cli_dted.main(build + ['--set', 'dted_level=0']) == 2
+    assert '--set dted_level: the level is --level N' in capsys.readouterr().err
+    assert cli_dted.main(build + ['--set', 'abs_vert_acc=7.2']) == 2
+    assert "--set abs_vert_acc: '7.2' is not a whole number of meters" in capsys.readouterr().err
+    assert cli_dted.main(build + ['--map', 'notes=remark']) == 2
+    assert '--map, --prefer, --layer and --cell-field go with --from-table' in capsys.readouterr().err
+
+
+def test_build_nudges_about_the_datum_columns(dt0, tmp_dir, capsys):
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    build = ['dted-index', 'build', '--out', out, '--from-dted', tmp_dir]
+    assert cli_dted.main(build) == 0
+    assert ("vertical_datum is 'MSL' in 1 cell(s) (N06E126); the DTED EGMTrans writes is E96: "
+            '--set vertical_datum=E96 (an Index Overrides row in ArcGIS Pro) records that in the index'
+            in capsys.readouterr().err)
+    assert cli_dted.main(build + ['--set', 'vertical_datum=E96']) == 0
+    assert 'the DTED EGMTrans writes is E96' not in capsys.readouterr().err
+
+
+def test_refused_header_values_warn_once_per_problem(tmp_dir, capsys):
+    from tests.test_dted_index import _codec_cell
+
+    for lat in (6, 7):
+        _codec_cell(os.path.join(tmp_dir, f'n0{lat}e126.dt0'), 126, lat, raw={'dsi.data_edition': '00'})
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    assert cli_dted.main(['dted-index', 'build', '--out', out, '--from-dted', tmp_dir]) == 0
+    lines = capsys.readouterr().err.splitlines()
+    noted = [line for line in lines if line.startswith("In 2 cell(s) (N06E126, N07E126): data_edition '00' is NULL")]
+    assert len(noted) == 1
+    assert read_index(out).get('N06E126')['data_edition'] is None
+
+
+def test_source_header_findings_are_tallied_once_per_message(tmp_dir, capsys):
+    for lon in (126, 127):
+        write_dted(os.path.join(tmp_dir, f'n06e{lon}.dt0'), np.zeros((121, 121), dtype=np.int16), lon, 6)
+    assert cli_dted.main(['dted-index', 'build', '--out', os.path.join(tmp_dir, 'index.gpkg'),
+                          '--from-dted', tmp_dir]) == 0
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith('Source header finding in')]
+    assert lines and all(line.startswith('Source header finding in 2 cell(s) (N06E126, N06E127): ') for line in lines)
+    assert len(set(lines)) == len(lines), 'each finding once'
+    assert any('compilation_date' in line and 'ERROR' in line for line in lines)
+    assert any('read as blanks' in line and 'WARNING' in line for line in lines)
+
+
+def test_header_report_accepts_folders(tmp_dir, capsys):
+    folder = _two_levels(tmp_dir)
+    assert cli_dted.main(['dted-header', folder]) == 1  # the GDAL cell has a blank compilation date
+    out, err = capsys.readouterr()
+    assert f'Found 2 file(s) under {folder}: 1 .dt0, 1 .dt1' in err
+    assert 'n06e126.dt0: 1 error(s)' in err and 'n07e126.dt1: 0 error(s), 0 warning(s)' in err
+    assert 'Checked 2 file(s): 1 with errors, 0 with warnings, 1 clean' in err
+    assert out.count('UHL  User Header Label') == 2
+    with open(os.path.join(folder, 'n08e126.dt0'), 'wb') as handle:
+        handle.write(b'UHL1')
+    assert cli_dted.main(['dted-header', folder, '--format', 'json']) == 1
+    out, err = capsys.readouterr()
+    assert 'n08e126.dt0: ' in err and 'too short' in err and len(json.loads(out)) == 2
+    os.makedirs(os.path.join(tmp_dir, 'empty'))
+    assert cli_dted.main(['dted-header', os.path.join(tmp_dir, 'empty')]) == 2
+    assert 'No DTED file (.dt0, .dt1, .dt2, or a DTED0 .avg, .min, .max) under' in capsys.readouterr().err
+    assert cli_dted.main(['dted-header', os.path.join(tmp_dir, 'nowhere')]) == 2
+    assert 'Not a file or folder' in capsys.readouterr().err

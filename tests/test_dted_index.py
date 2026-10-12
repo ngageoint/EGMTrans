@@ -454,12 +454,14 @@ def test_rows_from_table_maps_names_coerces_and_prefers(tmp_dir):
     ])
     with pytest.raises(ValueError, match=r'row 1 \(N06E126\): security_code <- security_code: .*not one of'):
         rows_from_table(bad)
-    with pytest.raises(ValueError, match='not an index column'):
+    with pytest.raises(ValueError, match='the cell comes from the source'):
         parse_constants(['cell_id=N06E126'])
     with pytest.raises(ValueError, match='INDEX_COLUMN=VALUE'):
         parse_constants(['security_code'])
-    assert parse_constants(['compilation_date=2024-07', 'abs_vert_acc=7.2']) == {
+    assert parse_constants(['compilation_date=2024-07', 'abs_vert_acc=8']) == {
         'compilation_date': dt.date(2024, 7, 1), 'abs_vert_acc': 8}
+    with pytest.raises(ValueError, match='not a whole number of meters'):
+        parse_constants(['abs_vert_acc=7.2'])  # 1.10.1: a decimal accuracy in an index is an error
 
 
 def test_rows_from_table_reads_parquet_and_the_geometry(tmp_dir):
@@ -715,3 +717,221 @@ def test_a_bad_level_in_the_meta_table_names_the_file(tmp_dir):
     index = DtedIndex(path='<memory>', rows={'N03E008': {'cell_id': 'N03E008', 'dted_level': 'x'}})
     messages = [str(issue) for issue in validate_index(index, level=2)]
     assert any("'x' is not an integer" in m for m in messages)
+
+
+# -- 1.11.0: the DTED source scans by level, continues past bad files, takes --set, round-trips a header
+
+
+def _codec_cell(path, lon0, lat0, level=0, datum='E96', subregions=None, raw=None):
+    """A cell written with the package's own codec: clean fields, no GDAL defaults.
+    *subregions* are (abs_h, abs_v, rel_h, rel_v, outline) tuples; *raw* sets
+    fields as raw text after everything else, to plant a bad value."""
+    from egmtrans.dted.header import AccSubregion, CellGeometry, new_header
+    from egmtrans.dted.records import write_dted_file
+
+    cell = CellGeometry(level, lon0, lat0)
+    header = new_header(cell)
+    header.set('dsi.security_code', 'U')
+    header.set_raw('uhl.security_code', 'U  ')
+    header.set('dsi.data_edition', 1)
+    header.set('dsi.match_merge_version', 'A')
+    header.set('dsi.producer_code', 'USNGA')
+    header.set('dsi.compilation_date', '2024-07')
+    header.set('dsi.vertical_datum', datum)
+    for key in ('acc.abs_horiz_acc', 'acc.abs_vert_acc', 'acc.rel_horiz_acc', 'acc.rel_vert_acc', 'uhl.abs_vert_acc'):
+        header.set(key, 5)
+    if subregions:
+        header.set_subregions([AccSubregion.from_values(*item) for item in subregions])
+    for key, text in (raw or {}).items():
+        header.set_raw(key, text)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    write_dted_file(path, header, np.full((cell.lat_points, cell.lon_lines), 200, dtype=np.int32))
+    return path
+
+
+def test_scan_counts_files_by_extension_and_root(tmp_dir):
+    from egmtrans.dted.harvest import choose_level, scan_dted
+
+    _codec_cell(os.path.join(tmp_dir, 'a', 'n06e126.dt0'), 126, 6)
+    _codec_cell(os.path.join(tmp_dir, 'b', 'N07.DT1'), 126, 7, level=1)
+    direct = _codec_cell(os.path.join(tmp_dir, 'n08e126.dt0'), 126, 8)
+    scan = scan_dted([os.path.join(tmp_dir, 'a'), os.path.join(tmp_dir, 'b'), direct])
+    assert scan.by_extension == {'.dt0': 2, '.dt1': 1} and scan.levels == {0, 1}
+    assert scan.describe().startswith('Found 3 DTED file(s) under ') and scan.describe().endswith(': 2 .dt0, 1 .dt1')
+    assert [(os.path.basename(p), r) for p, r in scan.of_level(0)] == [
+        ('n06e126.dt0', os.path.join(tmp_dir, 'a')), ('n08e126.dt0', None)]
+    with pytest.raises(ValueError, match=r'several DTED levels \(2 .dt0, 1 .dt1\).*give --level 0 or --level 1'):
+        choose_level(scan, None)
+    with pytest.raises(ValueError, match=r'No .dt2 file under .* for --level 2; found 2 .dt0, 1 .dt1'):
+        choose_level(scan, 2)
+    assert choose_level(scan, 1) == 1
+    assert choose_level(scan_dted([os.path.join(tmp_dir, 'a')]), None) == 0
+    os.makedirs(os.path.join(tmp_dir, 'empty'))
+    with pytest.raises(ValueError, match=r'No DTED file \(.dt0, .dt1, .dt2\) under'):
+        choose_level(scan_dted([os.path.join(tmp_dir, 'empty')]), None)
+    with pytest.raises(FileNotFoundError):
+        scan_dted([os.path.join(tmp_dir, 'nowhere')])
+
+
+def test_import_reads_one_level_and_source_file_is_relative(tmp_dir):
+    from egmtrans.dted.harvest import import_dted, scan_dted
+
+    _codec_cell(os.path.join(tmp_dir, 'a', 'E126', 'N06.dt0'), 126, 6)
+    _codec_cell(os.path.join(tmp_dir, 'a', 'E126', 'N07.dt1'), 126, 7, level=1)
+    direct = _codec_cell(os.path.join(tmp_dir, 'n08e126.dt0'), 126, 8)
+    imported = import_dted(scan_dted([os.path.join(tmp_dir, 'a'), direct]), 0)
+    assert sorted(imported.rows) == ['N06E126', 'N08E126'] and imported.read == 2
+    assert imported.skipped == {'.dt1': 1} and imported.failed == []
+    assert imported.notes == {} and imported.findings == {}
+    assert imported.rows['N06E126']['source_file'] == 'E126/N06.dt0'
+    assert imported.rows['N08E126']['source_file'] == 'n08e126.dt0'
+    assert imported.rows['N06E126']['dted_level'] == 0 and imported.rows['N06E126']['producer_code'] == 'USNGA'
+
+
+def test_two_files_for_one_cell_are_an_error_without_a_row(tmp_dir):
+    from egmtrans.dted.harvest import import_dted, scan_dted
+
+    _codec_cell(os.path.join(tmp_dir, 'a', 'n06e126.dt0'), 126, 6)
+    _codec_cell(os.path.join(tmp_dir, 'b', 'N06.dt0'), 126, 6)
+    _codec_cell(os.path.join(tmp_dir, 'a', 'n07e126.dt0'), 126, 7)
+    imported = import_dted(scan_dted([tmp_dir]), 0)
+    assert sorted(imported.rows) == ['N07E126']
+    assert imported.failed == [
+        'N06E126: 2 files for one cell at level 0: a/n06e126.dt0, b/N06.dt0; no row for the cell']
+
+
+def test_an_unreadable_file_is_reported_and_the_rest_indexed(tmp_dir):
+    from egmtrans.dted.harvest import BuildReport
+    from egmtrans.dted.index import INDEX_COLUMNS
+
+    _codec_cell(os.path.join(tmp_dir, 'n06e126.dt0'), 126, 6)
+    with open(os.path.join(tmp_dir, 'n07e126.dt0'), 'wb') as handle:
+        handle.write(b'UHL1' * 25)
+    report = BuildReport()
+    index = build_index(os.path.join(tmp_dir, 'index.gpkg'), from_dted=[tmp_dir], report=report)
+    assert sorted(index.rows) == ['N06E126'] and index.level == 0
+    assert report.failed == ['n07e126.dt0: is too short for a DTED header (100 bytes); no row']
+    assert set(index.columns) == {column.name for column in INDEX_COLUMNS}, 'the DTED source writes the complete table'
+
+
+def test_values_the_index_cannot_hold_become_null_with_a_note(tmp_dir):
+    from egmtrans.dted.harvest import import_dted, scan_dted
+
+    raw = {'dsi.data_edition': '00', 'dsi.security_code': 'u', 'dsi.horizontal_datum': 'WGS72',
+           'acc.abs_horiz_acc': '12.5', 'dsi.compilation_date': '2413'}
+    for lat in (6, 7):
+        _codec_cell(os.path.join(tmp_dir, f'n0{lat}e126.dt0'), 126, lat, raw=raw)
+    imported = import_dted(scan_dted([tmp_dir]), 0)
+    row = imported.rows['N06E126']
+    assert row['data_edition'] is None and row['security_code'] is None and row['horizontal_datum'] is None
+    assert row['abs_horiz_acc'] is None and row['compilation_date'] is None
+    assert row['producer_code'] == 'USNGA' and row['abs_vert_acc'] == 5, 'the rest of the row is kept'
+    assert imported.failed == [] and all(cells == ['N06E126', 'N07E126'] for cells in imported.notes.values())
+    for text in ("data_edition '00' is NULL in the index: ", "security_code 'u' is NULL in the index: ",
+                 "horizontal_datum 'WGS72' is NULL in the index: ",
+                 "abs_horiz_acc '12.5' is NA in the index: not an accuracy (0000-9999 or NA)",
+                 "compilation_date '2413' is NULL in the index: not a YYMM date"):
+        assert any(message.startswith(text) for message in imported.notes), text
+
+
+def test_malformed_subregions_are_dropped_with_a_note(tmp_dir):
+    from egmtrans.dted.harvest import import_dted, scan_dted
+    from egmtrans.dted.header import read_header, write_header
+
+    outline = [(6.0, 126.0), (7.0, 126.0), (7.0, 126.5), (6.0, 126.5)]
+    path = _codec_cell(os.path.join(tmp_dir, 'n06e126.dt0'), 126, 6,
+                       subregions=[(12, 6, None, 8, outline), (20, 10, 'NA', 12, outline)])
+    good = import_dted(scan_dted([tmp_dir]), 0)
+    assert [item['seq'] for item in good.subregions['N06E126']] == [1, 2] and good.notes == {}
+    header = read_header(path)
+    block = header['acc.subregions']
+    header.set_raw('acc.subregions', block[:284 + 4] + '12.5' + block[284 + 8:])  # the second's abs_vert_acc
+    write_header(path, header)
+    bad = import_dted(scan_dted([tmp_dir]), 0)
+    assert bad.subregions == {} and 'N06E126' in bad.rows
+    assert len(bad.notes) == 1 and next(iter(bad.notes)).startswith('subregions dropped: subregion 2')
+
+
+def test_a_level_conflict_takes_the_file_name_and_is_noted(tmp_dir):
+    from egmtrans.dted.harvest import import_dted, scan_dted
+
+    _codec_cell(os.path.join(tmp_dir, 'n06e126.dt1'), 126, 6)  # a DTED0 grid under a .dt1 name
+    imported = import_dted(scan_dted([tmp_dir]), 1)
+    assert imported.rows['N06E126']['dted_level'] == 1
+    assert any(message.startswith('dted_level 1 from the file name; the header says level 0')
+               for message in imported.notes)
+    assert any('FILE.level' in message for message in imported.findings)
+
+
+def test_parse_constants_takes_every_column_and_today():
+    from egmtrans.dted.harvest import parse_constants
+
+    got = parse_constants(['vertical_datum=E96', 'compilation_date=today', 'source_version=v2', 'rel_horiz_acc=NA',
+                           ('notes', ' from a pair ')], today=dt.date(2026, 10, 5))
+    assert got == {'vertical_datum': 'E96', 'compilation_date': dt.date(2026, 10, 5), 'source_version': 'v2',
+                   'rel_horiz_acc': None, 'notes': 'from a pair'}
+    for bad, reason in [
+        ('cell_id=N06E126', 'the cell comes from the source'), ('dted_level=2', 'is --level N'),
+        ('updated=now', 'stamps updated'), ('abs_vert_acc=7.2', 'not a whole number of meters'),
+        ('data_edition=1.5', 'not an integer'), ('security_code=x', 'not one of'), ('bogus=1', 'not an index column'),
+        ('producer_code= ', 'a required column needs a value'), ('compilation_date=yesterday', 'not a date'),
+        ('compilation_date=1975-06', '1980-2079'), ('security_code', 'INDEX_COLUMN=VALUE'),
+    ]:
+        with pytest.raises(ValueError, match=reason):
+            parse_constants([bad])
+    with pytest.raises(ValueError, match='given twice'):
+        parse_constants(['notes=a', 'notes=b'])
+    assert parse_constants(['dsi_free_text='])['dsi_free_text'] is None, 'a blank clears an optional column'
+
+
+def test_constants_win_over_every_source_and_are_not_refilled(tmp_dir):
+    from egmtrans.dted.harvest import BuildReport
+
+    write_dted(os.path.join(tmp_dir, 'n06e126.dt0'), np.zeros((121, 121), dtype=np.int16), 126, 6)  # MSL, NULs
+    report = BuildReport()
+    index = build_index(
+        os.path.join(tmp_dir, 'index.gpkg'), from_dted=[tmp_dir], level=0, profile=load_profile(PROFILE),
+        constants={'vertical_datum': 'E96', 'rel_horiz_acc': None, 'compilation_date': dt.date(2024, 7, 1)},
+        report=report,
+    )
+    row = index.get('N06E126')
+    assert row['vertical_datum'] == 'E96' and row['rel_horiz_acc'] is None
+    assert row['compilation_date'] == dt.date(2024, 7, 1)
+    assert report.set_counts == {'vertical_datum': 1, 'rel_horiz_acc': 1, 'compilation_date': 1}
+    # The profile fills the blank text fields of a DTED row but never an accuracy: a header's NA is a value.
+    assert row['producer_code'] == 'USCNIMA' and row['digitizing_system'] == 'SRTM'
+    assert row['abs_vert_acc'] is None and row['abs_horiz_acc'] is None
+    assert 'producer_code' in report.filled and 'abs_vert_acc' not in report.filled
+
+
+def test_the_dted_source_writes_the_complete_table(tmp_dir):
+    from egmtrans.dted.index import INDEX_COLUMNS
+
+    write_dted(os.path.join(tmp_dir, 'n06e126.dt0'), np.zeros((121, 121), dtype=np.int16), 126, 6)
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    index = build_index(out, from_dted=[tmp_dir])
+    assert set(index.columns) == {column.name for column in INDEX_COLUMNS}
+    assert set(read_index(out).columns) == {column.name for column in INDEX_COLUMNS}
+    assert index.get('N06E126')['abs_vert_acc'] is None, 'NA in the header stays NA'
+
+
+def test_a_cell_read_into_the_index_assembles_byte_identical(tmp_dir):
+    from egmtrans.dted.header import cell_geometry, encode_header, read_header
+    from egmtrans.dted.writer import DerivedFields, DtedMetadataSource, assemble_header
+
+    outline_a = [(3.0, 8.0), (4.0, 8.0), (4.0, 8.5), (3.0, 8.5)]
+    outline_b = [(3.0, 8.5), (4.0, 8.5), (4.0, 9.0), (3.0, 9.0)]
+    path = _codec_cell(os.path.join(tmp_dir, 'n03e008.dt0'), 8, 3,
+                       subregions=[(12, 6, None, 8, outline_a), (20, 10, 'NA', 12, outline_b)])
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    build_index(out, from_dted=[tmp_dir])
+    index = read_index(out)
+    items = index.subregions_of('N03E008')
+    assert [(s['seq'], s['abs_horiz_acc'], s['rel_horiz_acc'], len(s['outline'])) for s in items] == [
+        (1, 12, None, 4), (2, 20, None, 4)]
+    row = index.get('N03E008')
+    assembled, _ = assemble_header(
+        cell_geometry(8, 3, 0), metadata=DtedMetadataSource(index, None).for_cell('N03E008'),
+        derived=DerivedFields(vertical_datum='E96', partial_cell=row['partial_cell']),
+    )
+    assert encode_header(assembled) == encode_header(read_header(path))

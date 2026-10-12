@@ -13,7 +13,8 @@ EGMTrans ArcGIS Pro Toolbox
 This Python toolbox (.pyt) provides an ArcGIS Pro interface for the EGMTrans
 script. It allows users to perform vertical datum transformations directly
 within the ArcGIS Pro environment, make standard DTED deliveries from GeoTIFF
-tiles, and check, describe and complete them.
+tiles, build and validate the metadata index of a delivery, and check, describe
+and complete them.
 """
 import arcpy # type: ignore
 from importlib import reload
@@ -44,6 +45,8 @@ GEOTIFF_EXTENSIONS = (".tif", ".tiff")
 
 # The Output Format value list: the DTED level it stands for, or None for GeoTIFF.
 FORMAT_LEVELS = {"DTED2": 2, "DTED1": 1, "DTED0": 0, "GeoTIFF": None}
+# The DTED Level value list of the index tools: the level it stands for.
+INDEX_LEVELS = {"DTED2": 2, "DTED1": 1, "DTED0": 0}
 DEFAULT_FORMAT = "DTED2"
 ALL_DATUMS = ["WGS84", "EGM96", "EGM2008"]
 DTED_DATUMS = ["EGM96"]  # DTED is written in EGM96 only (MIL-PRF-89020B 3.2.2)
@@ -219,6 +222,60 @@ def _declared_datum(path):
         return None
 
 
+def _arc_logging():
+    """Log through the messages pane: the handler delivers only once arcpy is registered with the package."""
+    from egmtrans.arcpy_compat import init_arcpy
+
+    EGMTrans.setup_logger(None, False, is_arc_mode=True)
+    init_arcpy()
+
+
+def _settable_columns():
+    """The index columns an Index Overrides row may set: every column but the keys and the write stamp."""
+    from egmtrans.dted.index import ALWAYS_WRITTEN, INDEX_COLUMNS
+
+    return [column.name for column in INDEX_COLUMNS if column.name not in ALWAYS_WRITTEN]
+
+
+def _parse_index_overrides(pairs):
+    """The Index Overrides rows as the build's --set values; raises ValueError naming the column."""
+    from egmtrans.dted.harvest import parse_constants
+
+    return parse_constants([f"{name}={value}" for name, value in pairs])
+
+
+def _check_profile_level(p, level):
+    """Errors on the profile and level parameters of the index tools: a profile that cannot be
+    loaded, or one written for another level than the one chosen."""
+    from egmtrans.dted.profile import load_profile
+
+    profile_path = p["dted_profile"].valueAsText
+    if not profile_path:
+        return
+    try:
+        profile = load_profile(profile_path)
+    except (OSError, ValueError) as e:
+        p["dted_profile"].setErrorMessage(str(e))
+        return
+    if level is not None and profile.level not in (None, level):
+        p["dted_level"].setErrorMessage(f"The profile is for level {profile.level}, not {level}")
+
+
+def _check_index_name(parameter, message):
+    """An index is a GeoPackage or a GeoParquet file."""
+    from egmtrans.dted.index import SUPPORTED_INDEX_EXTENSIONS
+
+    text = parameter.valueAsText
+    if text and not text.lower().endswith(SUPPORTED_INDEX_EXTENSIONS):
+        parameter.setErrorMessage(message)
+
+
+def _add_issue(issue):
+    """An index finding in the messages pane, at its severity."""
+    (arcpy.AddError if issue.severity == "error" else arcpy.AddWarning if issue.severity == "warning"
+     else arcpy.AddMessage)(str(issue))
+
+
 class Toolbox:
     def __init__(self):
         """Define the toolbox (the name of the toolbox is the name of the
@@ -228,7 +285,7 @@ class Toolbox:
         self.icon = "../img/icons/EGMTrans_32.png"
 
         # List of tool classes associated with this toolbox
-        self.tools = [Tool, DtedHeaderReport, DtedSelfTest, DtedDmed]
+        self.tools = [Tool, DtedHeaderReport, DtedSelfTest, DtedDmed, DtedIndexBuild, DtedIndexValidate]
 
 
 class Tool:
@@ -1153,6 +1210,309 @@ class DtedDmed:
             f"Wrote {result.path}: {result.record_count} records of 394 bytes for {len(result.cells)} cell(s) in a "
             f"rectangle of {rectangle.east - rectangle.west} x {rectangle.north - rectangle.south} degrees."
         )
+        return
+
+    def postExecute(self, parameters):
+        return
+
+
+class DtedIndexBuild:
+    """Build the DTED metadata index of a delivery from the headers of its DTED files."""
+
+    def __init__(self):
+        self.label = "Build DTED Index"
+        self.description = (
+            "Build the DTED metadata index of a delivery from the headers of its DTED files: one row per cell "
+            "with the markings, edition, dates, producer and accuracies the headers hold, the accuracy "
+            "subregions, and the values the Index Overrides set in every row. The index is the manifest a run "
+            "reads and the template a producer completes in a GIS."
+        )
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        # A raster layer or dataset first, so the browse dialog's OK selects a
+        # DTED file it shows as a raster; a folder for a delivery.
+        input_param = arcpy.Parameter(
+            displayName="DTED File or Folder",
+            name="input",
+            datatype=["GPRasterLayer", "DEFile", "DEFolder"],
+            parameterType="Required",
+            direction="Input")
+
+        dted_level = arcpy.Parameter(
+            displayName="DTED Level",
+            name="dted_level",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        dted_level.filter.list = list(INDEX_LEVELS)
+
+        output = arcpy.Parameter(
+            displayName="Output Index",
+            name="output",
+            datatype="DEFile",
+            parameterType="Required",
+            direction="Output")
+        output.filter.list = ["gpkg", "parquet"]
+
+        index_overrides = arcpy.Parameter(
+            displayName="Index Overrides",
+            name="index_overrides",
+            datatype="GPValueTable",
+            parameterType="Optional",
+            direction="Input")
+        index_overrides.columns = [["GPString", "Index column"], ["GPString", "Value"]]
+        index_overrides.filters[0].type = "ValueList"
+        index_overrides.filters[0].list = _settable_columns()
+
+        dted_profile = arcpy.Parameter(
+            displayName="DTED Product Profile",
+            name="dted_profile",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
+        dted_profile.filter.list = ["toml"]
+        return [input_param, dted_level, output, index_overrides, dted_profile]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        _show_dataset(_by_name(parameters)["input"])
+        return
+
+    def updateMessages(self, parameters):
+        p = _by_name(parameters)
+        level = INDEX_LEVELS.get(p["dted_level"].valueAsText)
+        pairs = _override_pairs(p["index_overrides"])
+        if pairs:
+            try:
+                _parse_index_overrides(pairs)
+            except ValueError as e:
+                p["index_overrides"].setErrorMessage(str(e))
+        try:
+            _check_profile_level(p, level)
+        except Exception as e:  # validation must never take the dialog down
+            p["dted_profile"].setErrorMessage(f"The profile could not be checked: {e}")
+        _check_index_name(p["output"], "Name the index .gpkg or .parquet.")
+        return
+
+    def execute(self, parameters, messages):
+        from egmtrans.cli_dted import datum_lines, supply_lines
+        from egmtrans.dted.harvest import BuildReport, build_index
+        from egmtrans.dted.index import validate_index
+        from egmtrans.dted.profile import load_profile
+        from egmtrans.dted.validate import count
+
+        p = _by_name(parameters)
+        input_path = _input_path(p["input"])
+        level_text = p["dted_level"].valueAsText
+        level = INDEX_LEVELS.get(level_text)
+        output = p["output"].valueAsText
+        profile_path = p["dted_profile"].valueAsText or None
+        try:
+            constants = _parse_index_overrides(_override_pairs(p["index_overrides"]))
+        except ValueError as e:
+            arcpy.AddError(f"Index Overrides: {e}")
+            return
+        profile = None
+        if profile_path:
+            try:
+                profile = load_profile(profile_path)
+            except (OSError, ValueError) as e:
+                arcpy.AddError(str(e))
+                return
+
+        _arc_logging()
+        arcpy.AddMessage(EGMTrans.versions_line())
+        _warn_if_stale()
+        arcpy.AddMessage(f"DTED File or Folder: {input_path}")
+        arcpy.AddMessage(f"DTED Level: {level_text or 'the one level found'}")
+        arcpy.AddMessage(f"Output Index: {output}")
+        arcpy.AddMessage("Index Overrides: " + (", ".join(f"{k}={v}" for k, v in constants.items()) or "none"))
+        arcpy.AddMessage(f"DTED Product Profile: {profile_path or 'none'}")
+        arcpy.AddMessage(f'{"="*80}\n')
+
+        report = BuildReport()
+        failed = False
+        try:
+            index = build_index(
+                output, from_dted=[input_path], constants=constants, profile=profile, level=level, report=report,
+            )
+        except (OSError, ValueError, RuntimeError) as e:
+            arcpy.AddError(f"Index not written: {e}")
+            failed = True
+        except Exception as e:
+            arcpy.AddError(f"An error occurred: {e}")
+            from egmtrans.logging_setup import log_traceback
+
+            log_traceback()
+            failed = True
+        else:
+            # The index is on disk: what it holds, and what a run would make of
+            # it, as the command line reports after a build.
+            subregions = sum(len(items) for items in index.subregions.values())
+            arcpy.AddMessage(
+                f"{os.path.basename(output)}: {len(index)} cell(s), {subregions} subregion(s), level {index.level}"
+            )
+            issues = validate_index(
+                index, level=level, profile_values=profile.product if profile is not None else None
+            )
+            for issue in issues:
+                _add_issue(issue)
+            for line in datum_lines(index):
+                arcpy.AddWarning(line)
+            source = EGMTrans.DtedMetadataSource(index, profile, {})
+            for line in supply_lines(source, level if level is not None else index.level):
+                arcpy.AddMessage(line)
+            if report.failed:
+                arcpy.AddError(f"{len(report.failed)} file(s) gave no row; see the messages above.")
+            failed = bool(report.failed) or count(issues, "error") > 0
+        finally:
+            EGMTrans.end_logger(save_log=False)
+        arcpy.AddMessage(" ")
+        arcpy.AddMessage("Processing stopped with errors." if failed else "Processing completed.")
+        return
+
+    def postExecute(self, parameters):
+        return
+
+
+class DtedIndexValidate:
+    """Check a DTED metadata index as a run with the same profile and overrides would see it."""
+
+    def __init__(self):
+        self.label = "Validate DTED Index"
+        self.description = (
+            "Check a DTED metadata index with the product profile and the DTED Header Overrides of the run it is "
+            "meant for, as the run will see them: the values, keys and subregions, the level, the producer codes "
+            "against FIPS 10-4, and that every required header field comes from the index, the profile or an "
+            "override."
+        )
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        dted_index = arcpy.Parameter(
+            displayName="DTED Metadata Index",
+            name="dted_index",
+            datatype="DEFile",
+            parameterType="Required",
+            direction="Input")
+        dted_index.filter.list = ["gpkg", "parquet"]
+
+        dted_profile = arcpy.Parameter(
+            displayName="DTED Product Profile",
+            name="dted_profile",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
+        dted_profile.filter.list = ["toml"]
+
+        dted_overrides = arcpy.Parameter(
+            displayName="DTED Header Overrides",
+            name="dted_overrides",
+            datatype="GPValueTable",
+            parameterType="Optional",
+            direction="Input")
+        dted_overrides.columns = [["GPString", "Header field"], ["GPString", "Value"]]
+        dted_overrides.filters[0].type = "ValueList"
+        dted_overrides.filters[0].list = list(EGMTrans.HEADER_FIELD_NAMES)
+
+        dted_level = arcpy.Parameter(
+            displayName="DTED Level",
+            name="dted_level",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        dted_level.filter.list = list(INDEX_LEVELS)
+        return [dted_index, dted_profile, dted_overrides, dted_level]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        p = _by_name(parameters)
+        level = INDEX_LEVELS.get(p["dted_level"].valueAsText)
+        pairs = _override_pairs(p["dted_overrides"])
+        if pairs:
+            try:
+                EGMTrans.parse_overrides(pairs)
+            except ValueError as e:
+                p["dted_overrides"].setErrorMessage(str(e))
+        try:
+            _check_profile_level(p, level)
+        except Exception as e:  # validation must never take the dialog down
+            p["dted_profile"].setErrorMessage(f"The profile could not be checked: {e}")
+        _check_index_name(p["dted_index"], "An index is a .gpkg or .parquet file.")
+        return
+
+    def execute(self, parameters, messages):
+        from egmtrans.cli_dted import supply_lines
+        from egmtrans.dted.validate import count
+
+        p = _by_name(parameters)
+        index_path = p["dted_index"].valueAsText
+        profile_path = p["dted_profile"].valueAsText or None
+        level_text = p["dted_level"].valueAsText
+        level = INDEX_LEVELS.get(level_text)
+        try:
+            overrides = EGMTrans.parse_overrides(_override_pairs(p["dted_overrides"]))
+        except ValueError as e:
+            arcpy.AddError(f"DTED Header Overrides: {e}")
+            return
+        try:
+            source = _load_metadata(index_path, profile_path, overrides)
+        except MetadataFileError as e:
+            arcpy.AddError(str(e))
+            return
+
+        _arc_logging()
+        try:
+            arcpy.AddMessage(EGMTrans.versions_line())
+            _warn_if_stale()
+            arcpy.AddMessage(f"DTED Metadata Index: {index_path}")
+            arcpy.AddMessage(f"DTED Product Profile: {profile_path or 'none'}")
+            arcpy.AddMessage(
+                "DTED Header Overrides: " + (", ".join(f"{k}={v}" for k, v in overrides.items()) or "none")
+            )
+            arcpy.AddMessage(f"DTED Level: {level_text or 'the level of the index'}")
+            arcpy.AddMessage(f'{"="*80}\n')
+
+            index = source.index
+            subregions = sum(len(items) for items in index.subregions.values())
+            arcpy.AddMessage(
+                f"{os.path.basename(index_path)}: {len(index)} cell(s), level {index.level}, {subregions} subregion(s)"
+            )
+            issues = source.validate(level)
+            unsupplied = {}
+            if source.profile is not None:
+                # The run's own rule (coverage): a NULL row and a blank profile value are no source.
+                unsupplied = source.coverage(level).missing_required
+                if unsupplied:
+                    described = [
+                        name if name not in index.columns else f"{name} (NULL in {n:,} of {len(index):,} cells)"
+                        for name, n in unsupplied.items()
+                    ]
+                    arcpy.AddError(
+                        "Neither the index, the profile nor the DTED Header Overrides supplies: "
+                        + ", ".join(described)
+                    )
+            for issue in issues:
+                _add_issue(issue)
+            for line in supply_lines(source, level if level is not None else index.level):
+                arcpy.AddMessage(line)
+            errors = count(issues, "error")
+            arcpy.AddMessage(f"{errors} error(s), {count(issues, 'warning')} warning(s)")
+            arcpy.AddMessage(" ")
+            if errors or unsupplied:
+                arcpy.AddMessage("The index is not valid; see the messages above.")
+            else:
+                arcpy.AddMessage("The index is valid.")
+        finally:
+            EGMTrans.end_logger(save_log=False)
         return
 
     def postExecute(self, parameters):

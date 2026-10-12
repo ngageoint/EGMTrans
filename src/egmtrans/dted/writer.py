@@ -81,7 +81,8 @@ def parse_override(name: str, text: str, *, today: dt.date | None = None):
     if column is None:
         raise ValueError(f'{name!r} is not an index column')
     if name == 'dted_level':
-        raise ValueError('dted_level is not a header field; use --dted-level (or the DTED Level parameter)')
+        raise ValueError("dted_level is not a header field; use --dted-level (or the tool's Output Format or "
+                         'DTED Level parameter)')
     if column.dted_key is None:
         raise ValueError(f'{name} is a catalog column, not a header field')
     if column.check_only:
@@ -537,11 +538,12 @@ def assemble_header(
         current = header.stripped(COLUMNS_BY_NAME[column_name].dted_key)
         if str(value).strip() != current:
             # The derived code is written whatever the sources say; the
-            # disagreement means the index or profile describes another product.
-            logger.warning(
-                f'DTED header: {column_name} is {value!r} in the {where} but the output is {current!r}; '
-                f'the output keeps {current!r}'
-            )
+            # disagreement means the index or profile describes another
+            # product. In a batch it is tallied and summarized once at the end.
+            message = (f'{column_name} is {value!r} in the {where} but the output is {current!r}; '
+                       f'the output keeps {current!r}')
+            if not _state.tally_header_warning(message, cell.cell_id):
+                logger.warning(f'DTED header: {message}')
     if base is None:
         # Built from scratch, every required field must come from a source:
         # the spec fill (NA, 0000) is not a value for it. With a base header

@@ -147,12 +147,12 @@ def _warnings(param):
     return [text for kind, text in param.messages if kind == 'warning']
 
 
-def _write_dted0(path, lon0, lat0, datum_code='E96', heights=200):
-    """A DTED0 cell written with the package's own codec, no GDAL defaults."""
+def _write_dted0(path, lon0, lat0, datum_code='E96', heights=200, level=0):
+    """A DTED cell written with the package's own codec, no GDAL defaults; DTED0 unless *level* says otherwise."""
     from egmtrans.dted.header import CellGeometry, new_header
     from egmtrans.dted.records import write_dted_file
 
-    cell = CellGeometry(0, lon0, lat0)
+    cell = CellGeometry(level, lon0, lat0)
     header = new_header(cell)
     header.set('dsi.security_code', 'U')
     header.set_raw('uhl.security_code', 'U  ')
@@ -200,7 +200,7 @@ def test_parameter_names_types_and_defaults(monkeypatch):
         assert p[name].category is None, name
     assert set(toolbox.NAMING_LABELS.values()) <= set(toolbox.EGMTrans.DTED_NAMING_PRESETS)
     assert [tool_class.__name__ for tool_class in toolbox.Toolbox().tools] == [
-        'Tool', 'DtedHeaderReport', 'DtedSelfTest', 'DtedDmed',
+        'Tool', 'DtedHeaderReport', 'DtedSelfTest', 'DtedDmed', 'DtedIndexBuild', 'DtedIndexValidate',
     ]
 
 
@@ -638,6 +638,7 @@ def test_display_names_and_help_match_the_xml_files(monkeypatch):
         root = ET.parse(xml_path).getroot()
         tool_element = root.find('tool')
         assert tool_element is not None and tool_element.get('displayname') == tool_class().label
+        assert root.findtext('dataIdInfo/idCitation/resTitle') == tool_class().label, tool_class.__name__
         documented = {param.get('name'): param for param in tool_element.iter('param')}
         for parameter in tool_class().getParameterInfo():
             if parameter.direction == 'Output' and parameter.parameterType == 'Derived':
@@ -715,3 +716,272 @@ def test_a_band_chosen_in_the_browse_dialog_is_read_as_its_file(monkeypatch, tmp
     p['check_only'].value = True
     tool.execute(params, _Messages())
     assert any('matches the cells' in text for _kind, text in fake.messages)
+
+
+# -- 1.11.0: the index tools --------------------------------------------------
+
+def _index_rows(cells):
+    from egmtrans.dted.index import new_row
+
+    complete = dict(security_code='U', data_edition=1, match_merge_version='A', producer_code='USNGA',
+                    compilation_date='2024-07', abs_horiz_acc=3, abs_vert_acc=5, rel_horiz_acc=3, rel_vert_acc=3)
+    return {cell: new_row(cell, **complete) for cell in cells}
+
+
+def test_index_tool_parameters(monkeypatch):
+    from egmtrans.dted.index import ALWAYS_WRITTEN, INDEX_COLUMNS
+    from egmtrans.dted.writer import HEADER_FIELD_NAMES
+
+    toolbox, _fake = _load_toolbox(monkeypatch)
+    build = toolbox.DtedIndexBuild()
+    assert build.label == 'Build DTED Index'
+    params = build.getParameterInfo()
+    assert [param.name for param in params] == ['input', 'dted_level', 'output', 'index_overrides', 'dted_profile']
+    p = _by_name(params)
+    assert p['input'].datatype == ['GPRasterLayer', 'DEFile', 'DEFolder'] and p['input'].parameterType == 'Required'
+    assert p['dted_level'].filter.list == ['DTED2', 'DTED1', 'DTED0'] and p['dted_level'].value is None
+    assert p['dted_level'].parameterType == 'Optional' and p['dted_level'].datatype == 'GPString'
+    assert p['output'].direction == 'Output' and p['output'].parameterType == 'Required'
+    assert p['output'].datatype == 'DEFile' and p['output'].filter.list == ['gpkg', 'parquet']
+    overrides = p['index_overrides']
+    assert overrides.datatype == 'GPValueTable' and overrides.parameterType == 'Optional'
+    assert overrides.columns == [['GPString', 'Index column'], ['GPString', 'Value']]
+    assert overrides.filters[0].type == 'ValueList'
+    assert 'vertical_datum' in overrides.filters[0].list and 'source_file' in overrides.filters[0].list
+    assert not {'cell_id', 'dted_level', 'updated'} & set(overrides.filters[0].list)
+    assert overrides.filters[0].list == [column.name for column in INDEX_COLUMNS if column.name not in ALWAYS_WRITTEN]
+    assert p['dted_profile'].filter.list == ['toml'] and p['dted_profile'].parameterType == 'Optional'
+    assert all(param.category is None for param in params)
+
+    validate = toolbox.DtedIndexValidate()
+    assert validate.label == 'Validate DTED Index'
+    params = validate.getParameterInfo()
+    assert [param.name for param in params] == ['dted_index', 'dted_profile', 'dted_overrides', 'dted_level']
+    p = _by_name(params)
+    assert p['dted_index'].parameterType == 'Required' and p['dted_index'].filter.list == ['gpkg', 'parquet']
+    assert p['dted_index'].datatype == 'DEFile' and p['dted_index'].direction == 'Input'
+    assert p['dted_overrides'].columns == [['GPString', 'Header field'], ['GPString', 'Value']]
+    assert p['dted_overrides'].filters[0].list == list(HEADER_FIELD_NAMES)
+    assert p['dted_level'].filter.list == ['DTED2', 'DTED1', 'DTED0'] and p['dted_level'].value is None
+    assert p['dted_profile'].filter.list == ['toml'] and p['dted_profile'].parameterType == 'Optional'
+
+
+def test_index_build_messages_route_to_their_parameters(monkeypatch, tmp_dir):
+    toolbox, _fake = _load_toolbox(monkeypatch)
+    tool = toolbox.DtedIndexBuild()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    p['input'].value = os.path.join(tmp_dir, 'nowhere')  # validation never walks the input
+    p['output'].value = os.path.join(tmp_dir, 'index.gpkg')
+    _validate(tool, params)
+    assert not any(param.messages for param in params), [(param.name, param.messages) for param in params]
+
+    # A column the build fills itself cannot be set; a datum code can; a bad value is the overrides' own error.
+    p['index_overrides'].values = [['cell_id', 'N49E006']]
+    _validate(tool, params)
+    assert _errors(p['index_overrides']) and 'cell_id' in _errors(p['index_overrides'])[0]
+    p['index_overrides'].values = [['vertical_datum', 'E96'], ['', '']]
+    _validate(tool, params)
+    assert not any(param.messages for param in params)
+    p['index_overrides'].values = [['security_code', 'x']]
+    _validate(tool, params)
+    assert any('U, R, C, S' in text for text in _errors(p['index_overrides']))
+    p['index_overrides'].values = None
+
+    # A profile that cannot be read is an error on the profile; its level must be the chosen one.
+    bad_profile = os.path.join(tmp_dir, 'bad.toml')
+    with open(bad_profile, 'w', encoding='utf-8') as handle:
+        handle.write('schema = 1\n[product]\nproducer_code = "<fill in>"\n')
+    p['dted_profile'].value = bad_profile
+    _validate(tool, params)
+    assert any('placeholder not filled' in text for text in _errors(p['dted_profile']))
+    p['dted_profile'].value = PROFILE
+    p['dted_level'].value = 'DTED0'
+    _validate(tool, params)
+    assert any('level 2, not 0' in text for text in _errors(p['dted_level'])) and not _errors(p['dted_profile'])
+    p['dted_level'].value = 'DTED2'
+    _validate(tool, params)
+    assert not any(param.messages for param in params)
+
+    # The index is a .gpkg or .parquet file.
+    p['output'].value = os.path.join(tmp_dir, 'index.csv')
+    _validate(tool, params)
+    assert any('.gpkg or .parquet' in text for text in _errors(p['output']))
+    p['output'].value = os.path.join(tmp_dir, 'index.parquet')
+
+    # A band chosen in the browse dialog stands for its file.
+    cell = _write_dted0(os.path.join(tmp_dir, 'n49.dt0'), 6, 49)
+    p['input'].value = os.path.join(cell, 'Band_1')
+    _validate(tool, params)
+    assert p['input'].value == cell and not p['input'].messages
+
+
+def test_index_overrides_follow_the_set_rules(monkeypatch, tmp_dir):
+    """The Index Overrides rows are --set rows: the write stamp and the level are not values to set, a date
+    is within 1980-2079 or today, an accuracy takes NA."""
+    toolbox, _fake = _load_toolbox(monkeypatch)
+    tool = toolbox.DtedIndexBuild()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    p['input'].value = os.path.join(tmp_dir, 'cells')
+    p['output'].value = os.path.join(tmp_dir, 'index.gpkg')
+    p['index_overrides'].values = [['updated', '2026-10-10']]
+    _validate(tool, params)
+    assert _errors(p['index_overrides']) and 'updated' in _errors(p['index_overrides'])[0]
+    p['index_overrides'].values = [['dted_level', '2']]
+    _validate(tool, params)
+    assert any('DTED Level' in text for text in _errors(p['index_overrides']))
+    p['index_overrides'].values = [['compilation_date', '1975-06']]
+    _validate(tool, params)
+    assert any('1980-2079' in text for text in _errors(p['index_overrides']))
+    p['index_overrides'].values = [['compilation_date', 'today'], ['rel_horiz_acc', 'NA']]
+    _validate(tool, params)
+    assert not p['index_overrides'].messages
+
+
+def test_index_build_executes_from_a_delivery_tree(monkeypatch, tmp_dir):
+    from egmtrans.dted.index import read_index
+
+    toolbox, fake = _load_toolbox(monkeypatch)
+    delivery = os.path.join(tmp_dir, 'delivery')
+    os.makedirs(os.path.join(delivery, 'DTED', 'E126'))
+    os.makedirs(os.path.join(delivery, 'DTED', 'E127'))
+    _write_dted0(os.path.join(delivery, 'DTED', 'E126', 'N06.dt0'), 126, 6, datum_code='E08')
+    _write_dted0(os.path.join(delivery, 'DTED', 'E126', 'N07.dt0'), 126, 7, datum_code='E08')
+    short = os.path.join(delivery, 'DTED', 'E127', 'N06.dt0')
+    with open(short, 'wb') as handle:
+        handle.write(b'UHL1' + b' ' * 6)
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    tool = toolbox.DtedIndexBuild()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    p['input'].value = delivery
+    p['output'].value = out
+    p['index_overrides'].values = [['producer_code', 'USTEST'], ['vertical_datum', 'E96']]
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    index = read_index(out)
+    assert sorted(index.rows) == ['N06E126', 'N07E126'] and index.level == 0
+    for cell, row in index.rows.items():
+        assert row['producer_code'] == 'USTEST' and row['vertical_datum'] == 'E96', cell
+        assert not os.path.isabs(row['source_file']) and row['source_file'].endswith(f"{cell[:3]}.dt0"), row
+    assert any('Found 3 DTED file(s)' in text and '3 .dt0' in text for text in texts), texts
+    assert any(kind == 'error' and 'too short' in text for kind, text in fake.messages), texts
+    assert 'index.gpkg: 2 cell(s), 0 subregion(s), level 0' in texts
+    assert any('1 file(s) gave no row' in text for text in texts)
+    assert any(text.startswith('Required header fields the index supplies for every cell') for text in texts)
+    assert texts[-1] == 'Processing stopped with errors.'
+
+    os.remove(short)
+    fake.messages.clear()
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    assert not any(kind == 'error' for kind, _text in fake.messages), texts
+    assert texts[-1] == 'Processing completed.'
+
+
+def test_index_build_needs_a_level_when_several_are_found(monkeypatch, tmp_dir):
+    from egmtrans.dted.index import read_index
+
+    toolbox, fake = _load_toolbox(monkeypatch)
+    cells = os.path.join(tmp_dir, 'cells')
+    os.makedirs(cells)
+    _write_dted0(os.path.join(cells, 'n06e126.dt0'), 126, 6)
+    _write_dted0(os.path.join(cells, 'n07e126.dt1'), 126, 7, level=1)
+    out = os.path.join(tmp_dir, 'index.gpkg')
+    tool = toolbox.DtedIndexBuild()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    p['input'].value = cells
+    p['output'].value = out
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    assert any('Index not written' in text and 'several DTED levels' in text for text in texts), texts
+    assert not os.path.exists(out) and texts[-1] == 'Processing stopped with errors.'
+
+    fake.messages.clear()
+    p['dted_level'].value = 'DTED1'
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    index = read_index(out)
+    assert list(index.rows) == ['N07E126'] and index.level == 1
+    assert any('skipped' in text for text in texts) and texts[-1] == 'Processing completed.'
+
+
+def test_index_validate_tool(monkeypatch, tmp_dir):
+    from egmtrans.dted.index import write_index
+
+    toolbox, fake = _load_toolbox(monkeypatch)
+    index_path = os.path.join(tmp_dir, 'index.gpkg')
+    write_index(index_path, _index_rows(('N06E126', 'N07E126')), level=0)
+    tool = toolbox.DtedIndexValidate()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    p['dted_index'].value = index_path
+    _validate(tool, params)
+    assert not any(param.messages for param in params)
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    assert 'index.gpkg: 2 cell(s), level 0, 0 subregion(s)' in texts
+    assert '0 error(s), 0 warning(s)' in texts and texts[-1] == 'The index is valid.'
+    assert any(text.startswith('Required header fields the index supplies for every cell') for text in texts)
+
+    # The level asked for is checked against the index's.
+    fake.messages.clear()
+    p['dted_level'].value = 'DTED2'
+    tool.execute(params, _Messages())
+    assert ('error', 'ERROR INDEX.dted_level: the index is for level 0, not 2') in fake.messages
+    assert [text for _kind, text in fake.messages][-1] == 'The index is not valid; see the messages above.'
+
+    # A profile for another level is an error on the level in the dialog, and in the run.
+    p['dted_level'].value = 'DTED0'
+    p['dted_profile'].value = PROFILE
+    _validate(tool, params)
+    assert any('level 2, not 0' in text for text in _errors(p['dted_level'])) and not _errors(p['dted_profile'])
+    fake.messages.clear()
+    tool.execute(params, _Messages())
+    assert any(kind == 'error' and 'PROFILE' in text and 'level 2, not 0' in text for kind, text in fake.messages)
+    assert [text for _kind, text in fake.messages][-1] == 'The index is not valid; see the messages above.'
+    p['dted_profile'].value = None
+
+    # A bad override is its own error, in the dialog and in the run; a good one counts as a source.
+    p['dted_overrides'].values = [['dted_level', '2']]
+    _validate(tool, params)
+    assert 'use --dted-level' in _errors(p['dted_overrides'])[0]
+    fake.messages.clear()
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    assert texts[0].startswith('DTED Header Overrides: ') and not any('cell(s)' in text for text in texts)
+    p['dted_overrides'].values = [['compilation_date', 'today']]
+    _validate(tool, params)
+    assert not p['dted_overrides'].messages
+    fake.messages.clear()
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    assert texts[-1] == 'The index is valid.' and any('compilation_date' in text for text in texts)
+
+    # A profile that cannot supply a field the index lacks is one error naming the field.
+    p['dted_overrides'].values = None
+    rows = _index_rows(('N06E126', 'N07E126'))
+    for row in rows.values():
+        row['producer_code'] = None
+    write_index(index_path, rows, level=0)
+    with open(os.path.join(tmp_dir, 'level0.toml'), 'w', encoding='utf-8') as handle:
+        handle.write('schema = 1\n[product]\ndted_level = 0\n')
+    p['dted_profile'].value = os.path.join(tmp_dir, 'level0.toml')
+    fake.messages.clear()
+    tool.execute(params, _Messages())
+    texts = [text for _kind, text in fake.messages]
+    assert any(text.startswith('Neither the index, the profile nor the DTED Header Overrides supplies: producer_code')
+               for text in texts), texts
+    assert texts[-1] == 'The index is not valid; see the messages above.'
+    p['dted_profile'].value = None
+
+    # The index is a .gpkg or .parquet file, and it must exist.
+    p['dted_index'].value = os.path.join(tmp_dir, 'index.csv')
+    _validate(tool, params)
+    assert any('.gpkg or .parquet' in text for text in _errors(p['dted_index']))
+    p['dted_index'].value = os.path.join(tmp_dir, 'missing.gpkg')
+    fake.messages.clear()
+    tool.execute(params, _Messages())
+    assert fake.messages[0][0] == 'error' and 'not found' in fake.messages[0][1].lower()
