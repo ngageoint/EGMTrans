@@ -7,14 +7,16 @@ from __future__ import annotations
 import datetime as dt
 import glob
 import json
+import logging
 import math
 import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import PurePath
 
 from egmtrans import _state
-from egmtrans.dted.header import DtedHeader, read_header, yymm_to_iso
+from egmtrans.dted.header import MAX_COORDINATES, DtedHeader, decode_accuracy, yymm_to_iso
 from egmtrans.dted.header import cell_id as make_cell_id
 from egmtrans.dted.index import (
     ACCURACY_COLUMNS,
@@ -32,7 +34,8 @@ from egmtrans.dted.index import (
     write_index,
 )
 from egmtrans.dted.profile import Profile
-from egmtrans.dted.schema import LEVELS
+from egmtrans.dted.schema import LEVEL_BY_EXTENSION, LEVELS, MIN_COORDINATES
+from egmtrans.dted.validate import validate_file
 
 DTED_EXTENSIONS = tuple(level.extension for level in LEVELS.values())
 RASTER_EXTENSIONS = ('.tif', '.tiff')
@@ -59,6 +62,11 @@ def _now() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
 
 
+def _printable(text: str) -> str:
+    """The field's text with every byte that is not printable read as a blank, as the validator reads it."""
+    return ''.join(ch if 32 <= ord(ch) <= 126 else ' ' for ch in text)
+
+
 def _text(header: DtedHeader, key: str) -> str | None:
     """The field's text without padding; bytes that are not printable (the NULs
     some writers leave) are dropped, so a defective header harvests as blank."""
@@ -66,24 +74,114 @@ def _text(header: DtedHeader, key: str) -> str | None:
     return value or None
 
 
-def _accuracy(header: DtedHeader, key: str) -> int | None:
+def _tally(tally: dict[str, list[str]], message: str, cell: str) -> None:
+    """Record *message* for *cell* once, messages in order of first appearance."""
+    cells = tally.setdefault(message, [])
+    if cell not in cells:
+        cells.append(cell)
+
+
+def tally_lines(tally: dict[str, list[str]], what: str) -> list[str]:
+    """One line per message: ``{what} N cell(s) (the first five): message``."""
+    lines = []
+    for message, cells in tally.items():
+        shown = ', '.join(cells[:5]) + (f', and {len(cells) - 5:,} more' if len(cells) > 5 else '')
+        lines.append(f'{what} {len(cells):,} cell(s) ({shown}): {message}')
+    return lines
+
+
+def _relative(path: str, root: str | None) -> str:
+    """How a row names its file: relative to the folder it was found under, with
+    forward slashes so an index built on one computer reads on another; the bare
+    name for a file given directly."""
+    if root is None:
+        return os.path.basename(path)
+    return PurePath(os.path.relpath(path, root)).as_posix()
+
+
+def _subregion_rows(header: DtedHeader, cell: str, note) -> list[dict]:
+    """The subregion rows of a header; a malformed block drops them all with a note."""
+    subregions = []
     try:
-        return header.accuracy(key)
-    except ValueError:
-        return None
+        for seq, subregion in enumerate(header.subregions(), start=1):
+            outline = subregion.decoded_outline()
+            if any(lat is None or lon is None for lat, lon in outline):
+                raise ValueError(f'subregion {seq}: a coordinate pair is malformed')
+            if not MIN_COORDINATES <= len(outline) <= MAX_COORDINATES:
+                raise ValueError(f'subregion {seq}: {len(outline)} vertices; {MIN_COORDINATES} to '
+                                 f'{MAX_COORDINATES} are allowed')
+            try:
+                accuracies = subregion.accuracies()
+            except ValueError as e:
+                raise ValueError(f'subregion {seq}: {e}') from None
+            subregions.append({'cell_id': cell, 'seq': seq, 'outline': outline, **accuracies})
+    except ValueError as e:
+        note(f'subregions dropped: {e}')
+        return []
+    return subregions
 
 
-def _date(header: DtedHeader, key: str) -> dt.date | None:
-    iso = yymm_to_iso(header[key])
-    return parse_date(iso) if iso else None
+def row_from_header(
+    header: DtedHeader,
+    path: str | None = None,
+    *,
+    root: str | None = None,
+    level: int | None = None,
+    notes: dict[str, list[str]] | None = None,
+) -> tuple[dict, list[dict]]:
+    """An index row and the subregion rows that describe an existing header.
 
-
-def row_from_header(header: DtedHeader, path: str | None = None) -> tuple[dict, list[dict]]:
-    """An index row and the subregion rows that describe an existing header."""
+    *level* is the level the file name gives (the caller's filter); without it
+    the header's own evidence decides. *root* is the folder the file was found
+    under, so ``source_file`` is relative to it (the bare name without one).
+    A value the index cannot hold is left NULL and, with *notes* (a tally of
+    message to cells), reported with the column and the raw text; a malformed
+    subregion block is dropped the same way. Bytes that are not printable are
+    read as blanks, as the validator reads them.
+    """
     cell = header.cell_id
     if cell is None:
         raise ValueError(f'{os.path.basename(path or "header")}: the origin cannot be read')
-    level = header.detect_level(os.path.splitext(path)[1] if path else None).level
+
+    def note(message: str) -> None:
+        if notes is not None:
+            _tally(notes, message, cell)
+
+    detected = header.detect_level(os.path.splitext(path)[1] if path else None)
+    if level is None:
+        level = detected.level
+    elif detected.conflict:
+        said = next((vote for vote in (detected.by_lat_interval, detected.by_lat_points, detected.by_series)
+                     if vote is not None and vote != level), None)
+        if said is not None:
+            note(f'dted_level {level} from the file name; the header says level {said}')
+
+    def accuracy(name: str, key: str) -> int | None:
+        text = _printable(header[key])
+        try:
+            return decode_accuracy(text)
+        except ValueError:
+            note(f'{name} {text.strip()!r} is NA in the index: not an accuracy (0000-9999 or NA)')
+            return None
+
+    def date(name: str, key: str) -> dt.date | None:
+        text = _printable(header[key])
+        iso = yymm_to_iso(text)
+        if iso is None:
+            if text.strip() not in ('', '0000'):
+                note(f'{name} {text.strip()!r} is NULL in the index: not a YYMM date')
+            return None
+        return parse_date(iso)
+
+    def number(name: str, key: str) -> int | None:
+        text = _printable(header[key]).strip()
+        if text == '':
+            return None
+        if text.isdigit():
+            return int(text)
+        note(f'{name} {text!r} is NULL in the index: not a number')
+        return None
+
     row = new_row(
         cell,
         dted_level=level,
@@ -92,53 +190,223 @@ def row_from_header(header: DtedHeader, path: str | None = None) -> tuple[dict, 
         security_handling=_text(header, 'dsi.security_handling'),
         unique_ref_uhl=_text(header, 'uhl.unique_ref'),
         unique_ref_dsi=_text(header, 'dsi.unique_ref'),
-        data_edition=int(header['dsi.data_edition']) if header['dsi.data_edition'].strip().isdigit() else None,
+        data_edition=number('data_edition', 'dsi.data_edition'),
         match_merge_version=_text(header, 'dsi.match_merge_version'),
-        maintenance_date=_date(header, 'dsi.maintenance_date'),
-        match_merge_date=_date(header, 'dsi.match_merge_date'),
+        maintenance_date=date('maintenance_date', 'dsi.maintenance_date'),
+        match_merge_date=date('match_merge_date', 'dsi.match_merge_date'),
         maintenance_code=_text(header, 'dsi.maintenance_code'),
         producer_code=_text(header, 'dsi.producer_code'),
         product_spec=_text(header, 'dsi.product_spec'),
         product_spec_amend=_text(header, 'dsi.product_spec_amend'),
-        product_spec_date=_date(header, 'dsi.product_spec_date'),
+        product_spec_date=date('product_spec_date', 'dsi.product_spec_date'),
         vertical_datum=_text(header, 'dsi.vertical_datum'),
         horizontal_datum=_text(header, 'dsi.horizontal_datum'),
         digitizing_system=_text(header, 'dsi.digitizing_system'),
-        compilation_date=_date(header, 'dsi.compilation_date'),
-        abs_horiz_acc=_accuracy(header, 'acc.abs_horiz_acc'),
-        abs_vert_acc=_accuracy(header, 'acc.abs_vert_acc'),
-        rel_horiz_acc=_accuracy(header, 'acc.rel_horiz_acc'),
-        rel_vert_acc=_accuracy(header, 'acc.rel_vert_acc'),
+        compilation_date=date('compilation_date', 'dsi.compilation_date'),
+        abs_horiz_acc=accuracy('abs_horiz_acc', 'acc.abs_horiz_acc'),
+        abs_vert_acc=accuracy('abs_vert_acc', 'acc.abs_vert_acc'),
+        rel_horiz_acc=accuracy('rel_horiz_acc', 'acc.rel_horiz_acc'),
+        rel_vert_acc=accuracy('rel_vert_acc', 'acc.rel_vert_acc'),
         acc_nima_reserved=_text(header, 'acc.nima_reserved'),
         dsi_nima_text=_text(header, 'dsi.nima_text'),
         dsi_producer_text=_text(header, 'dsi.producer_text'),
         dsi_free_text=_text(header, 'dsi.free_text'),
-        partial_cell=int(header['dsi.partial_cell']) if header['dsi.partial_cell'].strip().isdigit() else None,
-        source_file=os.path.abspath(path) if path else None,
+        partial_cell=number('partial_cell', 'dsi.partial_cell'),
+        source_file=_relative(path, root) if path else None,
         updated=_now(),
     )
-    subregions = []
-    for seq, subregion in enumerate(header.subregions(), start=1):
-        outline = subregion.decoded_outline()
-        if any(lat is None or lon is None for lat, lon in outline):
+    for column in INDEX_COLUMNS:
+        if column.dted_key is None and column.name != 'partial_cell':
             continue
-        accuracies = subregion.accuracies()
-        subregions.append({'cell_id': cell, 'seq': seq, 'outline': outline, **accuracies})
-    return row, subregions
+        value = row.get(column.name)
+        if value is None:
+            continue
+        problem = check_value(column, value)
+        if problem:
+            raw = _printable(header[column.dted_key]).strip() if column.dted_key else str(value)
+            note(f'{column.name} {raw!r} is NULL in the index: {problem}')
+            row[column.name] = None
+    return row, _subregion_rows(header, cell, note)
 
 
-def rows_from_dted(paths: Iterable[str]) -> tuple[dict[str, dict], dict[str, list[dict]]]:
-    """Rows and subregions harvested from DTED files (or folders of them)."""
-    rows: dict[str, dict] = {}
-    subregions: dict[str, list[dict]] = {}
-    for path in find_files(paths, DTED_EXTENSIONS):
-        row, items = row_from_header(read_header(path), path)
-        rows[row['cell_id']] = row
-        if items:
-            subregions[row['cell_id']] = items
+def _level_of_extension(extension: str) -> int:
+    found = LEVEL_BY_EXTENSION.get(extension)
+    return found.number if found is not None else 0  # a DTED0 companion (.avg, .min, .max)
+
+
+@dataclass
+class DtedScan:
+    """The DTED files under the paths given, classified by extension before any is read."""
+
+    paths: list[str]
+    files: list[tuple[str, str | None, int]] = field(default_factory=list)  # (path, root folder or None, level)
+    by_extension: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def levels(self) -> set[int]:
+        return {level for _, _, level in self.files}
+
+    def of_level(self, level: int) -> list[tuple[str, str | None]]:
+        return [(path, root) for path, root, found in self.files if found == level]
+
+    @property
+    def where(self) -> str:
+        return ', '.join(self.paths)
+
+    @property
+    def counts(self) -> str:
+        return ', '.join(f'{n} {extension}' for extension, n in self.by_extension.items())
+
+    def describe(self, what: str = 'DTED file(s)') -> str:
+        """The counts line: ``Found 12 DTED file(s) under /data: 8 .dt1, 4 .dt2``."""
+        if not self.files:
+            return f'No {what} under {self.where}'
+        return f'Found {len(self.files)} {what} under {self.where}: {self.counts}'
+
+
+def scan_dted(paths: Iterable[str], *, extensions: tuple[str, ...] = DTED_EXTENSIONS) -> DtedScan:
+    """Walk *paths* (files or folders, sorted, extensions matched case apart) and
+    count the files by extension; nothing is opened. A missing path raises
+    FileNotFoundError; a file given directly must have one of *extensions*."""
+    scan = DtedScan([str(path) for path in paths])
+    counts = {extension: 0 for extension in extensions}
+
+    def take(path: str, root: str | None) -> bool:
+        extension = os.path.splitext(path)[1].lower()
+        if extension not in counts:
+            return False
+        counts[extension] += 1
+        scan.files.append((path, root, _level_of_extension(extension)))
+        return True
+
+    for path in scan.paths:
+        if os.path.isdir(path):
+            for folder, dirs, names in os.walk(path):
+                dirs.sort()
+                for name in sorted(names):
+                    take(os.path.join(folder, name), path)
+        elif os.path.isfile(path):
+            if not take(path, None):
+                raise ValueError(f'{path}: not a DTED file ({", ".join(extensions)})')
         else:
-            subregions.pop(row['cell_id'], None)
-    return rows, subregions
+            raise FileNotFoundError(path)
+    scan.by_extension = {extension: n for extension, n in counts.items() if n}
+    return scan
+
+
+def choose_level(scan: DtedScan, level: int | None) -> int:
+    """The level the index is for: *level* when given and present, else the one level found.
+
+    Raises:
+        ValueError: When nothing was found, the level asked for has no file,
+            or several levels were found and none was asked for.
+    """
+    if not scan.files:
+        raise ValueError(f'No DTED file ({", ".join(DTED_EXTENSIONS)}) under {scan.where}')
+    found = scan.levels
+    if level is None:
+        if len(found) == 1:
+            return next(iter(found))
+        options = ' or '.join(f'--level {number}' for number in sorted(found))
+        raise ValueError(f'The input holds several DTED levels ({scan.counts}); an index describes one level: '
+                         f'give {options} (the DTED Level parameter in ArcGIS Pro)')
+    if level not in found:
+        raise ValueError(f'No {LEVELS[level].extension} file under {scan.where} for --level {level}; '
+                         f'found {scan.counts}')
+    return level
+
+
+def reading_line(scan: DtedScan, level: int) -> str:
+    extension = LEVELS[level].extension
+    line = f'Reading {scan.by_extension.get(extension, 0)} {extension} file(s) for level {level}'
+    skipped = ', '.join(f'{n} {ext}' for ext, n in scan.by_extension.items() if ext != extension)
+    return f'{line}; skipped: {skipped}' if skipped else line
+
+
+@dataclass
+class DtedImport:
+    """What reading the files of one level gave: the rows and subregions, the
+    files that gave no row (errors), the index-side notes and the headers'
+    own findings, both tallied as message to cells."""
+
+    level: int
+    rows: dict[str, dict] = field(default_factory=dict)
+    subregions: dict[str, list[dict]] = field(default_factory=dict)
+    read: int = 0
+    skipped: dict[str, int] = field(default_factory=dict)  # extension -> files of other levels, unread
+    failed: list[str] = field(default_factory=list)
+    files_without_row: int = 0
+    notes: dict[str, list[str]] = field(default_factory=dict)
+    findings: dict[str, list[str]] = field(default_factory=dict)
+
+
+def import_dted(scan: DtedScan, level: int) -> DtedImport:
+    """Read every file of *level* in *scan* into rows, continuing past the files
+    that cannot be read: each is reported in ``failed`` and gets no row, as does
+    a cell that two files describe. Each header is read once and validated; its
+    errors and warnings go to ``findings``."""
+    imported = DtedImport(level)
+    extension = LEVELS[level].extension
+    imported.skipped = {ext: n for ext, n in scan.by_extension.items() if ext != extension}
+    by_cell: dict[str, list[str]] = {}
+    for path, root in scan.of_level(level):
+        shown = _relative(path, root)
+        try:
+            header, issues = validate_file(path)
+        except (OSError, ValueError) as e:
+            message = str(e)
+            base = os.path.basename(path)
+            if message.startswith(base + ' '):
+                message = message[len(base) + 1:]
+            imported.failed.append(f'{shown}: {message}; no row')
+            imported.files_without_row += 1
+            continue
+        imported.read += 1
+        cell = header.cell_id
+        if cell is None:
+            imported.failed.append(f'{shown}: the origin cannot be read; no row')
+            imported.files_without_row += 1
+            continue
+        for issue in issues:
+            if issue.severity != 'info':
+                _tally(imported.findings, str(issue), cell)
+        by_cell.setdefault(cell, []).append(shown)
+        row, items = row_from_header(header, path, root=root, level=level, notes=imported.notes)
+        imported.rows[cell] = row
+        if items:
+            imported.subregions[cell] = items
+        else:
+            imported.subregions.pop(cell, None)
+    for cell, paths in by_cell.items():
+        if len(paths) > 1:
+            imported.rows.pop(cell, None)
+            imported.subregions.pop(cell, None)
+            imported.failed.append(f'{cell}: {len(paths)} files for one cell at level {level}: '
+                                   f'{", ".join(paths)}; no row for the cell')
+            imported.files_without_row += len(paths)
+    return imported
+
+
+def import_lines(imported: DtedImport) -> list[tuple[int, str]]:
+    """The import's report as (logging level, line): the failures, then the
+    notes and the findings, each once with the cells concerned."""
+    lines = [(logging.ERROR, line) for line in imported.failed]
+    if imported.failed:
+        lines.append((logging.ERROR, f'{imported.files_without_row} file(s) have no row in the index; '
+                                     f'the index holds the {len(imported.rows)} other cell(s)'))
+    lines.extend((logging.WARNING, line) for line in tally_lines(imported.notes, 'In'))
+    lines.extend((logging.WARNING, line) for line in tally_lines(imported.findings, 'Source header finding in'))
+    return lines
+
+
+def rows_from_dted(paths: Iterable[str], *, level: int | None = None) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    """Rows and subregions harvested from DTED files (or folders of them) of one
+    level; raises ValueError with every failure when a file gave no row."""
+    scan = scan_dted(paths)
+    imported = import_dted(scan, choose_level(scan, level))
+    if imported.failed:
+        raise ValueError('\n'.join(imported.failed))
+    return imported.rows, imported.subregions
 
 
 def cells_covered(geotransform: tuple, cols: int, rows: int) -> list[str]:
@@ -422,24 +690,70 @@ def parse_column_map(pairs: Iterable[str]) -> dict[str, str]:
     return mapping
 
 
-def parse_constants(pairs: Iterable[str]) -> dict[str, object]:
-    """``INDEX_COLUMN=VALUE`` pairs as typed, checked column values."""
+def _constant(column: Column, text: str, today: dt.date | None):
+    clean = text.strip()
+    if column.type == 'date':
+        if clean == '':
+            value = None
+        elif clean.lower() == 'today':
+            value = today or dt.date.today()
+        else:
+            value = parse_date(clean)
+    elif column.type == 'int':
+        if clean == '' or (column.name in ACCURACY_COLUMNS and clean.upper() == 'NA'):
+            value = None
+        else:
+            try:
+                value = int(clean)
+            except ValueError:
+                what = 'a whole number of meters' if column.name in ACCURACY_COLUMNS else 'an integer'
+                raise ValueError(f'{clean!r} is not {what}') from None
+    else:
+        value = clean or None
+    if value is None and column.required and column.name not in ACCURACY_COLUMNS:
+        raise ValueError('a required column needs a value')
+    problem = check_value(column, value)
+    if problem:
+        raise ValueError(problem)
+    return value
+
+
+def parse_constants(pairs: Iterable, *, today: dt.date | None = None) -> dict[str, object]:
+    """``INDEX_COLUMN=VALUE`` strings (or ``(column, value)`` pairs) as typed,
+    checked column values: any column but the cell, the level and the write
+    stamp; a date as ``YYYY-MM``, ``YYYY-MM-DD`` or ``today`` (*today* when
+    given); an accuracy as whole meters or ``NA``; text stripped, a blank
+    clearing an optional column. The value is checked as the run checks an
+    override.
+
+    Raises:
+        ValueError: On a malformed pair, a column that cannot be set, a repeat,
+            or a value the column cannot hold.
+    """
     constants: dict[str, object] = {}
     for pair in pairs or ():
-        if '=' not in pair:
-            raise ValueError(f'--set {pair!r} is not INDEX_COLUMN=VALUE')
-        name, text = pair.split('=', 1)
-        name = name.strip()
-        if name == 'cell_id' or name not in COLUMNS_BY_NAME:
-            raise ValueError(f'--set {name}: not an index column that can be set')
+        if isinstance(pair, str):
+            if '=' not in pair:
+                raise ValueError(f'--set {pair!r} is not INDEX_COLUMN=VALUE')
+            name, text = pair.split('=', 1)
+        else:
+            name, text = pair
+        name = str(name).strip()
+        column = COLUMNS_BY_NAME.get(name)
+        if column is None:
+            raise ValueError(f'--set {name}: not an index column')
+        if name == 'cell_id':
+            raise ValueError('--set cell_id: the cell comes from the source')
+        if name == 'dted_level':
+            raise ValueError('--set dted_level: the level is --level N (the DTED Level parameter), not a value to set')
+        if name == 'updated':
+            raise ValueError('--set updated: the build stamps updated itself')
+        if name in constants:
+            raise ValueError(f'--set {name}: given twice')
         try:
-            value = _convert(name, text)
+            constants[name] = _constant(column, str(text), today)
         except ValueError as e:
-            raise ValueError(f'--set {name}: {e}') from e
-        problem = check_value(COLUMNS_BY_NAME[name], value)
-        if problem:
-            raise ValueError(f'--set {name}: {problem}')
-        constants[name] = value
+            raise ValueError(f'--set {name}: {e}') from None
     return constants
 
 
@@ -612,15 +926,18 @@ def merge_rows(base: dict[str, dict], incoming: dict[str, dict]) -> dict[str, di
     return merged
 
 
-def fill_from_profile(rows: dict[str, dict], profile: Profile) -> dict[str, int]:
+def fill_from_profile(rows: dict[str, dict], profile: Profile, *, skip: Iterable[str] = ()) -> dict[str, int]:
     """Fill the profile's header values into every row that has NULL for them,
     so a complete table shows what the header gets; returns how many cells each
     column was filled in. A profile value that means NULL ("NA", a blank) fills
     nothing: NULL already says it. An accuracy column that some cell fills is
-    left as it is, since its NULLs mean NA and never fall through to the profile."""
+    left as it is, since its NULLs mean NA and never fall through to the profile.
+    The columns in *skip* (the ones --set filled; the accuracies of rows read
+    from DTED headers, whose NA is a value) are left alone."""
     filled: dict[str, int] = {}
+    skipped = set(skip)
     for column in INDEX_COLUMNS:
-        if column.dted_key is None or column.name not in profile.product:
+        if column.dted_key is None or column.name not in profile.product or column.name in skipped:
             continue
         if column.name in ACCURACY_COLUMNS and any(row.get(column.name) is not None for row in rows.values()):
             continue
@@ -635,6 +952,29 @@ def fill_from_profile(rows: dict[str, dict], profile: Profile) -> dict[str, int]
                 row[column.name] = value
                 filled[column.name] = filled.get(column.name, 0) + 1
     return filled
+
+
+@dataclass
+class BuildReport:
+    """What a build did, for a caller that reports it (the ArcGIS Pro tool):
+    the scan and the import of the DTED source, the columns --set filled in
+    every row, and the columns the profile filled."""
+
+    scan: DtedScan | None = None
+    dted: DtedImport | None = None
+    set_counts: dict[str, int] = field(default_factory=dict)
+    filled: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def failed(self) -> list[str]:
+        """The DTED files and cells that got no row, one line each."""
+        return list(self.dted.failed) if self.dted is not None else []
+
+
+def _constant_text(name: str, value) -> str:
+    if value is None:
+        return 'NA' if name in ACCURACY_COLUMNS else 'NULL'
+    return value.isoformat() if isinstance(value, dt.date) else str(value)
 
 
 def build_index(
@@ -654,15 +994,25 @@ def build_index(
     update: bool = False,
     product: str | None = None,
     all_columns: bool = False,
+    report: BuildReport | None = None,
 ) -> DtedIndex:
     """Harvest rows from the given sources and write (or update) the index at *out*.
 
     *from_table* (or *from_footprints*, the same thing) is any attribute
     table, imported through :func:`rows_from_table`; the import is reported
     in the log. Sources merge in the order table, rasters, DTED headers, a
-    later non-NULL value over an earlier one. With *all_columns* the index
-    holds every column, and the profile's constants fill the rows that have
-    no value of their own (:func:`fill_from_profile`).
+    later non-NULL value over an earlier one. *constants* (``--set``) then
+    fill their columns in every row, over every source and an index being
+    updated. With *all_columns* the index holds every column, and the
+    profile's constants fill the rows that have no value of their own
+    (:func:`fill_from_profile`).
+
+    The DTED source reads one level: *level*, else the profile's, else the
+    one level found (several levels found stop the build: ValueError). Its
+    files are counted first, a file that cannot be read gets no row and the
+    build goes on (see :func:`import_dted`), and the index is written as the
+    complete table, a NULL accuracy meaning NA as the header said. *report*,
+    when given, is filled with what happened.
     """
     logger = _state.get_logger()
     rows: dict[str, dict] = {}
@@ -688,10 +1038,33 @@ def build_index(
     if from_rasters:
         rows = merge_rows(rows, rows_from_rasters(list(from_rasters), profile))
     if from_dted:
-        dted_rows, dted_subregions = rows_from_dted(list(from_dted))
-        rows = merge_rows(rows, dted_rows)
-        for cell, items in dted_subregions.items():
+        scan = scan_dted(list(from_dted))
+        logger.info(scan.describe())
+        wanted = level if level is not None else (profile.level if profile is not None else None)
+        chosen = choose_level(scan, wanted)
+        logger.info(reading_line(scan, chosen))
+        dted = import_dted(scan, chosen)
+        for severity, line in import_lines(dted):
+            logger.log(severity, line)
+        rows = merge_rows(rows, dted.rows)
+        for cell, items in dted.subregions.items():
             subregions[cell] = items
+        if report is not None:
+            report.scan, report.dted = scan, dted
+        if level is None:
+            level = chosen
+        if not all_columns:
+            all_columns = True
+            logger.info('--from-dted writes the complete table: every column, a NULL accuracy meaning NA')
+    if not rows:
+        raise ValueError('no source gave a row; nothing to write')
+    if constants:
+        for row in rows.values():
+            row.update(constants)
+        for name, value in constants.items():
+            logger.info(f'set in {len(rows)} cell(s): {name} = {_constant_text(name, value)}')
+            if report is not None:
+                report.set_counts[name] = len(rows)
     if level is None:
         level = profile.level if profile and profile.level is not None else None
     if level is None:
@@ -701,9 +1074,13 @@ def build_index(
         if row.get('dted_level') is None and level is not None:
             row['dted_level'] = level
     if all_columns and profile is not None:
-        filled = fill_from_profile(rows, profile)
+        # A header's NA is a value, so the accuracies of DTED rows are never filled from the profile.
+        skip = set(constants or ()) | (set(ACCURACY_COLUMNS) if from_dted else set())
+        filled = fill_from_profile(rows, profile, skip=skip)
         if filled:
             logger.info('filled from the profile: ' + ', '.join(f'{name} ({n} cell(s))' for name, n in filled.items()))
+        if report is not None:
+            report.filled = filled
     if product:
         meta['product'] = product
     if profile is not None:

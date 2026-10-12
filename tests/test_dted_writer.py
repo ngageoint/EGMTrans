@@ -467,3 +467,35 @@ def test_header_warnings_are_tallied_during_a_batch(profile, log_lines):
     # Without a tally, the warning is logged per cell as before.
     build('N49E006', 49)
     assert any('DTED header of cell N49E006' in line and 'ZZ' in line for line in log_lines)
+
+
+# -- 1.11.0
+
+
+def test_datum_disagreement_is_tallied_in_a_batch(profile, log_lines):
+    from egmtrans import _state
+
+    def build(cell_id, lat):
+        row = new_row(cell_id, vertical_datum='E08')
+        return assemble_header(cell_geometry(6, lat, 2), metadata=DtedMetadata(row, [], profile),
+                               derived=DerivedFields(vertical_datum='E96', partial_cell=0))
+
+    _state.begin_header_warnings()
+    try:
+        build('N49E006', 49)
+        build('N50E006', 50)
+    finally:
+        tally = _state.end_header_warnings()
+    (message, cells), = [(m, c) for m, c in tally.items() if m.startswith('vertical_datum')]
+    assert message == "vertical_datum is 'E08' in the index but the output is 'E96'; the output keeps 'E96'"
+    assert cells == ['N49E006', 'N50E006']
+    assert not [line for line in log_lines if 'vertical_datum is' in line], 'tallied, not logged per cell'
+    build('N49E006', 49)  # without a tally the line is logged as before
+    assert any("DTED header: vertical_datum is 'E08' in the index" in line for line in log_lines)
+
+
+def test_parse_override_names_the_output_format_parameter():
+    from egmtrans.dted.writer import parse_overrides
+
+    with pytest.raises(ValueError, match='use --dted-level .*Output Format'):
+        parse_overrides(['dted_level=2'])

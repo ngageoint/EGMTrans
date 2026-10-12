@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-10-10
+
+### Added
+
+- Build DTED Index, a toolbox tool that makes the metadata index of a delivery from the headers of its DTED files, with a DTED Level for a folder that holds several levels, Index Overrides for any index column, and the product profile; it is `egmtrans dted-index build --from-dted` with help beside each parameter.
+- Validate DTED Index, a toolbox tool that checks an index with the profile and the DTED Header Overrides of the run it is meant for, as `egmtrans dted-index validate` does.
+- `egmtrans dted-index build --level N` reads only the files of that level from `--from-dted`, and the build reports the number of DTED files it found by level before reading; with no level given, the one level found is used, and several levels found stop the build with their counts.
+- `egmtrans dted-index build --set COLUMN=VALUE` works with every source, not only `--from-table`, writes its value in every row over the sources and over an index being updated, and takes `today` for a date column.
+- `egmtrans dted-header` takes folders, as the DTED Header Report tool does: the counts by level come first and a summary line last.
+
+### Changed
+
+- An index built from DTED headers is the complete table, every column written, so a NULL accuracy keeps meaning NA as the header said; with `--profile`, the profile fills the blank text and date fields of such rows but never an accuracy.
+- `source_file` in an index built from DTED headers is the file's path relative to the folder given, with forward slashes, instead of an absolute path.
+- A build from DTED headers continues past a file it cannot read, reports it, writes the index for the other cells (nothing when no cell got a row) and exits 1; a header value the index cannot hold becomes NULL with a warning naming the cell, the column and the text, and the findings of the source headers are summarized once per message with the number of cells.
+- A run summarizes the warning about a datum code in the index or the profile that differs from the output once at the end with the number of cells, instead of once per cell.
+
+### Fixed
+
+- Two DTED files for one cell no longer silently give the index the last one read; they are an error naming both files, and the cell gets no row.
+- A malformed accuracy in a DTED header is no longer silently read as NA; it becomes NULL with a warning naming the cell.
+- The error for a `--dted-set dted_level` override names the Output Format parameter, which replaced the DTED Level parameter in 1.10.0.
+- The help of the Build DMED tool was titled DTED Self-Test.
+
 ## [1.10.1] - 2026-10-08
 
 ### Added

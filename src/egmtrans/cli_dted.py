@@ -1,12 +1,13 @@
 """The ``dted-header``, ``dted-index``, ``dted-selftest`` and ``dmed`` subcommands.
 
-    egmtrans dted-header FILE... [--format text|json|csv|md] [--out PATH]
+    egmtrans dted-header PATH... [--format text|json|csv|md] [--out PATH]
                          [--zero-based] [--check-data] [--strict]
     egmtrans dmed FOLDER [--out PATH] [--check]
     egmtrans dted-index build --out INDEX (--from-dted PATH... | --from-rasters PATH...
                          | --from-table FILE [--layer NAME] [--cell-field NAME]
-                           [--map INDEX_COLUMN=TABLE_COLUMN]... [--set INDEX_COLUMN=VALUE]...
-                           [--prefer TABLE_COLUMN]) [--profile FILE] [--level N] [--product NAME] [--update]
+                           [--map INDEX_COLUMN=TABLE_COLUMN]... [--prefer TABLE_COLUMN])
+                         [--set INDEX_COLUMN=VALUE]... [--profile FILE] [--level N] [--product NAME]
+                         [--update] [--all-columns]
     egmtrans dted-index validate INDEX [--profile FILE] [--level N] [--dted-set FIELD=VALUE]...
     egmtrans dted-index columns [--format markdown|csv]
     egmtrans dted-selftest [--keep FOLDER] [--print-reference]
@@ -25,8 +26,22 @@ import sys
 
 from egmtrans import _state
 from egmtrans.dted.companions import COMPANION_EXTENSIONS
-from egmtrans.dted.harvest import build_index, parse_column_map, parse_constants
-from egmtrans.dted.index import ACCURACY_COLUMNS, HEADER_COLUMNS, read_index, render_column_tables, validate_index
+from egmtrans.dted.harvest import (
+    DTED_EXTENSIONS,
+    BuildReport,
+    build_index,
+    parse_column_map,
+    parse_constants,
+    scan_dted,
+)
+from egmtrans.dted.index import (
+    ACCURACY_COLUMNS,
+    HEADER_COLUMNS,
+    DtedIndex,
+    read_index,
+    render_column_tables,
+    validate_index,
+)
 from egmtrans.dted.profile import load_profile
 from egmtrans.dted.report import FORMATS, build_report, render_report
 from egmtrans.dted.validate import count, validate_file
@@ -57,8 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
         description='Report every field of the UHL, DSI and ACC records of DTED files, with the level evidence, '
                     'a summary and the MIL-PRF-89020B findings.',
     )
-    header.add_argument('files', nargs='+', metavar='FILE',
-                        help='DTED file(s) (.dt0, .dt1, .dt2, or a DTED0 companion .avg, .min or .max)')
+    header.add_argument('files', nargs='+', metavar='PATH',
+                        help='DTED file(s) (.dt0, .dt1, .dt2, or a DTED0 companion .avg, .min or .max), or '
+                             'folders searched for them')
     header.add_argument('--format', choices=FORMATS, default='text', help='Report format (default: text)')
     header.add_argument('--out', metavar='PATH', help='Write the report to this file instead of stdout')
     header.add_argument('--zero-based', action='store_true',
@@ -91,19 +107,22 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument('--map', action='append', default=[], metavar='INDEX_COLUMN=TABLE_COLUMN',
                        help='Fill an index column from a table column of another name (may be repeated)')
     build.add_argument('--set', action='append', default=[], metavar='INDEX_COLUMN=VALUE',
-                       help='Fill an index column with one value for every row of the table (may be repeated)')
+                       help='Fill an index column with one value in every row, over every source and an index being '
+                            'updated (may be repeated); a date takes YYYY-MM, YYYY-MM-DD or today, an accuracy NA')
     build.add_argument('--prefer', metavar='TABLE_COLUMN',
                        help='When several rows share a cell, keep the one with the greatest value here')
     build.add_argument('--profile', metavar='FILE',
                        help='Product profile (TOML): its harvest mappings for --from-rasters, its level when --level '
                             'is not given, and its constants with --all-columns')
-    build.add_argument('--level', type=int, choices=(0, 1, 2), help='DTED level the index is for')
+    build.add_argument('--level', type=int, choices=(0, 1, 2),
+                       help='DTED level the index is for; with --from-dted, read only the files of that level '
+                            '(needed when the input holds several)')
     build.add_argument('--product', metavar='NAME', help='Product name recorded in the index meta table')
     build.add_argument('--update', action='store_true', help='Update an existing index instead of replacing it')
     build.add_argument('--all-columns', action='store_true',
                        help='Write every index column, NULL included, as a complete table to review and edit in a '
                             'GIS, and fill the product constants of --profile into every row where the cell has no '
-                            'value (a NULL accuracy in such a table means NA)')
+                            'value (a NULL accuracy in such a table means NA); always on with --from-dted')
 
     validate = index_commands.add_parser(
         'validate', help='Check an index against the schema.',
@@ -170,24 +189,61 @@ def _write_out(text: str, out: str | None) -> None:
         sys.stdout.write(text)
 
 
+def _header_files(paths: list[str], logger: logging.Logger) -> list[str]:
+    """The files of ``dted-header``: each path as given, a folder searched for
+    DTED files and DTED0 companions (the counts logged first).
+
+    Raises:
+        ValueError: For a path that is neither a file nor a folder, or a folder
+            without a DTED file.
+    """
+    files = []
+    for path in paths:
+        if os.path.isdir(path):
+            scan = scan_dted([path], extensions=DTED_EXTENSIONS + COMPANION_EXTENSIONS)
+            if not scan.files:
+                raise ValueError(f'No DTED file (.dt0, .dt1, .dt2, or a DTED0 .avg, .min, .max) under {path}')
+            logger.info(scan.describe('file(s)'))
+            files.extend(found for found, _root, _level in scan.files)
+        elif os.path.isfile(path):
+            files.append(path)
+        else:
+            raise ValueError(f'Not a file or folder: {path}')
+    return files
+
+
 def run_header(args: argparse.Namespace, logger: logging.Logger) -> int:
+    try:
+        files = _header_files(args.files, logger)
+    except ValueError as e:
+        logger.error(str(e))
+        return 2
     reports = []
     exit_code = 0
-    for path in args.files:
-        if not os.path.isfile(path):
-            logger.error(f'Not a file: {path}')
-            return 2
+    with_errors = with_warnings = unreadable = 0
+    for path in files:
         try:
             header, issues = validate_file(path, check_data=args.check_data, extension=report_extension(path))
         except (OSError, ValueError) as e:
             logger.error(f'{path}: {e}')
-            return 2
+            unreadable += 1
+            exit_code = 1
+            continue
         report = build_report(path, header, issues, zero_based=args.zero_based)
         reports.append(report)
         errors, warnings = count(issues, 'error'), count(issues, 'warning')
+        with_errors += bool(errors)
+        with_warnings += bool(warnings and not errors)
         if errors or (args.strict and warnings):
             exit_code = 1
         logger.info(f'{os.path.basename(path)}: {errors} error(s), {warnings} warning(s)')
+    if len(files) > 1:
+        clean = len(reports) - with_errors - with_warnings
+        unread = f', {unreadable} not readable' if unreadable else ''
+        logger.info(f'Checked {len(files)} file(s): {with_errors} with errors, {with_warnings} with warnings, '
+                    f'{clean} clean{unread}')
+    if not reports:
+        return exit_code or 2
 
     if args.format == 'json':
         documents = [{k: v for k, v in r.items() if not k.startswith('_')} for r in reports]
@@ -234,13 +290,29 @@ def supply_lines(source: DtedMetadataSource, level: int | None) -> list[str]:
     return lines or ['Every required header field has a source.']
 
 
+def datum_lines(index: DtedIndex) -> list[str]:
+    """A warning per vertical datum code other than E96 in the index: the DTED
+    EGMTrans writes is E96, and --set records that in the index."""
+    by_value: dict[str, list[str]] = {}
+    for cell, row in index.rows.items():
+        value = row.get('vertical_datum')
+        if value is not None and value != 'E96':
+            by_value.setdefault(str(value), []).append(cell)
+    lines = []
+    for value, cells in by_value.items():
+        shown = ', '.join(cells[:5]) + (f', and {len(cells) - 5:,} more' if len(cells) > 5 else '')
+        lines.append(f'vertical_datum is {value!r} in {len(cells):,} cell(s) ({shown}); the DTED EGMTrans writes is '
+                     'E96: --set vertical_datum=E96 (an Index Overrides row in ArcGIS Pro) records that in the index')
+    return lines
+
+
 def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
     table = args.from_table or args.from_footprints
     if not (args.from_dted or args.from_rasters or table):
         logger.error('Give at least one source: --from-dted, --from-rasters or --from-table')
         return 2
-    if (args.map or args.set or args.prefer or args.layer) and not table:
-        logger.error('--map, --set, --prefer and --layer go with --from-table')
+    if (args.map or args.prefer or args.layer or args.cell_field) and not table:
+        logger.error('--map, --prefer, --layer and --cell-field go with --from-table')
         return 2
     profile = None
     if args.profile:
@@ -255,12 +327,13 @@ def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
     except ValueError as e:
         logger.error(str(e))
         return 2
+    report = BuildReport()
     try:
         index = build_index(
             args.out, from_dted=args.from_dted, from_rasters=args.from_rasters, from_table=table,
             cell_field=args.cell_field, layer=args.layer, column_map=column_map, constants=constants,
             prefer=args.prefer, profile=profile, level=args.level, update=args.update, product=args.product,
-            all_columns=args.all_columns,
+            all_columns=args.all_columns, report=report,
         )
     except (OSError, ValueError, RuntimeError) as e:
         logger.error(f'Index not written: {e}')
@@ -271,9 +344,11 @@ def run_index_build(args: argparse.Namespace, logger: logging.Logger) -> int:
     for issue in issues:
         logger.log(logging.ERROR if issue.severity == 'error' else logging.WARNING if issue.severity == 'warning'
                    else logging.INFO, str(issue))
+    for line in datum_lines(index):
+        logger.warning(line)
     for line in supply_lines(DtedMetadataSource(index, profile), args.level if args.level is not None else index.level):
         logger.info(line)
-    return 1 if count(issues, 'error') else 0
+    return 1 if count(issues, 'error') or report.failed else 0
 
 
 def run_index_validate(args: argparse.Namespace, logger: logging.Logger) -> int:
