@@ -229,12 +229,12 @@ def test_uncontained_flat_area_is_left_as_terrain(tmp_dir, log_lines):
     assert np.unique(read_band(out_all)[70:100, 20:60]).size == 1
 
 
-def _write_float_tile(path, dem, nodata=None):
+def _write_float_tile(path, dem, nodata=None, x0=126.30):
     from osgeo import gdal, osr
 
     rows, cols = dem.shape
     ds = gdal.GetDriverByName("GTiff").Create(path, cols, rows, 1, gdal.GDT_Float32)
-    ds.SetGeoTransform((126.30, 0.01, 0.0, 7.90, 0.0, -0.01))
+    ds.SetGeoTransform((x0, 0.01, 0.0, 7.90, 0.0, -0.01))
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(4326)
     ds.SetProjection(srs.ExportToWkt())
@@ -243,6 +243,37 @@ def _write_float_tile(path, dem, nodata=None):
         ds.GetRasterBand(1).SetNoDataValue(nodata)
     ds = None
     return path
+
+
+def test_cog_is_written_from_memory_with_nodata_and_point_registration(tmp_dir):
+    """The COG is translated from an in-memory dataset: no uncompressed copy under
+    the output folder, NoData NaN, pixel-is-point, the values to the centimeter."""
+    from osgeo import gdal
+
+    from egmtrans.transform import load_input, write_output
+
+    rng = np.random.default_rng(11)
+    dem = (rng.integers(-500, 300000, size=(30, 40)) / 100).astype(np.float32)
+    dem[3:6, 7:12] = -9999.0
+    src = _write_float_tile(os.path.join(tmp_dir, "in.tif"), dem, nodata=-9999.0)
+    temp_dir = os.path.join(tmp_dir, "temp")
+    os.makedirs(temp_dir)
+    loaded = load_input(src, temp_dir)
+    out = os.path.join(tmp_dir, "out.tif")
+    write_output(loaded, loaded.array.astype(np.float64), out, "EGM96", None, temp_dir)
+    assert not any(name.endswith("_final_temp.tif") for name in os.listdir(temp_dir))
+    ds = gdal.Open(out)
+    band = ds.GetRasterBand(1)
+    assert ds.GetMetadataItem("LAYOUT", "IMAGE_STRUCTURE") == "COG"
+    assert ds.GetMetadataItem("COMPRESSION", "IMAGE_STRUCTURE") == "DEFLATE"
+    assert ds.GetMetadataItem("AREA_OR_POINT") == "Point"
+    assert np.isnan(band.GetNoDataValue())
+    values = band.ReadAsArray()
+    band = None
+    ds = None
+    void = dem == -9999.0
+    assert np.all(np.isnan(values[void]))
+    assert np.array_equal(values[~void], np.round(dem[~void].astype(np.float64), 2).astype(np.float32))
 
 
 @requires_grids
@@ -380,6 +411,32 @@ class TestCoast:
             src, out, src_datum, tgt_datum, True, False, 16, "bilinear", save_log=False, **kwargs
         )
         return read_band(out)
+
+    def test_a_void_bridge_through_a_high_tile_joins_the_low_ground_to_the_sea(self, tmp_dir, monkeypatch):
+        """Pass 1 records the low ground of a tile with voids even when every post
+        of it stands above the band top, because a void passes low ground through;
+        an all-void tile holds one region that joins both of its seams."""
+        from egmtrans.tiling import find_seams, low_ground
+        from egmtrans.transform import analyze_tile
+
+        self._fake_geoid(monkeypatch, egm96=2.5)
+        rows, cols = self.ROWS, self.COLS
+        sea = np.full((rows, cols), 5.0, np.float32)
+        sea[:, :5] = 0.0
+        high = np.full((rows, cols), 100.0, np.float32)
+        high[2, :] = -9999.0                               # a void row from the west edge to the east edge
+        inland = np.full((rows, cols), 5.0, np.float32)    # no sea
+        all_void = np.full((rows, cols), -9999.0, np.float32)
+        for middle, name in ((high, "void_row"), (all_void, "all_void")):
+            tiles = []
+            for i, (dem, x0) in enumerate(((sea, 126.30), (middle, 126.70), (inland, 127.10))):
+                path = _write_float_tile(os.path.join(tmp_dir, f"{name}_{i}.tif"), dem, nodata=-9999.0, x0=x0)
+                temp_dir = os.path.join(tmp_dir, f"{name}_{i}_temp")
+                os.makedirs(temp_dir)
+                tiles.append(analyze_tile(path, "EGM2008", "EGM96", "bilinear", 16, temp_dir, i, path + ".out"))
+            low = low_ground(tiles, find_seams(tiles))
+            assert [group.tile_ids for group in low.groups] == [[0, 1, 2]] and low.groups[0].coastal, name
+            assert low.is_coastal(2, 1), f"the inland tile's region is coastal ({name})"
 
     def test_a_lowered_coast_keeps_its_height_above_the_sea(self, tmp_dir, monkeypatch, log_lines):
         src, dem = self._tile(tmp_dir)

@@ -528,6 +528,7 @@ class TestKernels:
 
     def test_only_the_spline_kernels_take_fast_math(self):
         from egmtrans import flattening, interpolation
+        from egmtrans.dted import resample
         from egmtrans.numba_utils import FASTMATH_FLAGS, NUMBA_AVAILABLE
 
         if not NUMBA_AVAILABLE:
@@ -537,15 +538,18 @@ class TestKernels:
             flattening._patch_levels, flattening._apply_levels_parallel, flattening._apply_levels_sequential,
             flattening._round_half_away_scalar, flattening._enclosed_low_regions,
             interpolation._bilinear_interpolate_numba,
+            resample._regrid_row, resample._regrid_parallel, resample._regrid_sequential,
+            resample._carry_row, resample._carry_parallel, resample._carry_sequential,
         ]
         for kernel in strict:
             assert not kernel.targetoptions.get('fastmath'), kernel.py_func.__name__
         for kernel in (interpolation.compute_rbf_weights, interpolation.interpolate_chunk):
             assert kernel.targetoptions['fastmath'] == set(FASTMATH_FLAGS)
-        # Numba's parallel mode has crashed ArcGIS Pro: only the level writer has
-        # a parallel variant, and ArcGIS runs the sequential one.
+        # Numba's parallel mode has crashed ArcGIS Pro: only the level writer and
+        # the two lattice resamplers have a parallel variant, and ArcGIS runs the
+        # sequential ones.
         parallel = [k.py_func.__name__ for k in strict if k.targetoptions.get('parallel')]
-        assert parallel == ['_apply_levels_parallel']
+        assert parallel == ['_apply_levels_parallel', '_regrid_parallel', '_carry_parallel']
 
     def test_compiled_kernels_equal_plain_python(self):
         """A host without Numba runs the same functions uncompiled and must label alike."""

@@ -621,6 +621,31 @@ def test_execute_writes_the_standard_tree_and_adds_no_layer(monkeypatch, tmp_dir
     assert any('Build DMED' in text for text in texts)
 
 
+def test_the_self_test_tool_runs_in_arcgis_mode(monkeypatch):
+    """The self-test tool sets ArcGIS mode like the transform tool, so the
+    sequential kernels run inside ArcGIS Pro."""
+    from egmtrans import _state
+    from egmtrans.dted import selftest
+
+    toolbox, _fake = _load_toolbox(monkeypatch)
+    seen = {}
+
+    class Result:
+        ok = True
+        items = []
+
+    def fake_run(folder=None, *, keep=False):
+        seen['arc_mode'] = _state.get_arc_mode()
+        return Result()
+
+    monkeypatch.setattr(selftest, 'run_selftest', fake_run)
+    monkeypatch.setattr('egmtrans.config.verify_grids', lambda *args: None)
+    tool = toolbox.DtedSelfTest()
+    assert _state.get_arc_mode() is False
+    tool.execute(tool.getParameterInfo(), _Messages())
+    assert seen['arc_mode'] is True
+
+
 def test_the_version_on_disk_is_read_as_text(monkeypatch):
     import egmtrans
 

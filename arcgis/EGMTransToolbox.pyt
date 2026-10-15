@@ -989,11 +989,14 @@ class DtedSelfTest:
         return
 
     def execute(self, parameters, messages):
+        from egmtrans import _state
         from egmtrans.config import verify_grids
         from egmtrans.dted.selftest import SOURCE_DATUM, TARGET_DATUM, run_selftest
 
         keep = _by_name(parameters)["keep"].valueAsText
         EGMTrans.setup_logger(None, False, is_arc_mode=True)
+        # ArcGIS mode, as the transform tool runs: the sequential kernels.
+        _state.set_arc_mode(True)
         arcpy.AddMessage(EGMTrans.versions_line())
         _warn_if_stale()
         try:

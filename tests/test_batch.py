@@ -989,6 +989,23 @@ def coast_tiles(folder):
     )
 
 
+def void_bridge_tiles(folder):
+    """Three DTED0 tiles west to east: the sea and a 5 to 7 m plain; a tile at 100 m and more with one void
+    row from its west edge to its east edge; an inland plain at 5 to 7 m with no sea. The shared columns are
+    high, so the void row is the only low ground of the middle tile and the only path from the plain to the sea."""
+    i, j = np.mgrid[0:POSTS, 0:3 * POSTS - 2]
+    wide = (5 + (i + j) % 3).astype(np.int16)
+    wide[:, :30] = 0
+    wide[:, POSTS - 1:2 * POSTS - 1] += 95
+    wide[60, 30:] = -32767
+    a, b, c = wide[:, :POSTS].copy(), wide[:, POSTS - 1:2 * POSTS - 1].copy(), wide[:, 2 * POSTS - 2:].copy()
+    os.makedirs(folder, exist_ok=True)
+    return tuple(
+        write_dted(os.path.join(folder, name), tile, lon0, 6, datum_code="E08")
+        for name, tile, lon0 in (("n06e126.dt0", a, 126), ("n06e127.dt0", b, 127), ("n06e128.dt0", c, 128))
+    )
+
+
 class TestCoastAcrossTiles:
     """Low ground connected to the sea in one tile keeps its height above the sea in the inland tile too.
 
@@ -1050,6 +1067,29 @@ class TestCoastAcrossTiles:
         assert result.exit_code == 0
         east = read_band(os.path.join(tmp_dir, "ctx", "n06e127.dt0"))
         assert east[0, 3] == 6 and east[50, 10] == 4, "with the sea tile as context the plain is coastal"
+        assert not any("keeps the plain shift" in line for line in log_lines)
+
+    def test_a_void_row_through_a_high_tile_bridges_the_inland_plain_to_the_sea(self, tmp_dir, monkeypatch, log_lines):
+        """The middle tile stands above the band top everywhere, but its void row is
+        passable, so pass 1 records it and the inland plain is coastal."""
+        self._fake(monkeypatch)
+        void_bridge_tiles(os.path.join(tmp_dir, "in"))
+        result = _run(os.path.join(tmp_dir, "in"), os.path.join(tmp_dir, "out"))
+        assert result.exit_code == 0 and result.files_processed == 3
+        source = read_band(os.path.join(tmp_dir, "in", "n06e128.dt0"))
+        east = read_band(os.path.join(tmp_dir, "out", "n06e128.dt0"))
+        plain = (source == 7) | (source == 5)
+        plain[:, 0] = False
+        assert np.all(east[source == 7] == 6) and np.all(east[(source == 5) & plain] == 4), (
+            "blended through the void row (7 m to 5.875, 5 m to 4.375), not shifted to 5 and 3"
+        )
+        assert np.all(east[60, 1:] == -32767)
+        middle_in = read_band(os.path.join(tmp_dir, "in", "n06e127.dt0"))
+        middle = read_band(os.path.join(tmp_dir, "out", "n06e127.dt0"))
+        land = middle_in != -32767
+        assert np.array_equal(middle[land], round_half_away(middle_in[land] - 2.5)) and np.all(middle[~land] == -32767)
+        assert result.seam_checks and all(check.clean for check in result.seam_checks)
+        assert any("Low ground connected to the sea: 1 region(s)" in line for line in log_lines)
         assert not any("keeps the plain shift" in line for line in log_lines)
 
     def test_the_table_carries_the_coastal_verdict(self, tmp_dir, monkeypatch):

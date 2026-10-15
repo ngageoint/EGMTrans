@@ -55,8 +55,16 @@ NUMBA_CACHE = True
 FASTMATH_FLAGS = frozenset({'nsz', 'arcp', 'contract', 'afn', 'reassoc'})
 
 try:
+    from numba import config as _numba_config
     from numba import njit, prange
     NUMBA_AVAILABLE = True
+
+    def jit_enabled():
+        """Whether the kernels are compiled: Numba is installed and NUMBA_DISABLE_JIT
+        is not set. Under NUMBA_DISABLE_JIT a decorated kernel is its plain Python
+        function, one iteration per post, so a caller that has a numpy version of
+        the work runs that instead. Read at call time."""
+        return not _numba_config.DISABLE_JIT
 
     def get_numba_decorator(parallel=False, arc_safe=False, fastmath=False):
         """Return appropriate Numba decorator based on configuration.
@@ -84,6 +92,10 @@ except ImportError:
 
     def prange(*args):
         return range(*args)
+
+    def jit_enabled():
+        """Without Numba nothing is compiled."""
+        return False
 
     def get_numba_decorator(parallel=False, arc_safe=False, fastmath=False):
         """Return a dummy decorator when Numba is not available."""

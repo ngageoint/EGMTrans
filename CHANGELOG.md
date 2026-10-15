@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The README is organized around the EGMTrans Tool and the five DTED tools, with new screenshots of both; `docs/dted_tools.md` documents the DTED tools' parameters, messages and exit codes.
 - Options are no longer matched by prefix (`--source` for `--source-datum`), on the transform and on the DTED tools; write them out.
+- Converting a GeoTIFF to DTED is faster: the resampling of the heights, of the water labels and of the geoid correction onto the cell runs as compiled kernels where Numba is installed, with the same bytes as before; without Numba the conversion runs as it did.
+- A run checks each geoid grid against its SHA-256 once, and a GeoTIFF output is written straight to the Cloud Optimized GeoTIFF, with no uncompressed copy under the output folder first.
 
 ### Fixed
 

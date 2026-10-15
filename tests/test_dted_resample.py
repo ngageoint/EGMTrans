@@ -23,6 +23,7 @@ from egmtrans.dted.resample import (
     regrid_bilinear,
     thin,
 )
+from egmtrans.numba_utils import jit_enabled
 from tests.conftest import lattice_geotransform, point_geotransform
 
 # TanDEM-X posts per degree of longitude by band, with the DTED level-2
@@ -159,8 +160,10 @@ class TestRegridBilinear:
 
     def test_block_size_does_not_change_the_result(self):
         window = self._window(31, 41)
-        whole = regrid_bilinear(window, 46, 61)
-        assert np.array_equal(whole, regrid_bilinear(window, 46, 61, block_posts=61), equal_nan=True)
+        source = np.ascontiguousarray(window, dtype=np.float64)
+        whole = resample._regrid_numpy(source, 46, 61, 4_000_000)
+        assert np.array_equal(whole, resample._regrid_numpy(source, 46, 61, 61), equal_nan=True)
+        assert np.array_equal(whole, resample._regrid_numpy(source, 46, 61, 7), equal_nan=True)
         assert np.array_equal(whole, regrid_bilinear(window, 46, 61, block_posts=7), equal_nan=True)
 
     def test_a_constant_area_stays_exact_and_nodes_keep_their_value(self):
@@ -212,8 +215,10 @@ class TestRegridBilinear:
         assert np.abs(result - warped).max() < 1e-9
 
     def test_no_float_reduction_in_the_module(self):
-        """The resampler adds its four terms elementwise; a reduction over an
-        axis could sum in another order on another build of numpy."""
+        """The resampler adds its four terms elementwise, in the numpy version and
+        in the kernels; a reduction over an axis could sum in another order on
+        another build of numpy. Numba reaches the module only through
+        numba_utils, so the module imports without it."""
         source = open(resample.__file__).read()
         tree = ast.parse(source)
         calls = {
@@ -221,7 +226,7 @@ class TestRegridBilinear:
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         }
         assert not calls & {'sum', 'mean', 'dot', 'matmul', 'einsum', 'cumsum', 'average', 'nansum'}
-        assert 'numba' not in source and 'gdal' not in source
+        assert 'import numba' not in source and 'from numba' not in source and 'gdal' not in source
 
 
 class TestCarryLabels:
@@ -312,3 +317,104 @@ class TestMasterRow:
         shared = slice(0, None, 2)   # every second post of the finer cell lies on the coarser one
         assert np.array_equal(rebuilt[shared], north_edge)
         assert not np.array_equal(naive[shared], north_edge)
+
+
+class TestKernels:
+    """The compiled kernels give the numpy reference's bits, and the right one runs."""
+
+    CASES = [
+        ((61, 61), (3601, 601), 0.0, np.float64),    # the geoid nodes of a zone V cell
+        ((601, 601), (601, 601), 0.02, np.float32),  # a window onto its own grid
+        ((901, 601), (301, 301), 0.02, np.float32),  # finer to coarser
+        ((31, 41), (121, 91), 0.05, np.float32),     # coarser to finer
+        ((1, 301), (1, 3601), 0.02, np.float32),     # a master row
+        ((10, 10), (25, 25), 1.0, np.float32),       # all void
+        ((16, 13), (31, 25), 0.0, np.float32),       # no voids
+    ]
+
+    @staticmethod
+    def _window(shape, voids, dtype, seed):
+        rng = np.random.default_rng(seed)
+        window = (rng.integers(-30000, 300000, size=shape) / 100).astype(dtype)
+        if voids:
+            window[rng.random(shape) < voids] = np.nan
+        return window
+
+    def test_regrid_kernels_equal_the_numpy_resampler_bit_for_bit(self):
+        if not jit_enabled():
+            pytest.skip("Numba is not compiling; the numpy reference is what runs.")
+        for seed, (shape, (rows, cols), voids, dtype) in enumerate(self.CASES):
+            window = self._window(shape, voids, dtype, seed)
+            source = np.ascontiguousarray(window, dtype=np.float64)
+            expected = resample._regrid_numpy(source, rows, cols, 4_000_000)
+            for parallel in (True, False):
+                got = regrid_bilinear(window, rows, cols, parallel=parallel)
+                assert got.dtype == np.float64
+                assert np.array_equal(got.view(np.uint64), expected.view(np.uint64)), (shape, parallel)
+
+    def test_carry_kernels_equal_the_numpy_version(self):
+        if not jit_enabled():
+            pytest.skip("Numba is not compiling; the numpy reference is what runs.")
+        rng = np.random.default_rng(5)
+        cases = [
+            ((3, 5), (3, 3), 0.0), ((5, 5), (5, 9), 0.1), ((301, 301), (3601, 601), 0.03), ((1, 301), (1, 3601), 0.03),
+        ]
+        for shape, (rows, cols), voids in cases:
+            labels = rng.integers(0, 4, size=shape).astype(np.int32)
+            labels[labels == 3] = 7
+            valid = (rng.random(shape) >= voids) if voids else None
+            expected = resample._carry_numpy(labels, np.ones(shape, dtype=bool) if valid is None else valid, rows, cols)
+            for parallel in (True, False):
+                got = carry_labels(labels, rows, cols, valid, parallel=parallel)
+                assert got.dtype == np.int32 and np.array_equal(got, expected), (shape, parallel)
+
+    def test_arc_mode_picks_the_sequential_kernel(self, monkeypatch):
+        if not jit_enabled():
+            pytest.skip("Numba is not compiling; no kernel is picked.")
+        from egmtrans import _state
+
+        calls = []
+
+        def record(name, kernel):
+            def wrapped(*args):
+                calls.append(name)
+                return kernel(*args)
+            return wrapped
+
+        for name in ("_regrid_parallel", "_regrid_sequential", "_carry_parallel", "_carry_sequential"):
+            monkeypatch.setattr(resample, name, record(name, getattr(resample, name)))
+        window = self._window((7, 9), 0.0, np.float32, 1)
+        labels = np.ones((7, 9), dtype=np.int32)
+        try:
+            _state.set_arc_mode(True)
+            regrid_bilinear(window, 13, 17)
+            carry_labels(labels, 13, 17)
+            regrid_bilinear(window, 13, 17, parallel=True)
+            carry_labels(labels, 13, 17, parallel=True)
+        finally:
+            _state.set_arc_mode(False)
+        regrid_bilinear(window, 13, 17)
+        carry_labels(labels, 13, 17)
+        regrid_bilinear(window, 13, 17, parallel=False)
+        carry_labels(labels, 13, 17, parallel=False)
+        assert calls == [
+            "_regrid_sequential", "_carry_sequential", "_regrid_parallel", "_carry_parallel",
+            "_regrid_parallel", "_carry_parallel", "_regrid_sequential", "_carry_sequential",
+        ]
+
+    def test_without_the_jit_the_numpy_versions_run(self, monkeypatch):
+        calls = []
+        real_regrid, real_carry = resample._regrid_numpy, resample._carry_numpy
+        monkeypatch.setattr(resample, "jit_enabled", lambda: False)
+        monkeypatch.setattr(resample, "_regrid_numpy", lambda *a: (calls.append("regrid"), real_regrid(*a))[1])
+        monkeypatch.setattr(resample, "_carry_numpy", lambda *a: (calls.append("carry"), real_carry(*a))[1])
+        window = self._window((7, 9), 0.1, np.float32, 2)
+        labels = (np.arange(63, dtype=np.int32).reshape(7, 9) % 3).astype(np.int32)
+        resampled = regrid_bilinear(window, 13, 17)
+        carried = carry_labels(labels, 13, 17)
+        assert calls == ["regrid", "carry"]
+        assert np.array_equal(resampled, reference_bilinear(window, 13, 17), equal_nan=True)
+        monkeypatch.undo()
+        # Whatever path runs now (the kernels where Numba compiles) gives the same bits.
+        assert np.array_equal(regrid_bilinear(window, 13, 17).view(np.uint64), resampled.view(np.uint64))
+        assert np.array_equal(carry_labels(labels, 13, 17), carried)

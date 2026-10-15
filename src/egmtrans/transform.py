@@ -1315,23 +1315,17 @@ def write_output(
     metadata['AREA_OR_POINT'] = 'Point'
     tgt_srs = create_compound_srs(loaded.src_srs, tgt_datum)
 
-    final_temp_file = os.path.join(temp_dir, f'{loaded.base_name}_final_temp.tif')
-    driver = gdal.GetDriverByName('GTiff')
-    final_ds = driver.Create(final_temp_file, loaded.cols, loaded.rows, 1, gdal.GDT_Float32)
+    # From memory to the COG: GDAL converts the float64 heights to Float32 as
+    # it did into the temporary GeoTIFF this replaced, and nothing but the
+    # output is written under the output folder.
+    final_ds = gdal.GetDriverByName('MEM').Create('', loaded.cols, loaded.rows, 1, gdal.GDT_Float32)
     final_ds.SetGeoTransform(loaded.geotransform)
     final_ds.SetProjection(tgt_srs.ExportToWkt(['FORMAT=WKT2_2019']))
     final_band = final_ds.GetRasterBand(1)
-    # NoData first. A new GeoTIFF skips blocks that equal the NoData value
-    # current at write time (0 when none is set) and fills them with the
-    # NoData value on close, so writing first turned every all-ocean row
-    # of 0 m into NaN once NoData became NaN.
     final_band.SetNoDataValue(np.nan)
     final_band.WriteArray(warp_array)
     final_ds.SetMetadata(metadata)
-    # A live band reference keeps the dataset open; close it before
-    # gdal.Translate reads the file.
     final_band = None
-    final_ds.Close()
 
     translate_options = gdal.TranslateOptions(
         format='COG',
@@ -1348,10 +1342,11 @@ def write_output(
     # leaves no partial GeoTIFF under the output name.
     scratch = _scratch_name(output_file)
     try:
-        cog_ds = gdal.Translate(scratch, final_temp_file, options=translate_options)
+        cog_ds = gdal.Translate(scratch, final_ds, options=translate_options)
         cog_ds.Close()
         os.replace(scratch, output_file)
     finally:
+        final_ds = None
         for leftover in (scratch, scratch + '.aux.xml'):
             if os.path.exists(leftover):
                 os.remove(leftover)
@@ -1461,13 +1456,16 @@ def analyze_tile(
 
 def _coast_possible(loaded: LoadedInput, src_datum: str, tgt_datum: str, coast_band: float) -> bool:
     """Whether the coastal rule can touch a tile: on, between the two geoids,
-    and a post below the highest band top any correction can give."""
+    and a void or a post below the highest band top any correction can give."""
     if coast_band <= 0 or src_datum == tgt_datum or 'WGS84' in (src_datum, tgt_datum):
         return False
     finite = np.isfinite(loaded.array)
-    if not finite.any():
-        return False
-    return bool(np.nanmin(loaded.array) < COAST_CEILING + max(coast_band, 2 * COAST_CEILING))
+    if not finite.all():
+        # A void passes low ground through (coastal_regions), so a tile with
+        # voids can bridge its neighbors to the sea whatever its heights, and
+        # an all-void tile holds one region that joins both of its seams.
+        return True
+    return bool(loaded.array.min() < COAST_CEILING + max(coast_band, 2 * COAST_CEILING))
 
 
 def coast_lines(coast: CoastStats, coast_band: float) -> list[str]:
