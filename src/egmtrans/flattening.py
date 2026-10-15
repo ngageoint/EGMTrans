@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from osgeo import gdal
+from scipy import ndimage
 
 from egmtrans.numba_utils import get_numba_decorator, prange
 
@@ -919,6 +920,260 @@ def process_patches_arcpy(
     """
     levels, _counts = patch_levels(output_data, labeled_array, level_override)
     return apply_levels(output_data, labeled_array, levels, parallel=False), levels
+
+
+def level_edge_slivers(
+    output: np.ndarray,
+    labeled: np.ndarray,
+    cm: np.ndarray,
+    adopted: list[tuple[str, int, float, int]],
+    limit: int = 4096,
+    first_label: int | None = None,
+) -> list[tuple[int, float, int, int]]:
+    """Set the slivers of water bodies at the tile edges to their bodies' levels, in place.
+
+    *adopted* holds ``(side, position, level, height_cm)`` for every unlabeled
+    edge post that continues a water body of a neighboring tile (see
+    :func:`egmtrans.tiling.merge_patches`).  Each such post's 4-connected
+    patch of unlabeled posts at that centimeter, at most *limit* posts, takes
+    a new label and the body's level: a sliver has fewer posts than the
+    minimum patch size, so its correction differs from the body's at the seam
+    by well under a centimeter, and its shore, a centimeter or more above it
+    in the input, stays above the level.  Taking its own minimum instead left
+    the shared posts of the two cells a meter apart when the level sat near a
+    half meter.  New labels start at *first_label* (the length of the
+    per-label arrays, which may exceed the highest label left after the
+    uncontained patches were dropped) and never at the ocean's 1.  Returns
+    ``(label, level, height_cm, posts)`` per sliver leveled.
+    """
+    rows, cols = labeled.shape
+    next_label = max(int(labeled.max()) + 1, 2, int(first_label) if first_label is not None else 0)
+    done: list[tuple[int, float, int, int]] = []
+    for side, position, level, height_cm in adopted:
+        if side == 'N':
+            r, c = 0, position
+        elif side == 'S':
+            r, c = rows - 1, position
+        elif side == 'W':
+            r, c = position, 0
+        else:
+            r, c = position, cols - 1
+        if not (0 <= r < rows and 0 <= c < cols) or labeled[r, c] != 0 or cm[r, c] != height_cm:
+            continue
+        posts = [(r, c)]
+        labeled[r, c] = next_label
+        head = 0
+        while head < len(posts) and len(posts) < limit:
+            i, j = posts[head]
+            head += 1
+            for ni, nj in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)):
+                if 0 <= ni < rows and 0 <= nj < cols and labeled[ni, nj] == 0 and cm[ni, nj] == height_cm:
+                    labeled[ni, nj] = next_label
+                    posts.append((ni, nj))
+        ri = np.array([p[0] for p in posts])
+        ci = np.array([p[1] for p in posts])
+        output[ri, ci] = level
+        done.append((next_label, float(level), int(height_cm), len(posts)))
+        next_label += 1
+    return done
+
+
+# ---------------------------------------------------------------------------
+# The coast: the strip and the band
+# ---------------------------------------------------------------------------
+
+# The vertical band, in meters, over which the datum shift blends in above the
+# coastal strip that keeps its height above the sea (``--coast-band``).
+DEFAULT_COAST_BAND = 10.0
+
+
+@dataclass
+class CoastStats:
+    """What the coastal rule did to one tile.
+
+    *posts* counts the posts of the regions connected to the sea (the ocean and
+    the voids left out); *kept* those at or below the correction, which kept
+    their height above the sea; *blended* those in the band above them;
+    *lowered* and *raised* are the largest corrections suppressed where the
+    shift lowers and where it raises the land; *floored* the coastal land
+    posts a DTED output wrote as 1 m.
+    """
+
+    posts: int = 0
+    kept: int = 0
+    blended: int = 0
+    lowered: float = 0.0
+    raised: float = 0.0
+    floored: int = 0
+
+    @property
+    def active(self) -> bool:
+        return self.kept + self.blended > 0
+
+
+def coastal_band_top(shift: np.ndarray, band: float) -> np.ndarray:
+    """The height, in the source datum, below which a post is low ground.
+
+    With ``a`` the size of the correction and ``B = max(band, 2 a)`` the
+    width of the band on the high side, the band top is ``a + B`` where the
+    shift lowers the land (the source is the high side) and ``B`` where it
+    raises it (the target is): the same height under the rule, so a run in
+    either direction finds the same regions.
+    """
+    a = np.abs(shift)
+    width = np.maximum(band, 2.0 * a)
+    return np.where(shift > 0, a + width, width)
+
+
+def coastal_regions(
+    array: np.ndarray, shift: np.ndarray, labeled: np.ndarray, band: float
+) -> tuple[np.ndarray, set[int]]:
+    """Label the 4-connected regions of ocean, voids and low ground.
+
+    A post is low ground when its source height lies below
+    :func:`coastal_band_top`; every post of a flat patch (label 2 and above)
+    counts as low when any post of the patch does, so a patch lies in exactly
+    one region.  Voids pass, so that a void cannot cut a plain off from the
+    sea.  Returns the region of every post (0 for none) and the regions that
+    hold an ocean post: the low ground in those regions is connected to the
+    sea within the tile, and the regions at the tile edges are joined across
+    the seams of a run by :func:`egmtrans.tiling.low_ground`.
+    """
+    rows, cols = array.shape
+    low = np.zeros(array.shape, dtype=bool)
+    step = max(1, 2_000_000 // max(cols, 1))
+    for start in range(0, rows, step):
+        block = slice(start, start + step)
+        h = np.asarray(array[block], dtype=np.float64)
+        s = np.broadcast_to(np.asarray(shift, dtype=np.float64), array.shape)[block]
+        with np.errstate(invalid='ignore'):
+            low[block] = (h < coastal_band_top(s, band)) | np.isnan(h)
+        low[block] |= labeled[block] == 1
+    highest = int(labeled.max()) if labeled.size else 0
+    if highest > 1:
+        # A patch has one height, but the correction varies across it: all of
+        # it or none of it, decided once.
+        hit = np.bincount(labeled[low & (labeled > 1)], minlength=highest + 1) > 0
+        hit[:2] = False
+        low |= hit[labeled]
+    regions, _count = ndimage.label(low)
+    regions = np.ascontiguousarray(regions, dtype=np.int32)
+    ocean_regions = set(np.unique(regions[labeled == 1]).tolist()) - {0}
+    return regions, ocean_regions
+
+
+def _region_lookup(regions: np.ndarray, coastal: set[int] | None) -> np.ndarray:
+    """A boolean array indexed by region: True for the coastal ones (every region when *coastal* is None)."""
+    lookup = np.zeros(int(regions.max()) + 1 if regions.size else 1, dtype=bool)
+    if coastal is None:
+        lookup[1:] = True
+    else:
+        chosen = [r for r in coastal if 0 < r < lookup.size]
+        lookup[chosen] = True
+    lookup[0] = False
+    return lookup
+
+
+def apply_coast(
+    warp: np.ndarray,
+    array: np.ndarray,
+    shift: np.ndarray,
+    labeled: np.ndarray,
+    regions: np.ndarray,
+    coastal: set[int] | None,
+    band: float,
+) -> CoastStats:
+    """Keep the coast at its height above the sea, in place on *warp*.
+
+    *warp* holds the plain shift ``h - shift`` of the source heights *array*;
+    the rule rewrites the posts of the *coastal* regions (every region when
+    None; the ocean and the voids excluded) that lie at or below the
+    correction ``a = abs(shift)`` and in the band above it.  With
+    ``B = max(band, 2 a)`` and ``H`` the height on the high side, the side
+    where the land stands higher above its sea, one monotone bijection maps
+    the high side onto the low side::
+
+        phi(H) = H                          H <= a       the strip: the height above the sea is kept
+        phi(H) = H - a (H - a) / B          a < H < a + B   the band: the shift blends in
+        phi(H) = H - a                      H >= a + B   the plain shift
+
+    Where the shift lowers the land the output is ``phi(h)``; where it raises
+    the land the output is the inverse, ``h + a (h - a) / (B - a)`` on the
+    band ``a < h < B`` of the source heights.  The two directions are exact
+    inverses of each other, so a round trip restores the land.  Posts above
+    the band keep the plain shift *warp* already holds, bit for bit.
+
+    The rule exists because the geoid models, not the terrain, put a coast
+    below the sea or on a cliff above it: EGM2008 fits the sea where EGM96
+    does not, so the EGM96 heights of a coast are EGM96's error made
+    visible.  Keeping the coast at its height above the sea preserves the
+    coastline morphology of the full-resolution source DEM and keeps that
+    error off the shoreline.  MIL-PRF-89020B 3.5.3.2.1 asks for the land to
+    be higher than the adjacent water.
+    """
+    stats = CoastStats()
+    if regions.size == 0:
+        return stats
+    lookup = _region_lookup(regions, coastal)
+    if not lookup.any():
+        return stats
+    rows, cols = array.shape
+    step = max(1, 2_000_000 // max(cols, 1))
+    for start in range(0, rows, step):
+        block = slice(start, start + step)
+        mask = lookup[regions[block]] & (labeled[block] != 1)
+        h = np.asarray(array[block], dtype=np.float64)
+        mask &= ~np.isnan(h)
+        if not mask.any():
+            continue
+        idx = np.flatnonzero(mask)
+        hv = h.reshape(-1)[idx]
+        sv = np.asarray(np.broadcast_to(shift, array.shape)[block], dtype=np.float64).reshape(-1)[idx]
+        a = np.abs(sv)
+        width = np.maximum(band, 2.0 * a)
+        lowering = sv > 0
+        raising = sv < 0
+        strip = (lowering | raising) & (hv <= a)
+        band_down = lowering & (hv > a) & (hv < a + width)
+        band_up = raising & (hv > a) & (hv < width)
+        out = hv.copy()
+        out[band_down] = hv[band_down] - a[band_down] * (hv[band_down] - a[band_down]) / width[band_down]
+        out[band_up] = hv[band_up] + a[band_up] * (hv[band_up] - a[band_up]) / (width[band_up] - a[band_up])
+        changed = strip | band_down | band_up
+        target = warp[block].reshape(-1)
+        target[idx[changed]] = out[changed].astype(warp.dtype, copy=False)
+        stats.posts += int(idx.size)
+        stats.kept += int(np.count_nonzero(strip))
+        stats.blended += int(np.count_nonzero(band_down | band_up))
+        if np.any(changed & lowering):
+            stats.lowered = max(stats.lowered, float(a[changed & lowering].max()))
+        if np.any(changed & raising):
+            stats.raised = max(stats.raised, float(a[changed & raising].max()))
+    return stats
+
+
+def floor_coastal_land(
+    output: np.ndarray, labeled: np.ndarray, regions: np.ndarray, coastal: set[int] | None, cm: np.ndarray
+) -> int:
+    """Write 1 m, in place, at every coastal land post that would round to 0 in whole meters.
+
+    MIL-PRF-89020B 3.5.3.2.1: "Extremely shallow land just interior to
+    coastlines shall have + 1 meter elevation to force proper land boundary
+    portrayal."  Land only (label 0 after the water decision) with a source
+    height above the ocean's centimeter, in the regions connected to the sea.
+    Returns the number of posts written.
+    """
+    if regions.size == 0:
+        return 0
+    lookup = _region_lookup(regions, coastal)
+    if not lookup.any():
+        return 0
+    with np.errstate(invalid='ignore'):
+        mask = lookup[regions] & (labeled == 0) & (cm > OCEAN_CM) & (output >= 0) & (output < 0.5)
+    count = int(np.count_nonzero(mask))
+    if count:
+        output[mask] = 1.0
+    return count
 
 
 def create_flat_mask(

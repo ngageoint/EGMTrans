@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
-EGMTrans makes standard DTED deliveries from GeoTIFF elevation tiles on the whole-degree lattice, such as TanDEM-X tiles, and transforms the vertical datum of GeoTIFF and DTED files between the WGS 84 ellipsoid, EGM96 and EGM2008. DTED is written in EGM96 only, as MIL-PRF-89020B requires, into the standard `DTED/E006/N49.dt2` tree, with water bodies kept level across tiles and the same bytes on every computer.
+EGMTrans makes standard DTED deliveries from GeoTIFF elevation tiles on the whole-degree lattice, such as TanDEM-X tiles, and transforms the vertical datum of GeoTIFF and DTED files between the WGS 84 ellipsoid, EGM96 and EGM2008. DTED is written in EGM96 only, as MIL-PRF-89020B requires, into the standard `DTED/E006/N49.dt2` tree, with water bodies kept level across tiles, the coast kept at its height above the sea and the same bytes on every computer.
 
 A DTED header carries what no raster holds: the producer, the edition, the dates, the security markings, the accuracies and the datum codes. EGMTrans takes them from a metadata index (one row per cell) and a product profile (the constants of the product, from a template), and stops before writing when a required field has no source. The quickest way to a correct index is to build it from DTED cells you already have with Build DTED Index, overriding in the Index Overrides what the new product's specification changes (`vertical_datum`, `producer_code`, `dsi_producer_text`), and to check it with Validate DTED Index before the first run.
 
@@ -38,8 +38,8 @@ conda activate egmtrans
 pip install -e .                         # or "pip install -e .[core]" without Numba
 python download_grids.py                 # the five geoid grids, about 1.3 GB; see Offline setup for two
 
-egmtrans -i tiles -o delivery -s EGM2008 -t EGM96 -y --dted-level 2 \
-  --dted-index collection.gpkg --dted-profile product.toml
+egmtrans --input tiles --output delivery --source-datum EGM2008 --target-datum EGM96 --yes \
+  --dted-level 2 --dted-index collection.gpkg --dted-profile product.toml
 egmtrans dmed delivery
 ```
 
@@ -105,27 +105,30 @@ Pass `-y`: a container has no terminal to answer a prompt, so without it EGMTran
 
 | ArcGIS Pro | Command line | What it does |
 |---|---|---|
-| Input File or Folder | `-i` | A DTED or GeoTIFF file, or a folder of them, searched recursively. Files that are not DEMs are skipped; files that cannot be read are reported and counted. |
-| Output File or Folder | `-o` | The output file (`.tif`, `.tiff`, `.dt0`, `.dt1`, `.dt2`) or folder; may not lie inside the input folder; a drive or share root is fine. |
+| Input File or Folder | `-i`, `--input` | A DTED or GeoTIFF file, or a folder of them, searched recursively. Files that are not DEMs are skipped; files that cannot be read are reported and counted. |
+| Output File or Folder | `-o`, `--output` | The output file (`.tif`, `.tiff`, `.dt0`, `.dt1`, `.dt2`) or folder; may not lie inside the input folder; a drive or share root is fine. |
 | Output Format | `--dted-level N` | DTED2 (default), DTED1, DTED0 or GeoTIFF. A DTED input must be at the level given. For a DTED format the Target Datum and the Interpolation Algorithm offer EGM96 and bilinear only and the DTED parameters apply. |
-| Source Datum | `-s` | WGS84, EGM96 or EGM2008: state what your tiles are in. Every input's header or CRS is compared with it before anything is written. |
-| Target Datum | `-t` | EGM96 for DTED; WGS84, EGM96 or EGM2008 for GeoTIFF. |
-| Interpolation Algorithm | `-a` | bilinear (default; the only one for DTED), spline, delaunay, or proj on the command line. See [docs/algorithms.md](docs/algorithms.md). |
-| Minimum Patch Size (posts) | `-p` | The least number of posts of a flat area that counts as a water body; default 16. |
-| Retain Flat Areas | `-f` | Keep the ocean at 0 and every water body at one level across the run; on by default. Off, or with WGS84 as either datum, nothing is leveled and the three water options below are ignored. |
-| Create Mask | `-m` | A mask beside each output: 1 for the ocean, one value per water body. Beside a DTED cell it is named for the source tile. |
-| Save Log File | `-l` | The log, beside a single output or inside the output folder; appended on a rerun, UTF-8. |
+| Source Datum | `-s`, `--source-datum` | WGS84, EGM96 or EGM2008: state what your tiles are in. Every input's header or CRS is compared with it before anything is written. |
+| Target Datum | `-t`, `--target-datum` | EGM96 for DTED; WGS84, EGM96 or EGM2008 for GeoTIFF. |
+| Interpolation Algorithm | `-a`, `--algorithm` | bilinear (default; the only one for DTED), spline, delaunay, or proj on the command line. See [docs/algorithms.md](docs/algorithms.md). |
+| Minimum Patch Size (posts) | `-p`, `--min-patch-size` | The least number of posts of a flat area that counts as a water body; default 16. |
+| Retain Flat Areas | `-f`, `--flatten` | Keep the ocean at 0 and every water body at one level across the run; on by default. Off, or with WGS84 as either datum, nothing is leveled and the four water options below are ignored. |
+| Create Mask | `-m`, `--create-mask` | A mask beside each output: 1 for the ocean, one value per water body. Beside a DTED cell it is named for the source tile. |
+| Save Log File | `-l`, `--log-file` | The log, beside a single output or inside the output folder; appended on a rerun, UTF-8. |
 | Skip Existing Cells | `--skip-existing` | Leave outputs that already exist and verify alone, so a cancelled or failed run can be continued; their inputs are still analyzed, so the water levels match an uninterrupted run. Otherwise existing outputs are listed before they are replaced. |
 | Neighboring Tiles (not processed) | `--context FOLDER` | Additional tiles in the source datum that constrain the run: analyzed, never written. May be repeated on the command line. |
 | Water Levels Table | `--water-levels FILE` | A table from an earlier run's `--export-water-levels`. |
-| Minimum Containment (0-1) | `-c` | The share of a flat area's boundary that must lie above it for the area to be water; default 0.8. |
-| Absolute Horizontal Accuracy | `--abs_horiz_accuracy` | A default CE90 for DTED headers that have none. |
+| Minimum Containment (0-1) | `-c`, `--containment` | The share of a flat area's boundary that must lie above it for the area to be water; default 0.8. |
+| Coastal Containment, Coastal Band (m) | `-b`, `--coast-band` | Low ground connected to the sea keeps its height above the sea within the geoid correction, and the shift blends in over this band above that, in both directions (default 10 m; 0 turns it off): the coastline of the source DEM is kept, not the geoid models' errors. |
+| Absolute Horizontal Accuracy | `--abs-horiz-accuracy` | A default CE90 for DTED headers that have none. |
 | DTED Metadata Index | `--dted-index FILE` | GeoPackage or GeoParquet; the cell's row fills its header. |
 | DTED Product Profile | `--dted-profile FILE` | TOML of the product's header constants, from the template. |
 | DTED Output Naming, Naming Template | `--dted-naming` | DTED standard (`DTED/E006/N49.dt2`, default), Cell name (`N49E006.dt2`), Input name (`stem`), or a template with `{stem}`, `{dir}`, `{cell}`, `{lat}`, `{lon}`, `{level}`. |
 | DTED Header Overrides | `--dted-set FIELD=VALUE` | One value for every cell of the run, over the index and the profile. |
 | DTED Header Summary | | Read only: which header fields come from where, and what is still missing. |
-| | `-y` | Answer the prompts (a datum the headers contradict, the header plan) for unattended runs. |
+| | `-y`, `--yes` | Answer the prompts (a datum the headers contradict, the header plan) for unattended runs. |
+
+Every option has a long name beside the short one; the underscore spellings of earlier releases (`--source_datum`, `--abs_horiz_accuracy`) still work but are not listed by `--help`, and options are never matched by prefix.
 | | `--export-water-levels FILE` | Write the levels of the water bodies that touch a tile edge. |
 
 ### DTED output

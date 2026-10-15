@@ -550,7 +550,7 @@ def assemble_header(
         # the input is the authority, gaps included.
         for column in HEADER_COLUMNS:
             if column.required and sources.get(column.dted_key, 'default').startswith('default'):
-                also = ' or --abs_horiz_accuracy' if column.name == 'abs_horiz_acc' else ''
+                also = ' or --abs-horiz-accuracy' if column.name == 'abs_horiz_acc' else ''
                 problems.append(f'{column.name} is required and nothing supplies it (index or profile{also})')
     if not header['dsi.vertical_datum'].strip():
         problems.append('the vertical datum is unknown')

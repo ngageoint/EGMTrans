@@ -12,6 +12,7 @@ from egmtrans.transform import (
     create_interp_array,
     transform_vertical_datum,
 )
+from tests.conftest import point_geotransform, read_band, write_geotiff
 
 
 def _grids_available() -> bool:
@@ -344,3 +345,113 @@ def test_all_ocean_rows_stay_at_zero(tmp_dir):
 
     assert not np.isnan(result).any(), f"{int(np.isnan(result).sum())} pixels came out as voids"
     assert np.all(result[dem == 0.0] == 0.0)
+
+
+class TestCoast:
+    """The coast keeps its height above the sea in both directions; the geoid is faked, so the correction is exact."""
+
+    ROWS, COLS = 6, 40
+
+    def _tile(self, tmp_dir, name="coast.tif"):
+        land = np.tile(np.linspace(0.2, 20.0, self.COLS - 5, dtype=np.float32), (self.ROWS, 1))
+        dem = np.concatenate([np.zeros((self.ROWS, 5), np.float32), land], axis=1)   # the sea in the five west columns
+        dem[1:5, 7:11] = 0.5                                                         # a lagoon of 16 posts
+        return _write_float_tile(os.path.join(tmp_dir, name), dem), dem
+
+    @staticmethod
+    def _fake_geoid(monkeypatch, egm96, egm2008=0.0):
+        from osgeo import gdal
+
+        from egmtrans import transform
+
+        values = {"EGM96": egm96, "EGM2008": egm2008}
+
+        def fake(input_file, datum, algorithm, temp_dir, output_dir):
+            ds = gdal.Open(input_file)
+            shape = (ds.RasterYSize, ds.RasterXSize)
+            ds = None
+            return np.full(shape, values[datum], dtype=np.float32)
+
+        monkeypatch.setattr(transform, "create_datum_array", fake)
+
+    @staticmethod
+    def _convert(src, out, src_datum="EGM2008", tgt_datum="EGM96", **kwargs):
+        transform_vertical_datum(
+            src, out, src_datum, tgt_datum, True, False, 16, "bilinear", save_log=False, **kwargs
+        )
+        return read_band(out)
+
+    def test_a_lowered_coast_keeps_its_height_above_the_sea(self, tmp_dir, monkeypatch, log_lines):
+        src, dem = self._tile(tmp_dir)
+        self._fake_geoid(monkeypatch, egm96=2.5)    # N96 - N08 = 2.5: EGM96 lowers the land by 2.5 m
+        out = self._convert(src, os.path.join(tmp_dir, "out.tif"))
+        land = dem > 0
+        assert np.all(out[:, :5] == 0) and out[land].min() > 0
+        strip = land & (dem <= 2.5)
+        np.testing.assert_allclose(out[strip], dem[strip], atol=0.0051)    # kept, to the centimeter of the COG
+        assert np.all(out[1:5, 7:11] == np.float32(0.5)), "the lagoon keeps its height above the sea too"
+        above = dem >= 12.5
+        np.testing.assert_allclose(out[above], dem[above] - 2.5, atol=0.0051)    # the plain shift, to the centimeter
+        band = land & (dem > 2.5) & (dem < 12.5)
+        np.testing.assert_allclose(out[band], dem[band] - 2.5 * (dem[band] - 2.5) / 10.0, atol=0.0051)
+        assert np.all(np.diff(out[0, 5:]) > 0), "monotone along the ramp"
+        line = next(line for line in log_lines if line.startswith("Coastal containment: "))
+        assert "would have lowered the shore by up to 2.50 m" in line and "kept their height above the sea" in line
+        assert any("Low ground connected to the sea: 1 region(s)" in line for line in log_lines)
+
+    def test_a_raised_coast_stands_on_no_cliff(self, tmp_dir, monkeypatch, log_lines):
+        src, dem = self._tile(tmp_dir)
+        self._fake_geoid(monkeypatch, egm96=-2.5)   # EGM96 raises the land by 2.5 m
+        out = self._convert(src, os.path.join(tmp_dir, "out.tif"))
+        land = dem > 0
+        strip = land & (dem <= 2.5)
+        np.testing.assert_allclose(out[strip], dem[strip], atol=0.0051)    # kept, to the centimeter of the COG
+        assert out[0, 5] == np.float32(0.2), "the first land post stays at its height above the sea"
+        above = dem >= 10.0
+        np.testing.assert_allclose(out[above], dem[above] + 2.5, atol=0.0051)
+        band = land & (dem > 2.5) & (dem < 10.0)
+        np.testing.assert_allclose(out[band], dem[band] + 2.5 * (dem[band] - 2.5) / 7.5, atol=0.0051)
+        assert np.all(np.diff(out[0, 5:]) > 0)
+        assert any("would have raised the shore by up to 2.50 m" in line for line in log_lines)
+
+    def test_the_two_directions_are_inverses(self, tmp_dir, monkeypatch):
+        src, dem = self._tile(tmp_dir)
+        self._fake_geoid(monkeypatch, egm96=2.5)
+        down = os.path.join(tmp_dir, "egm96.tif")
+        self._convert(src, down)
+        back = self._convert(down, os.path.join(tmp_dir, "egm2008.tif"), "EGM96", "EGM2008")
+        land = (dem > 0) & (dem != np.float32(0.5))   # the lagoon is leveled, one way
+        np.testing.assert_allclose(back[land], dem[land], atol=0.011)     # two roundings to the centimeter
+
+    def test_off_the_plain_shift_sinks_the_coast(self, tmp_dir, monkeypatch, log_lines):
+        src, dem = self._tile(tmp_dir)
+        self._fake_geoid(monkeypatch, egm96=2.5)
+        out = self._convert(src, os.path.join(tmp_dir, "out.tif"), coast_band=0)
+        assert out[0, 5] == pytest.approx(0.2 - 2.5, abs=0.0051)
+        assert not any("Coastal containment" in line for line in log_lines)
+
+    def test_dted_writes_one_meter_at_coastal_land_that_rounds_to_zero(self, tmp_dir, monkeypatch, log_lines):
+        from egmtrans import transform
+        from egmtrans.dted.header import CellGeometry
+        from tests.test_determinism import metadata
+
+        posts = 301
+        i, j = np.mgrid[0:posts, 0:posts]
+        # Shallow land from 0.2 m, rising a millimeter per post with no two neighbors alike.
+        dem = (0.2 + 0.001 * j + 0.01 * ((7 * i + 13 * j) % 23)).astype(np.float32)
+        dem[:, :60] = 0.0
+        src = write_geotiff(os.path.join(tmp_dir, "cell.tif"), dem, point_geotransform(126, 6, posts))
+        geoid = {"EGM96": 2.5, "EGM2008": 0.0}
+        monkeypatch.setattr(
+            transform, "geoid_on_cell", lambda datum, cell: np.full((cell.lat_points, cell.lon_lines), geoid[datum])
+        )
+        for band, expected in ((10.0, 1), (0.0, -2)):
+            log_lines.clear()
+            out = os.path.join(tmp_dir, f"N06E126_{band:g}.dt0")
+            transform_vertical_datum(
+                src, out, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False,
+                dted_metadata=metadata(0), cell=CellGeometry(0, 126, 6), coast_band=band,
+            )
+            values = read_band(out)
+            assert np.all(values[:, :20] == 0) and np.all(values[:, 30:] == expected), band
+            assert any(line.startswith("Wrote 1 m at ") for line in log_lines) == (band > 0)

@@ -14,7 +14,7 @@ When a header is written, its fields are filled in order of precedence:
 3. the cell's index row;
 4. the profile;
 5. the input file's header (for a DTED input);
-6. the `--abs_horiz_accuracy` fallback, which fills its field only when it is still NA;
+6. the `--abs-horiz-accuracy` fallback, which fills its field only when it is still NA;
 7. the specification's fill (NA, `0000`, blanks; the DSI unique reference is zero filled).
 
 A cell the index does not hold, or holds twice, stops the run before anything is written, and so does an index or profile made for another DTED level. For a DTED cell made from a GeoTIFF there is no input header: the security code, the edition, the match/merge version, the producer code, the compilation date and the four accuracies must come from the index, the profile or `--abs_horiz_accuracy`, and the run stops before writing when one of them has no source (an explicit NA counts; a blank does not). A `vertical_datum` or `horizontal_datum` the profile or index states for another product is reported as a warning and the output keeps its own code. A column the index does not have is supplied by the profile: an index built by `dted-index build` leaves out every column that is NULL in all its rows. A NULL among an accuracy column's values means NA; to write NA in every cell, say so in the profile (`rel_horiz_acc = "NA"`). Every field's source is logged, the validator's warnings on the result are logged, and a DTED output whose header cannot be completed is removed rather than left with the wrong datum code over transformed heights.
@@ -172,7 +172,7 @@ When transforming DTED files, EGMTrans rewrites the output file's 3,428-byte hea
 
 - **Vertical datum** (DSI characters 142-144): `E96`, the one code DTED is written in.
 - **Accuracies** (ACC characters 4-19 and the UHL copy at 29-32): a value that is neither `0000`-`9999` nor NA becomes NA, and NA is written left justified (`NA  `), as section 3.13.5 of the specification requires for alpha values. The UHL absolute vertical accuracy always repeats the ACC value.
-- **Absolute horizontal accuracy**: the `--abs_horiz_accuracy` value fills the field only when it is NA.
+- **Absolute horizontal accuracy**: the `--abs-horiz-accuracy` value fills the field only when it is NA.
 - **Bytes that are not printable**: the NUL bytes that GDAL-written headers carry where the specification wants blanks become blanks.
 
 Every change is logged with its source, and the findings of the validator are logged as warnings, so a problem the input header had and nothing corrected is visible.
