@@ -1413,8 +1413,9 @@ def analyze_tile(
     Labels the tile exactly as the transform will, records the labeled posts
     along its edges, and, when a flat patch touches an edge or the tile may
     hold low ground connected to the sea, runs the transform to record each
-    edge patch's height, lowest transformed value (plain and under the
-    coastal rule) and post count, and the low-ground regions along the edges.
+    edge patch's height, lowest transformed value and post count, and, where
+    the coastal rule can touch the tile (:func:`_coast_possible`), the
+    minimum under that rule and the low-ground regions along the edges.
     The arrays are dropped on return; the record is small. With *cell*, the
     tile is the cell's level-2 grid made from the raster.
     """
@@ -1423,7 +1424,8 @@ def analyze_tile(
     labels = label_tile(loaded, min_patch_size)
     tile.edges = extract_edges(labels.labeled, loaded.geotransform, loaded.centimeters)
     no_patch = edge_touching_labels(tile.edges).size == 0
-    if no_patch and not _coast_possible(loaded, src_datum, tgt_datum, coast_band):
+    coast_possible = _coast_possible(loaded, src_datum, tgt_datum, coast_band)
+    if no_patch and not coast_possible:
         return tile
 
     # The full transform, through the same code as the second pass, so the
@@ -1431,7 +1433,9 @@ def analyze_tile(
     warp_array, shift = compute_transformed(loaded, src_datum, tgt_datum, algorithm, temp_dir, temp_dir)
     regions = None
     coastal_levels = None
-    if coast_band > 0 and shift is not None:
+    if shift is not None and coast_possible:
+        # Where the rule cannot touch a post the regions would be empty and
+        # the coastal minimum the plain one: the merge reads both the same.
         regions, tile.ocean_regions = coastal_regions(loaded.array, shift, labels.labeled, coast_band)
         tile.edges = extract_edges(labels.labeled, loaded.geotransform, loaded.centimeters, regions)
         if not no_patch:
@@ -1456,7 +1460,8 @@ def analyze_tile(
 
 def _coast_possible(loaded: LoadedInput, src_datum: str, tgt_datum: str, coast_band: float) -> bool:
     """Whether the coastal rule can touch a tile: on, between the two geoids,
-    and a void or a post below the highest band top any correction can give."""
+    and a void or a post below the highest band top any correction can give.
+    Both passes label the low-ground regions of a tile only when this holds."""
     if coast_band <= 0 or src_datum == tgt_datum or 'WGS84' in (src_datum, tgt_datum):
         return False
     finite = np.isfinite(loaded.array)
@@ -1597,13 +1602,17 @@ def transform_vertical_datum(
 
             # The coast, before the water levels: a water body in low ground
             # connected to the sea takes its level from the weighted values,
-            # the minimum pass 1 recorded for it.
+            # the minimum pass 1 recorded for it. The regions are labeled only
+            # where the rule can touch a post, the test pass 1 applies: on a
+            # tile without a void whose lowest post stands above every band
+            # top they would hold nothing but the ocean, and the ocean is
+            # never rewritten, so the bytes are the same either way.
             regions = None
             ocean_regions: set[int] = set()
             coastal_set: set[int] = set()
             coast = CoastStats()
             coasting = coast_band > 0 and shift is not None
-            if coasting:
+            if coasting and _coast_possible(loaded, src_datum, tgt_datum, coast_band):
                 regions, ocean_regions = coastal_regions(loaded.array, shift, labeled, coast_band)
                 coastal_set = set(ocean_regions)
                 if tile_levels is not None:
@@ -1626,7 +1635,7 @@ def transform_vertical_datum(
                     f'tile edges with the water bodies the neighboring tiles continue them with.'
                 )
             if coasting:
-                if loaded.whole_meters:
+                if loaded.whole_meters and regions is not None:
                     # After the water decision, so the land is final; before
                     # the write, so every DTED level inherits it.
                     coast.floored = floor_coastal_land(warp_array, labeled, regions, coastal_set, loaded.centimeters)

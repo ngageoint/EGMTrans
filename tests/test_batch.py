@@ -1108,3 +1108,34 @@ class TestCoastAcrossTiles:
         reference = read_band(os.path.join(tmp_dir, "full", "n06e127.dt0"))
         np.testing.assert_array_equal(east[40:80, :21], reference[40:80, :21])
         assert east[50, 10] == 4
+
+    def test_tiles_the_rule_cannot_touch_are_not_labeled_and_keep_their_bytes(self, tmp_dir, monkeypatch):
+        """Tiles without a void whose lowest post stands above every band top never
+        have their low-ground regions labeled, in either pass, and their DTED
+        bytes are the same with the rule on and off."""
+        from egmtrans import transform
+
+        self._fake(monkeypatch)
+        calls = []
+        real = transform.coastal_regions
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(transform, "coastal_regions", spy)
+        a = _terrain(POSTS, 0, np.int16) + 500
+        a[LAKE_ROWS, 90:] = 650
+        b = _terrain(POSTS, POSTS - 1, np.int16) + 500
+        b[LAKE_ROWS, :30] = 650
+        folder = os.path.join(tmp_dir, "in")
+        os.makedirs(folder)
+        write_dted(os.path.join(folder, "n06e126.dt0"), a, 126, 6, datum_code="E08")
+        write_dted(os.path.join(folder, "n06e127.dt0"), b, 127, 6, datum_code="E08")
+        digests = []
+        for band in (10.0, 0.0):
+            out = os.path.join(tmp_dir, f"out_{band:g}")
+            result = _run(folder, out, coast_band=band)
+            assert result.exit_code == 0 and result.files_processed == 2
+            digests.append([_sha(os.path.join(out, name)) for name in ("n06e126.dt0", "n06e127.dt0")])
+        assert digests[0] == digests[1] and not calls

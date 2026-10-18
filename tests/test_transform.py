@@ -512,3 +512,75 @@ class TestCoast:
             values = read_band(out)
             assert np.all(values[:, :20] == 0) and np.all(values[:, 30:] == expected), band
             assert any(line.startswith("Wrote 1 m at ") for line in log_lines) == (band > 0)
+
+    @staticmethod
+    def _spy_on_regions(monkeypatch):
+        """Count the calls to the region labeling, which still does its work."""
+        from egmtrans import transform
+
+        calls = []
+        real = transform.coastal_regions
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(transform, "coastal_regions", spy)
+        return calls
+
+    def test_a_tile_the_rule_cannot_touch_skips_the_region_labeling(self, tmp_dir, monkeypatch, log_lines):
+        """A tile without a void whose lowest post stands above every band top
+        gives the same bytes with the rule on and off and never labels its
+        regions, as pass 1 already decides; one void post, or one post below
+        the band top, brings the labeling back."""
+        calls = self._spy_on_regions(monkeypatch)
+        self._fake_geoid(monkeypatch, egm96=2.5)
+        inland = np.tile(np.linspace(500.0, 900.0, self.COLS, dtype=np.float32), (self.ROWS, 1))
+        inland[1:5, 7:11] = 650.0                                   # a lake of 16 posts
+        src = _write_float_tile(os.path.join(tmp_dir, "inland.tif"), inland)
+        outputs = []
+        for band in (10.0, 0.0):
+            log_lines.clear()
+            out = os.path.join(tmp_dir, f"inland_{band:g}.tif")
+            self._convert(src, out, coast_band=band)
+            with open(out, "rb") as handle:
+                outputs.append(handle.read())
+            assert any(
+                line == "Coastal containment: no low ground connected to the sea in this tile." for line in log_lines
+            ) == (band > 0)
+        assert outputs[0] == outputs[1] and not calls
+
+        void = inland.copy()
+        void[3, 20] = -9999.0
+        low = inland.copy()
+        low[3, 20] = 30.0                                            # below the 36.6 m band top
+        for name, dem in (("void", void), ("low", low)):
+            path = _write_float_tile(os.path.join(tmp_dir, f"{name}.tif"), dem, nodata=-9999.0)
+            self._convert(path, os.path.join(tmp_dir, f"{name}_out.tif"))
+        assert len(calls) == 2
+
+    def test_a_converted_cell_the_rule_cannot_touch_gets_the_same_bytes(self, tmp_dir, monkeypatch):
+        from egmtrans import transform
+        from egmtrans.dted.header import CellGeometry
+        from tests.test_determinism import metadata
+
+        calls = self._spy_on_regions(monkeypatch)
+        posts = 301
+        i, j = np.mgrid[0:posts, 0:posts]
+        dem = (500.0 + 0.5 * j + 0.01 * ((7 * i + 13 * j) % 23)).astype(np.float32)
+        dem[100:140, 100:140] = 620.0                                # a lake
+        src = write_geotiff(os.path.join(tmp_dir, "cell.tif"), dem, point_geotransform(126, 6, posts))
+        geoid = {"EGM96": 2.5, "EGM2008": 0.0}
+        monkeypatch.setattr(
+            transform, "geoid_on_cell", lambda datum, cell: np.full((cell.lat_points, cell.lon_lines), geoid[datum])
+        )
+        outputs = []
+        for band in (10.0, 0.0):
+            out = os.path.join(tmp_dir, f"N06E126_{band:g}.dt0")
+            transform_vertical_datum(
+                src, out, "EGM2008", "EGM96", True, False, 16, "bilinear", save_log=False,
+                dted_metadata=metadata(0), cell=CellGeometry(0, 126, 6), coast_band=band,
+            )
+            with open(out, "rb") as handle:
+                outputs.append(handle.read())
+        assert outputs[0] == outputs[1] and not calls
