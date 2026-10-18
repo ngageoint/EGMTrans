@@ -12,8 +12,10 @@ batch-directory processing.
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import os
+import re
 import sys
 
 from osgeo import gdal
@@ -46,7 +48,7 @@ from egmtrans.file_utils import (
     prepare_output_target,
     resolve_io_paths,
 )
-from egmtrans.flattening import DEFAULT_CONTAINMENT
+from egmtrans.flattening import DEFAULT_COAST_BAND, DEFAULT_CONTAINMENT
 from egmtrans.logging_setup import end_logger, log_traceback, setup_logger
 from egmtrans.numba_utils import NUMBA_AVAILABLE
 from egmtrans.tiling import TileLevels
@@ -325,6 +327,7 @@ def process_file(
     dted_cell: CellGeometry | None = None,
     dted_plan: bool = True,
     mask_file: str | None = None,
+    coast_band: float = DEFAULT_COAST_BAND,
 ) -> bool:
     """Process a single file for vertical datum transformation, or convert a
     GeoTIFF cell to DTED.
@@ -505,7 +508,7 @@ def process_file(
             input_file, output_file, source_datum, target_datum,
             flatten, create_mask, min_patch_size, algorithm,
             abs_horiz_accuracy, save_log, tile_levels=tile_levels, min_containment=min_containment,
-            dted_metadata=dted_metadata, cell=cell, mask_file=mask_file,
+            dted_metadata=dted_metadata, cell=cell, mask_file=mask_file, coast_band=coast_band,
         )
     except Exception as e:
         logger.error(f"Transformation failed: {e}.")
@@ -515,35 +518,48 @@ def process_file(
     return True
 
 
-def main() -> None:
-    """CLI entry point for EGMTrans.
+class _Parser(argparse.ArgumentParser):
+    """Leaves the underscore spellings of earlier releases out of the error messages."""
 
-    Parses command-line arguments, sets up logging, and processes either a
-    single file or an entire directory tree.  For batch processing, copies
-    the input folder structure first, then transforms each supported DEM in
-    place.  Datum-mismatch confirmation is requested once and applied to all
-    subsequent files.
+    def error(self, message: str) -> None:
+        super().error(re.sub(r'/--\w+_\w+', '', message))
+
+
+class _HelpFormatter(argparse.HelpFormatter):
+    """Leaves the underscore spellings of earlier releases out of the help."""
+
+    def _format_action_invocation(self, action: argparse.Action) -> str:
+        if action.option_strings and any('_' in name for name in action.option_strings):
+            shown = [name for name in action.option_strings if '_' not in name]
+            if shown:
+                action = copy.copy(action)
+                action.option_strings = shown
+        return super()._format_action_invocation(action)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The transform's command line.
+
+    Every option has a short and a hyphenated long name; the underscore
+    spellings of releases before 1.12 (``--source_datum``) still parse but are
+    not shown. Options are never matched by prefix.
     """
-    # The DTED tools are subcommands; the transform keeps its flag-only form.
-    if len(sys.argv) > 1 and sys.argv[1] in SUBCOMMANDS:
-        from egmtrans.cli_dted import main as dted_main
-
-        sys.exit(dted_main(sys.argv[1:]))
-
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description="Transform vertical datum between WGS 84 ellipsoid, EGM96, and EGM2008 for DTED and GeoTIFF files.",
         epilog="DTED header tools: 'egmtrans dted-header FILE...' reports and validates headers; "
                "'egmtrans dted-index build|validate' builds and checks a metadata index. "
                "Run either with --help for its options.",
+        formatter_class=_HelpFormatter,
+        allow_abbrev=False,
     )
     parser.add_argument("-i", "--input", required=True, help="Input DEM file, or folder of DEMs (DTED or GeoTIFF)")
     parser.add_argument("-o", "--output", required=True, help="Output file, or folder for the transformed DEMs")
     parser.add_argument(
-        "-s", "--source_datum", required=True, type=datum_arg,
+        "-s", "--source-datum", "--source_datum", required=True, type=datum_arg,
         help="Source vertical datum (WGS84, EGM96, or EGM2008)",
     )
     parser.add_argument(
-        "-t", "--target_datum", required=True, type=datum_arg,
+        "-t", "--target-datum", "--target_datum", required=True, type=datum_arg,
         help="Target vertical datum (WGS84, EGM96, or EGM2008; DTED output is EGM96 only)",
     )
     parser.add_argument(
@@ -551,13 +567,13 @@ def main() -> None:
         help="Retain flat areas (default: True)",
     )
     parser.add_argument(
-        "-m", "--create_mask", required=False, type=str2bool, nargs='?', const=True, default=False,
+        "-m", "--create-mask", "--create_mask", required=False, type=str2bool, nargs='?', const=True, default=False,
         help="Create a mask of the ocean and the water bodies, DTED included (default: False)",
     )
     # No nargs='?' here: a bare -p used to become True (one post) and a bare -a
     # became True, which passed the choices check and ran the spline branch.
     parser.add_argument(
-        "-p", "--min_patch_size", required=False, type=int, default=16,
+        "-p", "--min-patch-size", "--min_patch_size", required=False, type=int, default=16,
         help="Minimum patch size in pixels for flat areas, DTED included (default: 16)",
     )
     parser.add_argument(
@@ -566,16 +582,22 @@ def main() -> None:
              "body and be flattened, 0 to 1 (default: 0.8; 0 keeps every flat area)",
     )
     parser.add_argument(
+        "-b", "--coast-band", required=False, type=float, default=DEFAULT_COAST_BAND,
+        help="Coastal containment: low ground connected to the sea keeps its height above the sea within the "
+             "geoid correction, and the shift blends in over this many meters above that, in both directions "
+             "(default: 10; 0 turns it off)",
+    )
+    parser.add_argument(
         "-a", "--algorithm", required=False, choices=['bilinear', 'delaunay', 'spline', 'proj'],
         default='bilinear',
         help="Interpolation algorithm (default: bilinear; DTED output accepts only bilinear)",
     )
     parser.add_argument(
-        "--abs_horiz_accuracy", required=False, type=int,
+        "--abs-horiz-accuracy", "--abs_horiz_accuracy", required=False, type=int,
         help="Absolute horizontal accuracy in meters (for DTED output only)",
     )
     parser.add_argument(
-        "-l", "--log_file", required=False, type=str2bool, nargs='?', const=True, default=True,
+        "-l", "--log-file", "--log_file", required=False, type=str2bool, nargs='?', const=True, default=True,
         help="Save a log file (default: True)",
     )
     parser.add_argument(
@@ -637,6 +659,26 @@ def main() -> None:
              "an accuracy takes NA, a date takes YYYY-MM, YYYY-MM-DD or today.",
     )
 
+    return parser
+
+
+def main() -> None:
+    """CLI entry point for EGMTrans.
+
+    Parses command-line arguments, sets up logging, and processes either a
+    single file or an entire directory tree.  For batch processing, copies
+    the input folder structure first, then transforms each supported DEM in
+    place.  Datum-mismatch confirmation is requested once and applied to all
+    subsequent files.
+    """
+    # The DTED tools are subcommands; the transform keeps its flag-only form.
+    if len(sys.argv) > 1 and sys.argv[1] in SUBCOMMANDS:
+        from egmtrans.cli_dted import main as dted_main
+
+        sys.exit(dted_main(sys.argv[1:]))
+
+    parser = build_parser()
+
     args = parser.parse_args()
 
     try:
@@ -646,6 +688,8 @@ def main() -> None:
         parser.error(str(e))
     if not 0.0 <= args.containment <= 1.0:
         parser.error(f"--containment must be between 0 and 1, not {args.containment}")
+    if not args.coast_band >= 0.0:
+        parser.error(f"--coast-band must be 0 or more, not {args.coast_band}")
     for folder in args.context:
         if not os.path.isdir(folder):
             parser.error(f"--context folder does not exist: {folder}")
@@ -773,6 +817,7 @@ def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) 
             args.flatten, args.create_mask, args.min_patch_size, args.algorithm,
             args.abs_horiz_accuracy, args.log_file, assume_yes=args.yes,
             min_containment=args.containment, dted_metadata=getattr(args, 'dted_metadata', None),
+            coast_band=args.coast_band,
         ) is False:
             exit_code = 1
     else:
@@ -784,6 +829,7 @@ def _dispatch(args: argparse.Namespace, paths: IOPaths, logger: logging.Logger) 
             export_water_levels=args.export_water_levels, min_containment=args.containment,
             dted_metadata=getattr(args, 'dted_metadata', None),
             dted_level=paths.dted_level, dted_naming=args.dted_naming, skip_existing=args.skip_existing,
+            coast_band=args.coast_band,
         )
         exit_code = result.exit_code
 

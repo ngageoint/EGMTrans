@@ -63,13 +63,14 @@ NAMING_LABELS = {"DTED standard": "dted", "Cell name": "cell", "Input name": "st
 CUSTOM_NAMING = "Custom template"
 DEFAULT_MIN_PATCH_SIZE = 16
 DEFAULT_CONTAINMENT = 0.8
+DEFAULT_COAST_BAND = 10.0
 # The parameters that matter only when DTED is written, shown as one group.
 DTED_CATEGORY = "DTED output"
 DTED_GROUP = (
     "abs_horiz_accuracy", "dted_index", "dted_profile", "dted_naming", "dted_naming_template", "dted_overrides",
     "dted_summary",
 )
-WATER_GROUP = ("context_folder", "water_levels", "containment")
+WATER_GROUP = ("context_folder", "water_levels", "containment", "coast", "coast_band")
 # ArcGIS Pro's browse dialog opens a raster on a double click and lists its
 # bands; a band chosen there (N49.dt2\Band_1) stands for its file.
 RASTER_BAND = re.compile(r"band_\d+", re.IGNORECASE)
@@ -428,6 +429,24 @@ class Tool:
         containment.value = DEFAULT_CONTAINMENT
         params.append(containment)
 
+        coast = arcpy.Parameter(
+            displayName="Coastal Containment",
+            name="coast",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
+        coast.value = True
+        params.append(coast)
+
+        coast_band = arcpy.Parameter(
+            displayName="Coastal Band (m)",
+            name="coast_band",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
+        coast_band.value = DEFAULT_COAST_BAND
+        params.append(coast_band)
+
         abs_horiz_accuracy = arcpy.Parameter(
             displayName="Absolute Horizontal Accuracy",
             name="abs_horiz_accuracy",
@@ -562,10 +581,15 @@ class Tool:
         )
         for name in WATER_GROUP:
             p[name].enabled = water
+        # The band means nothing while the coastal rule is off.
+        p["coast_band"].enabled = water and bool(p["coast"].value)
 
         if p["min_patch_size"].value is None:
             _NOTES["min_patch_size"] = f"Minimum Patch Size was set to {DEFAULT_MIN_PATCH_SIZE}, the default."
             p["min_patch_size"].value = DEFAULT_MIN_PATCH_SIZE
+        if p["coast_band"].value is None:
+            _NOTES["coast_band"] = f"Coastal Band was set to {DEFAULT_COAST_BAND:g}, the default."
+            p["coast_band"].value = DEFAULT_COAST_BAND
 
         try:
             if not is_dted or not (
@@ -726,6 +750,9 @@ class Tool:
         containment = p["containment"].value
         if containment is not None and not 0.0 <= containment <= 1.0:
             p["containment"].setErrorMessage("Minimum Containment must be between 0 and 1.")
+        coast_band = p["coast_band"].value
+        if coast_band is not None and coast_band < 0:
+            p["coast_band"].setErrorMessage("Coastal Band must be 0 or more.")
         try:
             self._check_dted_metadata(p, is_dted and not input_is_dted)
         except Exception as e:  # a failure here would disable Run with no explanation
@@ -753,6 +780,9 @@ class Tool:
         context_folder = p["context_folder"].valueAsText
         water_levels = p["water_levels"].valueAsText
         containment = p["containment"].value if p["containment"].value is not None else DEFAULT_CONTAINMENT
+        coast = bool(p["coast"].value)
+        coast_band = p["coast_band"].value if p["coast_band"].value is not None else DEFAULT_COAST_BAND
+        coast_band = float(coast_band) if coast else 0.0
         dted_index = p["dted_index"].valueAsText
         dted_profile = p["dted_profile"].valueAsText
         dted_naming = _naming_value(p) or NAMING_LABELS["DTED standard"]
@@ -812,6 +842,8 @@ class Tool:
         arcpy.AddMessage(f"Neighboring Tiles: {context_folder}")
         arcpy.AddMessage(f"Water Levels Table: {water_levels}")
         arcpy.AddMessage(f"Minimum Containment: {containment}")
+        arcpy.AddMessage(f"Coastal Containment: {coast}")
+        arcpy.AddMessage(f"Coastal Band (m): {coast_band:g}")
         if dted_level is not None:
             arcpy.AddMessage(f"Absolute Horizontal Accuracy: {abs_horiz_accuracy}")
             arcpy.AddMessage(f"DTED Metadata Index: {dted_index}")
@@ -852,7 +884,7 @@ class Tool:
                 ok = EGMTrans.process_file(
                     io_paths.input_path, output_path, source_datum, target_datum, flatten, create_mask,
                     min_patch_size, algorithm, abs_horiz_accuracy, save_log, arc_mode=True,
-                    min_containment=containment, dted_metadata=dted_metadata,
+                    min_containment=containment, dted_metadata=dted_metadata, coast_band=coast_band,
                 )
                 written = [output_path] if ok and os.path.isfile(output_path) else []
                 if not ok:
@@ -867,7 +899,7 @@ class Tool:
                     context_folders=[context_folder] if context_folder else [], water_levels=water_levels,
                     min_containment=containment, dted_metadata=dted_metadata,
                     dted_level=dted_level, dted_naming=dted_naming, skip_existing=skip_existing,
-                    should_stop=lambda: bool(getattr(arcpy.env, "isCancelled", False)),
+                    should_stop=lambda: bool(getattr(arcpy.env, "isCancelled", False)), coast_band=coast_band,
                 )
                 written = list(result.outputs)
                 failed = len(result.failed)
@@ -957,11 +989,14 @@ class DtedSelfTest:
         return
 
     def execute(self, parameters, messages):
+        from egmtrans import _state
         from egmtrans.config import verify_grids
         from egmtrans.dted.selftest import SOURCE_DATUM, TARGET_DATUM, run_selftest
 
         keep = _by_name(parameters)["keep"].valueAsText
         EGMTrans.setup_logger(None, False, is_arc_mode=True)
+        # ArcGIS mode, as the transform tool runs: the sequential kernels.
+        _state.set_arc_mode(True)
         arcpy.AddMessage(EGMTrans.versions_line())
         _warn_if_stale()
         try:

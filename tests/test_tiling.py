@@ -6,6 +6,7 @@ import numpy as np
 
 from egmtrans.tiling import (
     DisjointSet,
+    LowGround,
     PatchStats,
     TableRow,
     TileAnalysis,
@@ -16,7 +17,9 @@ from egmtrans.tiling import (
     extract_edges,
     find_seams,
     format_boundary_report,
+    format_low_ground_report,
     format_tile_patches,
+    low_ground,
     merge_patches,
     single_tile_water_bodies,
 )
@@ -28,7 +31,7 @@ GT_ABUTTING_EAST = (4.5, 1.0, 0.0, 4.5, 0.0, -1.0)  # posts x = 5..9: one spacin
 GT_GAP_EAST = (5.5, 1.0, 0.0, 4.5, 0.0, -1.0)       # posts x = 6..10: two spacings east
 
 
-def _tile(tile_id, labeled, gt, patches, output=True, crs="EPSG:4326", is_dted=True):
+def _tile(tile_id, labeled, gt, patches, output=True, crs="EPSG:4326", is_dted=True, cm=None):
     labeled = np.asarray(labeled, dtype=np.int32)
     rows, cols = labeled.shape
     tile = TileAnalysis(
@@ -41,7 +44,7 @@ def _tile(tile_id, labeled, gt, patches, output=True, crs="EPSG:4326", is_dted=T
         cols=cols,
         is_dted=is_dted,
     )
-    tile.edges = extract_edges(labeled, gt)
+    tile.edges = extract_edges(labeled, gt, cm)
     tile.patches = {label: PatchStats(*spec) for label, spec in patches.items()}
     return tile
 
@@ -506,3 +509,124 @@ class TestTilePatches:
     def test_empty_form(self):
         tile = _tile(1, np.zeros((5, 5)), GT_A, {})
         assert format_tile_patches(tile) == "tile1.dt0: no flat area reaches a tile edge."
+
+
+class TestSlivers:
+    """An unlabeled edge post at a water body's height across the seam is adopted for pass 2."""
+
+    def _pair(self, height_b=15000, water=True, label_b=False):
+        cm_a = np.arange(25, dtype=np.int32).reshape(5, 5) * 7 + 100000
+        cm_a[1:3, :] = 15000
+        labeled_a = _band(2)  # rows 1 and 2, every column: the band reaches the east edge
+        a = _tile(0, labeled_a, GT_A, {2: (15000, 149.4, 10, 20 if water else 0, 0 if water else 20)}, cm=cm_a)
+        cm_b = np.arange(25, dtype=np.int32).reshape(5, 5) * 7 + 200000
+        cm_b[1:3, 0] = height_b  # the shared column only: a sliver too small for a label
+        labeled_b = np.zeros((5, 5), dtype=np.int32)
+        patches_b = {}
+        if label_b:
+            labeled_b[1:3, 0] = 2
+            patches_b = {2: (15000, 149.6, 2, 0, 0)}
+        b = _tile(1, labeled_b, GT_SHARED_EAST, patches_b, cm=cm_b)
+        return a, b
+
+    def test_unlabeled_posts_at_the_bodys_height_are_adopted(self):
+        a, b = self._pair()
+        levels, bodies = merge_patches([a, b], find_seams([a, b]))
+        assert len(bodies) == 1 and bodies[0].water
+        assert levels[1].adopted == [("W", 1, 149.4, 15000), ("W", 2, 149.4, 15000)]
+        assert levels[0].adopted == []
+        assert bodies[0].notes == [
+            "tile1.dt0:W continues it with 2 post(s) below the minimum patch size at the seam; "
+            "they take the body's level"
+        ]
+
+    def test_a_different_height_is_not_adopted(self):
+        a, b = self._pair(height_b=15001)
+        levels, bodies = merge_patches([a, b], find_seams([a, b]))
+        assert levels[1].adopted == [] and bodies[0].notes == []
+
+    def test_no_adoption_from_a_body_that_is_not_water(self):
+        a, b = self._pair(water=False)
+        levels, bodies = merge_patches([a, b], find_seams([a, b]))
+        assert not bodies[0].water and levels[1].adopted == []
+
+    def test_labeled_posts_are_joined_not_adopted(self):
+        a, b = self._pair(label_b=True)
+        levels, bodies = merge_patches([a, b], find_seams([a, b]))
+        assert len(bodies) == 1 and bodies[0].posts == 12 and levels[1].adopted == []
+
+    def test_edges_without_heights_adopt_nothing(self):
+        a, b = self._pair()
+        b.edges = extract_edges(np.zeros((5, 5), dtype=np.int32), GT_SHARED_EAST)
+        levels, _ = merge_patches([a, b], find_seams([a, b]))
+        assert levels[1].adopted == []
+
+
+class TestLowGround:
+    """Low ground at the tile edges is joined across the seams and connected to the sea run-wide."""
+
+    def _tiles(self, sea_in_a=True, regions_b=True):
+        labeled_a = np.zeros((5, 5), dtype=np.int32)
+        if sea_in_a:
+            labeled_a[:, 0] = 1
+        cm_a = np.arange(25, dtype=np.int32).reshape(5, 5) * 3 + 50
+        a = _tile(0, labeled_a, GT_A, {}, cm=cm_a)
+        a.edges = extract_edges(labeled_a, GT_A, cm_a, np.ones((5, 5), dtype=np.int32))
+        a.ocean_regions = {1} if sea_in_a else set()
+        labeled_b = np.zeros((5, 5), dtype=np.int32)
+        cm_b = np.arange(25, dtype=np.int32).reshape(5, 5) * 3 + 60
+        b = _tile(1, labeled_b, GT_SHARED_EAST, {}, cm=cm_b)
+        regions = np.ones((5, 5), dtype=np.int32) if regions_b else None
+        b.edges = extract_edges(labeled_b, GT_SHARED_EAST, cm_b, regions)
+        return a, b
+
+    def test_low_ground_joins_across_the_seam_and_finds_the_sea(self):
+        a, b = self._tiles()
+        low = low_ground([a, b], find_seams([a, b]))
+        assert len(low.groups) == 1 and low.groups[0].coastal
+        assert low.groups[0].members == [(0, 1), (1, 1)]
+        assert low.by_tile == {0: ({1}, set()), 1: ({1}, set())}
+        assert low.is_coastal(1, 1) and not low.is_coastal(1, 2)
+
+    def test_without_the_sea_the_ground_is_inland_and_its_open_edges_listed(self):
+        _a, b = self._tiles(sea_in_a=False)
+        low = low_ground([b], [])
+        assert len(low.groups) == 1 and not low.groups[0].coastal
+        assert sorted(low.groups[0].open_edges) == [(1, "E"), (1, "N"), (1, "S"), (1, "W")]
+        assert low.by_tile == {1: (set(), {1})}
+        lines = format_low_ground_report(low, [b])
+        assert lines[0].startswith("Low ground connected to the sea: 0 region(s)")
+        assert "keeps the plain shift (1 region(s))" in lines[1] and lines[1].endswith("tile1.dt0:N,S,W,E.")
+
+    def test_edges_without_regions_make_no_groups(self):
+        a, b = self._tiles(regions_b=False)
+        low = low_ground([a, b], find_seams([a, b]))
+        assert [g.members for g in low.groups] == [[(0, 1)]]
+        assert format_low_ground_report(low, [a, b])[0].startswith("Low ground connected to the sea: 1 region(s)")
+        assert format_low_ground_report(LowGround([], {}), []) == []
+
+    def _lake_tile(self, sea):
+        labeled = _band(2)
+        cm = np.arange(25, dtype=np.int32).reshape(5, 5) * 3 + 50
+        cm[1:3, :] = 15000
+        if sea:
+            labeled[4, :] = 1
+        tile = _tile(0, labeled, GT_A, {2: (15000, 149.4, 10, 20, 0, 149.9, 1)}, cm=cm)
+        tile.edges = extract_edges(labeled, GT_A, cm, np.ones((5, 5), dtype=np.int32))
+        tile.ocean_regions = {1} if sea else set()
+        return tile
+
+    def test_a_body_in_coastal_ground_takes_its_coastal_minimum(self):
+        for sea, expected in ((True, 149.9), (False, 149.4)):
+            _, bodies = merge_patches([self._lake_tile(sea)], [])
+            assert bodies[0].coastal is sea and bodies[0].level == expected
+
+    def test_a_coastal_table_row_makes_the_body_coastal_before_lowering_it(self):
+        coastal_row = TableRow(15000, 149.7, 40, 2, "E", 4.0, 1.0, 3.5, coastal=True)
+        _, bodies = merge_patches([self._lake_tile(False)], [], WaterLevelTable([coastal_row], "EGM2008", "EGM96"))
+        assert bodies[0].coastal and bodies[0].level == 149.7 and bodies[0].table_level == 149.7
+        assert any("connected to the sea" in note for note in bodies[0].notes)
+        plain_row = TableRow(15000, 149.7, 40, 2, "E", 4.0, 1.0, 3.5)
+        _, bodies = merge_patches([self._lake_tile(False)], [], WaterLevelTable([plain_row], "EGM2008", "EGM96"))
+        assert not bodies[0].coastal and bodies[0].level == 149.4
+        assert any("stale" in note for note in bodies[0].notes)

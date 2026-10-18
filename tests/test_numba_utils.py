@@ -77,3 +77,16 @@ def test_constants_are_booleans():
     assert isinstance(TQDM_AVAILABLE, bool)
     assert isinstance(PARALLEL_ENABLED, bool)
     assert isinstance(NUMBA_CACHE, bool)
+
+
+def test_jit_enabled_follows_numba_and_its_disable_switch(monkeypatch):
+    """Under NUMBA_DISABLE_JIT a kernel is its plain Python function, so a caller
+    that has a numpy version of the work must know to run that instead."""
+    from egmtrans.numba_utils import jit_enabled
+
+    assert jit_enabled() == NUMBA_AVAILABLE
+    if NUMBA_AVAILABLE:
+        import numba
+
+        monkeypatch.setattr(numba.config, "DISABLE_JIT", 1)
+        assert not jit_enabled()

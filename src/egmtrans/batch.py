@@ -55,7 +55,7 @@ from egmtrans.file_utils import (
     is_valid_dem,
     mask_output_name,
 )
-from egmtrans.flattening import DEFAULT_CONTAINMENT
+from egmtrans.flattening import DEFAULT_COAST_BAND, DEFAULT_CONTAINMENT
 from egmtrans.io import new_dted_header, preview_dted_header
 from egmtrans.logging_setup import progress
 from egmtrans.tiling import (
@@ -70,8 +70,10 @@ from egmtrans.tiling import (
     connected_tiles,
     find_seams,
     format_boundary_report,
+    format_low_ground_report,
     format_seam_report,
     format_tile_patches,
+    low_ground,
     merge_patches,
 )
 from egmtrans.transform import (
@@ -83,7 +85,7 @@ from egmtrans.transform import (
     tile_geometry,
 )
 
-TABLE_COLUMNS = ('height_m', 'level_m', 'posts', 'tiles', 'side', 'line', 'start', 'end')
+TABLE_COLUMNS = ('height_m', 'level_m', 'posts', 'tiles', 'side', 'line', 'start', 'end', 'coastal')
 # Above this many work units, a run in ArcGIS Pro keeps the per-cell detail
 # to the log file and shows the messages pane one line per cell.
 QUIET_THRESHOLD = 20
@@ -270,6 +272,8 @@ def read_water_levels(path: str, source_datum: str, target_datum: str) -> WaterL
                 line=float(record['line']),
                 start=float(record['start']),
                 end=float(record['end']),
+                # Tables written before the coastal rule have no such column: not coastal.
+                coastal=str(record.get('coastal') or '0').strip().lower() in ('1', 'true'),
             ))
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f'The water-level table {path} is malformed: {e}') from e
@@ -298,7 +302,7 @@ def write_water_levels(path: str, bodies: list[WaterBody], source_datum: str, ta
                 writer.writerow([
                     f'{body.height_cm / 100:.2f}', repr(float(body.level)), body.posts, len(body.tile_ids),
                     crossing.side, repr(float(crossing.line)), repr(float(crossing.start)),
-                    repr(float(crossing.end)),
+                    repr(float(crossing.end)), int(body.coastal),
                 ])
                 count += 1
     return count
@@ -448,7 +452,10 @@ def adjoining_context(run_files: list[str], context_files: list[str]) -> list[st
     return [t.input_file for t in geometry if t.tile_id >= len(run_files) and t.tile_id in reached]
 
 
-def _pass_explanation(min_patch_size: int, min_containment: float, with_table: bool, with_finished: bool) -> list[str]:
+def _pass_explanation(
+    min_patch_size: int, min_containment: float, with_table: bool, with_finished: bool,
+    coast_band: float = DEFAULT_COAST_BAND,
+) -> list[str]:
     """The lines that say what pass 1 does with the run's values, logged once before it starts."""
     lines = [
         f'Pass 1 looks in every tile for the flat areas of at least {min_patch_size} posts at one height (the same '
@@ -462,6 +469,12 @@ def _pass_explanation(min_patch_size: int, min_containment: float, with_table: b
         'tile by tile. The tables at the end of pass 1 list the bodies that span tiles and the ones that touch an '
         'edge with no neighbor in the run.',
     ]
+    if coast_band > 0:
+        lines.append(
+            f'Low ground connected to the sea keeps its height above the sea within the geoid correction, and the '
+            f'shift blends in over the {coast_band:g} m above that; pass 1 joins such ground across the seams so that '
+            f'both sides of a seam agree, and lists the low ground that reaches an edge of the run without the sea.'
+        )
     if with_finished:
         lines.append(
             'The inputs of the skipped outputs are analyzed too, so the water bodies they share with the rest of the '
@@ -510,6 +523,7 @@ def run_batch(
     dted_naming: str = DEFAULT_DTED_NAMING,
     skip_existing: bool = False,
     should_stop: Callable[[], bool] | None = None,
+    coast_band: float = DEFAULT_COAST_BAND,
 ) -> BatchResult:
     """Transform every DEM of a run with water bodies leveled across tiles.
 
@@ -845,7 +859,9 @@ def run_batch(
                 'Pass 1: analyzing ' + ', '.join(counted[:-1]) + (' and ' if len(counted) > 1 else '') + counted[-1]
                 + ' for water bodies that cross tile edges...'
             )
-            for line in _pass_explanation(min_patch_size, min_containment, table is not None, bool(finished_units)):
+            for line in _pass_explanation(
+                min_patch_size, min_containment, table is not None, bool(finished_units), coast_band,
+            ):
                 logger.info(line)
             for tile_id, unit in enumerate(all_units):
                 if stop_requested():
@@ -857,7 +873,7 @@ def run_batch(
                 try:
                     tile = analyze_tile(
                         unit.input_file, source_datum, target_datum, algorithm, min_patch_size,
-                        tile_temp, tile_id, unit.output_file, cell=unit.cell,
+                        tile_temp, tile_id, unit.output_file, cell=unit.cell, coast_band=coast_band,
                     )
                 except KeyboardInterrupt:
                     result.cancelled = True
@@ -887,6 +903,8 @@ def run_batch(
                 result.tiles = tiles
                 for line in format_boundary_report(bodies, tiles):
                     logger.info(line)
+                for line in format_low_ground_report(low_ground(tiles, seams), tiles):
+                    logger.info(line)
                 if quiet:
                     progress(boundary_summary(bodies) + ' The log file holds the tables.')
                 progress(f'\nPass 2: transforming {len(units)} tile(s)...')
@@ -911,7 +929,7 @@ def run_batch(
                     check_for_wrong_datum=False, arc_mode=arc_mode, assume_yes=True,
                     tile_levels=tile_levels, min_containment=min_containment,
                     dted_metadata=dted_metadata, dted_cell=unit.cell, dted_plan=False,
-                    mask_file=unit.mask_file,
+                    mask_file=unit.mask_file, coast_band=coast_band,
                 )
             except cli.NonInteractiveError:
                 raise

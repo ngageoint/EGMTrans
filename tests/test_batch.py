@@ -22,6 +22,7 @@ from tests.conftest import point_geotransform, read_band, write_dted, write_geot
 
 POSTS = 121          # DTED0: the last column of a tile is the first of its eastern neighbor
 LAKE_ROWS = slice(40, 80)
+SLIVER_ROWS = slice(45, 55)
 
 
 def _grids_available() -> bool:
@@ -49,6 +50,26 @@ def dted_tiles(folder, lake_to_east_edge=False):
     a[LAKE_ROWS, 90:] = 150                                # to the east edge of the west tile
     b = _terrain(POSTS, POSTS - 1, np.int16)
     b[LAKE_ROWS, : (POSTS if lake_to_east_edge else 30)] = 150   # from the west edge of the east tile
+    os.makedirs(folder, exist_ok=True)
+    return (
+        write_dted(os.path.join(folder, "n06e126.dt0"), a, 126, 6, datum_code="E08"),
+        write_dted(os.path.join(folder, "n06e127.dt0"), b, 127, 6, datum_code="E08"),
+    )
+
+
+def sliver_tiles(folder, lake_in_west_tile=True):
+    """A 10-row lake that ends on the shared column: in the east tile it is a sliver of 10 posts.
+
+    With *lake_in_west_tile* False the east tile holds the same 10 posts on its
+    own east edge instead, where no tile continues them.
+    """
+    a = _terrain(POSTS, 0, np.int16)
+    b = _terrain(POSTS, POSTS - 1, np.int16)
+    if lake_in_west_tile:
+        a[SLIVER_ROWS, 90:] = 150        # to the shared column
+        b[SLIVER_ROWS, 0] = 150          # the shared column only: fewer than 16 posts, no label
+    else:
+        b[SLIVER_ROWS, POSTS - 1] = 150  # the east edge, open
     os.makedirs(folder, exist_ok=True)
     return (
         write_dted(os.path.join(folder, "n06e126.dt0"), a, 126, 6, datum_code="E08"),
@@ -111,6 +132,37 @@ class TestOverlappingDted:
         body = result.water_bodies[0]
         assert body.height_cm == 15000 and body.tile_ids == [0, 1]
         assert body.posts == 40 * 31 + 40 * 30
+
+    def test_lake_sliver_in_the_neighbor_takes_the_lake_level(self, tmp_dir, log_lines):
+        """Lake Kivu, 2026-10-13: the lake's part in one cell was four posts wide at the seam, fewer than
+        the minimum patch size, so that cell left it as terrain and the shared posts differed by a meter."""
+        sliver_tiles(os.path.join(tmp_dir, "in"))
+        result = _run(os.path.join(tmp_dir, "in"), os.path.join(tmp_dir, "out"))
+        assert result.exit_code == 0 and result.seams == 1
+        out_a = read_band(os.path.join(tmp_dir, "out", "n06e126.dt0"))
+        out_b = read_band(os.path.join(tmp_dir, "out", "n06e127.dt0"))
+        assert np.array_equal(out_a[:, -1], out_b[:, 0]), "the shared column differs at the sliver"
+        lake = np.unique(out_a[SLIVER_ROWS, 90:])
+        assert lake.size == 1 and np.array_equal(out_b[SLIVER_ROWS, 0], np.full(10, lake[0]))
+        assert len(result.water_bodies) == 1
+        body = result.water_bodies[0]
+        assert body.water and body.posts == 10 * 31 and body.tile_ids == [0]
+        assert body.notes == [
+            "n06e127.dt0:W continues it with 10 post(s) below the minimum patch size at the seam; "
+            "they take the body's level"
+        ]
+        text = "\n".join(log_lines)
+        assert "Leveled 10 post(s) of 1 sliver(s) at the tile edges" in text
+        assert "0 seam(s) with posts that differ" in text
+
+    def test_a_sliver_no_tile_continues_stays_terrain(self, tmp_dir):
+        src_a, src_b = sliver_tiles(os.path.join(tmp_dir, "in"), lake_in_west_tile=False)
+        result = _run(os.path.join(tmp_dir, "in"), os.path.join(tmp_dir, "out"))
+        assert result.exit_code == 0
+        assert all(body.height_cm != 15000 for body in result.water_bodies)
+        out_b = read_band(os.path.join(tmp_dir, "out", "n06e127.dt0"))
+        alone_b = _alone(src_b, os.path.join(tmp_dir, "alone.dt0"))
+        assert np.array_equal(out_b, alone_b), "nothing in the batch changes a tile whose slivers no tile continues"
 
     def test_shared_dted_column_is_bit_identical(self, tmp_dir):
         dted_tiles(os.path.join(tmp_dir, "in"))
@@ -919,3 +971,171 @@ def test_water_level_table_accepts_a_bom_and_names_a_spreadsheet_resave(tmp_dir)
         handle.write(body.replace('150.00,149.25,400', '"150,00","149,25",400'))
     with pytest.raises(ValueError, match='decimal commas'):
         read_water_levels(path, 'EGM2008', 'EGM96')
+
+
+def coast_tiles(folder):
+    """n06e126.dt0 with the sea in its west quarter and n06e127.dt0 inland: a plain rising 1 m every 20 columns
+    from the shore to 12 m, then 20 m and more; no two neighbors alike; a 4 m lake across the shared column."""
+    i, j = np.mgrid[0:POSTS, 0:2 * POSTS - 1]
+    plain = (1 + np.minimum(j // 20, 9) + (i + j) % 3).astype(np.int16)
+    plain[:, 200:] += 10                     # from 20 m up: above the band, no stray low post near its top
+    plain[:, :30] = 0
+    plain[40:80, 100:141] = 4
+    a, b = plain[:, :POSTS].copy(), plain[:, POSTS - 1:].copy()
+    os.makedirs(folder, exist_ok=True)
+    return (
+        write_dted(os.path.join(folder, "n06e126.dt0"), a, 126, 6, datum_code="E08"),
+        write_dted(os.path.join(folder, "n06e127.dt0"), b, 127, 6, datum_code="E08"),
+    )
+
+
+def void_bridge_tiles(folder):
+    """Three DTED0 tiles west to east: the sea and a 5 to 7 m plain; a tile at 100 m and more with one void
+    row from its west edge to its east edge; an inland plain at 5 to 7 m with no sea. The shared columns are
+    high, so the void row is the only low ground of the middle tile and the only path from the plain to the sea."""
+    i, j = np.mgrid[0:POSTS, 0:3 * POSTS - 2]
+    wide = (5 + (i + j) % 3).astype(np.int16)
+    wide[:, :30] = 0
+    wide[:, POSTS - 1:2 * POSTS - 1] += 95
+    wide[60, 30:] = -32767
+    a, b, c = wide[:, :POSTS].copy(), wide[:, POSTS - 1:2 * POSTS - 1].copy(), wide[:, 2 * POSTS - 2:].copy()
+    os.makedirs(folder, exist_ok=True)
+    return tuple(
+        write_dted(os.path.join(folder, name), tile, lon0, 6, datum_code="E08")
+        for name, tile, lon0 in (("n06e126.dt0", a, 126), ("n06e127.dt0", b, 127), ("n06e128.dt0", c, 128))
+    )
+
+
+class TestCoastAcrossTiles:
+    """Low ground connected to the sea in one tile keeps its height above the sea in the inland tile too.
+
+    The geoid is faked: EGM96 lowers the land by 2.5 m everywhere, so the band is
+    2.5 to 12.5 m and a 7 m post comes out at 5.875 m (6 m in DTED) instead of
+    4.5 m (5 m).
+    """
+
+    @staticmethod
+    def _fake(monkeypatch, egm96=2.5):
+        from osgeo import gdal
+
+        from egmtrans import cli, transform
+
+        values = {"EGM96": egm96, "EGM2008": 0.0}
+
+        def fake(input_file, datum, algorithm, temp_dir, output_dir):
+            ds = gdal.Open(input_file)
+            shape = (ds.RasterYSize, ds.RasterXSize)
+            ds = None
+            return np.full(shape, values[datum], dtype=np.float32)
+
+        monkeypatch.setattr(transform, "create_datum_array", fake)
+        monkeypatch.setattr(cli, "verify_grids", lambda *a: None)
+
+    def test_the_inland_tile_is_blended_through_the_sea_of_its_neighbor(self, tmp_dir, monkeypatch, log_lines):
+        self._fake(monkeypatch)
+        coast_tiles(os.path.join(tmp_dir, "in"))
+        result = _run(os.path.join(tmp_dir, "in"), os.path.join(tmp_dir, "out"))
+        assert result.exit_code == 0 and result.files_processed == 2
+        west = read_band(os.path.join(tmp_dir, "out", "n06e126.dt0"))
+        east = read_band(os.path.join(tmp_dir, "out", "n06e127.dt0"))
+        np.testing.assert_array_equal(west[:, -1], east[:, 0])
+        assert west[0, 0] == 0 and west[0, 30] == 2, "the shore keeps its 2 m; the plain shift gave -1"
+        assert east[0, 3] == 6, "7 m in the inland tile is blended, not shifted to 5"
+        assert east[0, 120] == 18, "above the band the plain shift applies (20 - 2.5, rounded half away)"
+        assert west[50, 110] == 4 and east[50, 10] == 4, "the lake keeps its 4 m (3.625 m), not 1.5 m"
+        assert result.seam_checks and all(check.clean for check in result.seam_checks)
+        assert any(
+            "Low ground connected to the sea: 1 region(s) at the tile edges, 1 spanning" in line for line in log_lines
+        )
+        assert not any("keeps the plain shift" in line for line in log_lines)
+
+    def test_the_inland_tile_alone_keeps_the_plain_shift_and_says_so(self, tmp_dir, monkeypatch, log_lines):
+        self._fake(monkeypatch)
+        _src_a, src_b = coast_tiles(os.path.join(tmp_dir, "in"))
+        only_b = os.path.join(tmp_dir, "only_b")
+        os.makedirs(only_b)
+        shutil.copy(src_b, only_b)
+        result = _run(only_b, os.path.join(tmp_dir, "alone"))
+        assert result.exit_code == 0
+        east = read_band(os.path.join(tmp_dir, "alone", "n06e127.dt0"))
+        assert east[0, 3] == 5 and east[50, 10] == 2
+        line = next(line for line in log_lines if "keeps the plain shift" in line)
+        assert "n06e127.dt0:N,S,W" in line
+
+        log_lines.clear()
+        result = _run(only_b, os.path.join(tmp_dir, "ctx"), context_folders=[os.path.join(tmp_dir, "in")])
+        assert result.exit_code == 0
+        east = read_band(os.path.join(tmp_dir, "ctx", "n06e127.dt0"))
+        assert east[0, 3] == 6 and east[50, 10] == 4, "with the sea tile as context the plain is coastal"
+        assert not any("keeps the plain shift" in line for line in log_lines)
+
+    def test_a_void_row_through_a_high_tile_bridges_the_inland_plain_to_the_sea(self, tmp_dir, monkeypatch, log_lines):
+        """The middle tile stands above the band top everywhere, but its void row is
+        passable, so pass 1 records it and the inland plain is coastal."""
+        self._fake(monkeypatch)
+        void_bridge_tiles(os.path.join(tmp_dir, "in"))
+        result = _run(os.path.join(tmp_dir, "in"), os.path.join(tmp_dir, "out"))
+        assert result.exit_code == 0 and result.files_processed == 3
+        source = read_band(os.path.join(tmp_dir, "in", "n06e128.dt0"))
+        east = read_band(os.path.join(tmp_dir, "out", "n06e128.dt0"))
+        plain = (source == 7) | (source == 5)
+        plain[:, 0] = False
+        assert np.all(east[source == 7] == 6) and np.all(east[(source == 5) & plain] == 4), (
+            "blended through the void row (7 m to 5.875, 5 m to 4.375), not shifted to 5 and 3"
+        )
+        assert np.all(east[60, 1:] == -32767)
+        middle_in = read_band(os.path.join(tmp_dir, "in", "n06e127.dt0"))
+        middle = read_band(os.path.join(tmp_dir, "out", "n06e127.dt0"))
+        land = middle_in != -32767
+        assert np.array_equal(middle[land], round_half_away(middle_in[land] - 2.5)) and np.all(middle[~land] == -32767)
+        assert result.seam_checks and all(check.clean for check in result.seam_checks)
+        assert any("Low ground connected to the sea: 1 region(s)" in line for line in log_lines)
+        assert not any("keeps the plain shift" in line for line in log_lines)
+
+    def test_the_table_carries_the_coastal_verdict(self, tmp_dir, monkeypatch):
+        self._fake(monkeypatch)
+        _src_a, src_b = coast_tiles(os.path.join(tmp_dir, "in"))
+        table = os.path.join(tmp_dir, "levels.csv")
+        full = _run(os.path.join(tmp_dir, "in"), os.path.join(tmp_dir, "full"), export_water_levels=table)
+        assert full.exit_code == 0 and [body.coastal for body in full.water_bodies if body.water] == [True]
+        assert all(row.coastal for row in read_water_levels(table, "EGM2008", "EGM96").rows)
+        only_b = os.path.join(tmp_dir, "only_b")
+        os.makedirs(only_b)
+        shutil.copy(src_b, only_b)
+        result = _run(only_b, os.path.join(tmp_dir, "tab"), water_levels=table)
+        assert result.exit_code == 0 and result.water_bodies[0].coastal
+        east = read_band(os.path.join(tmp_dir, "tab", "n06e127.dt0"))
+        reference = read_band(os.path.join(tmp_dir, "full", "n06e127.dt0"))
+        np.testing.assert_array_equal(east[40:80, :21], reference[40:80, :21])
+        assert east[50, 10] == 4
+
+    def test_tiles_the_rule_cannot_touch_are_not_labeled_and_keep_their_bytes(self, tmp_dir, monkeypatch):
+        """Tiles without a void whose lowest post stands above every band top never
+        have their low-ground regions labeled, in either pass, and their DTED
+        bytes are the same with the rule on and off."""
+        from egmtrans import transform
+
+        self._fake(monkeypatch)
+        calls = []
+        real = transform.coastal_regions
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(transform, "coastal_regions", spy)
+        a = _terrain(POSTS, 0, np.int16) + 500
+        a[LAKE_ROWS, 90:] = 650
+        b = _terrain(POSTS, POSTS - 1, np.int16) + 500
+        b[LAKE_ROWS, :30] = 650
+        folder = os.path.join(tmp_dir, "in")
+        os.makedirs(folder)
+        write_dted(os.path.join(folder, "n06e126.dt0"), a, 126, 6, datum_code="E08")
+        write_dted(os.path.join(folder, "n06e127.dt0"), b, 127, 6, datum_code="E08")
+        digests = []
+        for band in (10.0, 0.0):
+            out = os.path.join(tmp_dir, f"out_{band:g}")
+            result = _run(folder, out, coast_band=band)
+            assert result.exit_code == 0 and result.files_processed == 2
+            digests.append([_sha(os.path.join(out, name)) for name in ("n06e126.dt0", "n06e127.dt0")])
+        assert digests[0] == digests[1] and not calls

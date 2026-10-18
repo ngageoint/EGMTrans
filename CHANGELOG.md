@@ -5,11 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.12.0] - 2026-10-17
+
+### Added
+
+- Coastal containment: low ground connected to the sea keeps its height above the sea within the geoid correction, and the datum shift blends in over a band above it (`-b`/`--coast-band`; Coastal Containment and Coastal Band in ArcGIS Pro; 10 m by default, 0 turns it off), in both directions and exactly reversible. A coast that EGM96 would sink below the sea or lift onto a cliff above it keeps the coastline of the source DEM instead, as MIL-PRF-89020B 3.5.3.2.1 asks, and coastal land that rounds to 0 in DTED is written as 1 m. The regions are joined across the tiles of a run, the water-level table records which water bodies lie in them, and the log counts the posts concerned. See `docs/water_bodies.md`.
+- Every option of the transform has a hyphenated long name beside its short one: `--source-datum`, `--target-datum`, `--create-mask`, `--min-patch-size`, `--log-file` and `--abs-horiz-accuracy` join `--input`, `--output` and the rest. The underscore spellings of earlier releases still work.
 
 ### Changed
 
 - The README is organized around the EGMTrans Tool and the five DTED tools, with new screenshots of both; `docs/dted_tools.md` documents the DTED tools' parameters, messages and exit codes.
+- Options are no longer matched by prefix (`--source` for `--source-datum`), on the transform and on the DTED tools; write them out.
+- Converting a GeoTIFF to DTED is faster: the resampling of the heights, of the water labels and of the geoid correction onto the cell runs as compiled kernels where Numba is installed, with the same bytes as before; without Numba the conversion runs as it did.
+- A run checks each geoid grid against its SHA-256 once, and a GeoTIFF output is written straight to the Cloud Optimized GeoTIFF, with no uncompressed copy under the output folder first.
+
+### Fixed
+
+- A water body whose part in a neighboring tile is a sliver smaller than the minimum patch size at the tile edge is now leveled in that tile too; the sliver was left as terrain there, so the shared posts of the two cells differed by a meter. The log notes the body and the posts concerned; a sliver no tile continues stays terrain. The sliver takes the body's level exactly, and its label can no longer collide with a dropped flat area or with the ocean code of the mask.
 
 ## [1.11.0] - 2026-10-10
 

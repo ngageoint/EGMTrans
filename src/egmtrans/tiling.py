@@ -68,6 +68,8 @@ class EdgeRecord:
     length: int
     idx: np.ndarray
     labels: np.ndarray
+    heights: np.ndarray | None = None  # the input height of every post along the edge, in whole centimeters
+    low: np.ndarray | None = None  # the low-ground region of every post along the edge (0 none), see coastal_regions
 
     def coordinate(self, index: float) -> float:
         return self.along0 + index * self.step
@@ -86,7 +88,11 @@ class PatchStats:
     *above* and *below* count the patch's boundary neighbors in the input
     that lie above and below it (see
     :func:`~egmtrans.flattening.patch_boundary_stats`); summed over a water
-    body they decide whether it is water at all.
+    body they decide whether it is water at all.  *min_coastal* is the
+    patch's lowest value under the coastal rule
+    (:func:`~egmtrans.flattening.apply_coast`), what pass 2 computes when the
+    body is coastal low ground, and *region* the low-ground region the patch
+    lies in (0 for none); None for *min_coastal* means the plain minimum.
     """
 
     height_cm: int
@@ -94,6 +100,14 @@ class PatchStats:
     count: int
     above: int = 0
     below: int = 0
+    min_coastal: float | None = None
+    region: int = 0
+
+    def level(self, coastal: bool) -> float:
+        """The minimum pass 2 computes for this patch: under the coastal rule or the plain shift."""
+        if coastal and self.min_coastal is not None:
+            return self.min_coastal
+        return self.min_value
 
 
 @dataclass(eq=False)
@@ -114,6 +128,7 @@ class TileAnalysis:
     cell: object | None = None  # the DTED cell a converted tile is written as
     array_crc: int | None = None  # CRC-32 of the heights, for pass 2 to check
     finished: bool = False  # written by an earlier run and skipped: analyzed as context
+    ocean_regions: set[int] = field(default_factory=set)  # the low-ground regions that hold an ocean post
 
     @property
     def name(self) -> str:
@@ -202,6 +217,7 @@ class WaterBody:
     above: int = 0
     below: int = 0
     water: bool = True
+    coastal: bool = False  # lies in low ground connected to the sea: leveled under the coastal rule
 
     @property
     def tile_ids(self) -> list[int]:
@@ -229,6 +245,13 @@ class TileLevels:
     expected_counts: dict[int, int] = field(default_factory=dict)
     not_water: set[int] = field(default_factory=set)
     array_crc: int | None = None
+    # (side, position, level, height_cm): an unlabeled edge post at the height of the water body the
+    # neighbor holds across the seam; pass 2 levels the sliver it belongs to with the body
+    adopted: list[tuple[str, int, float, int]] = field(default_factory=list)
+    # The low-ground regions at the tile's edges that the run found connected to the sea, and the
+    # ones it found not to be (see low_ground); regions inside the tile are decided in pass 2.
+    coastal: set[int] = field(default_factory=set)
+    inland: set[int] = field(default_factory=set)
 
     def override_array(self, max_label: int) -> np.ndarray:
         """A dense float array indexed by label, NaN where there is no override."""
@@ -249,6 +272,7 @@ class TableRow:
     line: float
     start: float
     end: float
+    coastal: bool = False  # the body lay in low ground connected to the sea in the exporting run
 
 
 class WaterLevelTable:
@@ -342,15 +366,35 @@ def geometry_edges(geotransform: tuple, rows: int, cols: int) -> dict[str, EdgeR
     }
 
 
-def extract_edges(labeled: np.ndarray, geotransform: tuple) -> dict[str, EdgeRecord]:
-    """The labeled posts (label > 1) along the four edges of a label array."""
+def _edge_lines(array: np.ndarray) -> dict[str, np.ndarray]:
+    return {'N': array[0, :], 'S': array[-1, :], 'W': array[:, 0], 'E': array[:, -1]}
+
+
+def extract_edges(
+    labeled: np.ndarray, geotransform: tuple, cm: np.ndarray | None = None, regions: np.ndarray | None = None,
+) -> dict[str, EdgeRecord]:
+    """The labeled posts (label > 1) along the four edges of a label array.
+
+    With *cm*, the :func:`~egmtrans.flattening.height_centimeters` array, every
+    edge post's height is recorded too, so the merge can see a sliver of a
+    water body that is too small to be a patch of its own.  With *regions*
+    (:func:`~egmtrans.flattening.coastal_regions`), every edge post's
+    low-ground region is recorded, so the run can join the low ground across
+    the seams.
+    """
     rows, cols = labeled.shape
-    lines = {'N': labeled[0, :], 'S': labeled[-1, :], 'W': labeled[:, 0], 'E': labeled[:, -1]}
+    lines = _edge_lines(labeled)
+    heights = _edge_lines(cm) if cm is not None else None
+    low = _edge_lines(regions) if regions is not None else None
     edges = {}
     for side, (across, along0, step, length) in _edge_frames(geotransform, rows, cols).items():
         line = lines[side]
         idx = np.flatnonzero(line > 1).astype(np.int32)
-        edges[side] = EdgeRecord(side, across, along0, step, length, idx, line[idx].astype(np.int32))
+        edges[side] = EdgeRecord(
+            side, across, along0, step, length, idx, line[idx].astype(np.int32),
+            None if heights is None else np.ascontiguousarray(heights[side], dtype=np.int32),
+            None if low is None else np.ascontiguousarray(low[side], dtype=np.int32),
+        )
     return edges
 
 
@@ -380,8 +424,15 @@ def edge_patch_stats(
     counts: np.ndarray,
     above: np.ndarray | None = None,
     below: np.ndarray | None = None,
+    coastal_levels: np.ndarray | None = None,
+    regions: np.ndarray | None = None,
 ) -> dict[int, PatchStats]:
-    """Height, minimum transformed value, post count and boundary counts of every edge-touching patch."""
+    """Height, minimum transformed value, post count and boundary counts of every edge-touching patch.
+
+    *coastal_levels* are the minima under the coastal rule and *regions* the
+    low-ground regions (see :class:`PatchStats`); without them a patch's
+    coastal minimum is its plain one and its region 0.
+    """
     rows, cols = input_array.shape
     stats: dict[int, PatchStats] = {}
     for side, edge in edges.items():
@@ -397,6 +448,8 @@ def edge_patch_stats(
                 count=int(counts[label]),
                 above=int(above[label]) if above is not None else 0,
                 below=int(below[label]) if below is not None else 0,
+                min_coastal=float(coastal_levels[label]) if coastal_levels is not None else None,
+                region=int(regions[i, j]) if regions is not None else 0,
             )
     return stats
 
@@ -531,14 +584,179 @@ def _all_covered(positions: np.ndarray, covers: list[tuple[int, int]]) -> bool:
     return bool(covered.all())
 
 
-def _apply_table(body: WaterBody, table: WaterLevelTable, spacing: float) -> None:
+def _adopt_slivers(
+    seam: Seam, by_id: dict[int, TileAnalysis], body_of: dict[tuple[int, int], WaterBody],
+    levels: dict[int, TileLevels],
+) -> None:
+    """Give the unlabeled posts across a seam that continue a water body to pass 2.
+
+    A patch smaller than the minimum patch size gets no label, so the part of
+    a lake that reaches a few posts into the neighboring tile is a sliver that
+    tile knows nothing about, and its shared posts would end a meter from the
+    lake.  Every labeled post of a water body on one side whose counterpart on
+    the other side is unlabeled and at the same whole centimeter is adopted:
+    pass 2 levels the sliver it belongs to with the body.
+    """
+    for tile_a, side_a, tile_b, side_b in ((seam.a, seam.a_side, seam.b, seam.b_side),
+                                           (seam.b, seam.b_side, seam.a, seam.a_side)):
+        a, b = by_id[tile_a], by_id[tile_b]
+        ea, eb = a.edges[side_a], b.edges[side_b]
+        if tile_b not in levels or ea.idx.size == 0 or eb.heights is None or ea.heights is None:
+            continue
+        k = (ea.coordinates() - eb.along0) / eb.step
+        k_round = np.rint(k)
+        near = (np.abs(k - k_round) <= EDGE_TOLERANCE_FRACTION) & (k_round >= 0) & (k_round < eb.length)
+        if not near.any():
+            continue
+        pos_a, labels_a = ea.idx[near], ea.labels[near]
+        pos_b = k_round[near].astype(np.int64)
+        unlabeled = ~np.isin(pos_b, eb.idx)
+        same = eb.heights[pos_b] == ea.heights[pos_a]
+        counted: dict[int, int] = defaultdict(int)
+        for p_b, label_a, ok in zip(pos_b.tolist(), labels_a.tolist(), (unlabeled & same).tolist()):
+            if not ok:
+                continue
+            body = body_of.get((tile_a, label_a))
+            if body is None or not body.water:
+                continue
+            levels[tile_b].adopted.append((side_b, int(p_b), body.level, body.height_cm))
+            counted[id(body)] += 1
+            counted.setdefault(('body', id(body)), body)  # type: ignore[arg-type]
+        for key, n in counted.items():
+            if isinstance(key, tuple):
+                continue
+            body = counted[('body', key)]  # type: ignore[index]
+            body.notes.append(
+                f"{b.name}:{side_b} continues it with {n} post(s) below the minimum patch size at the seam; "
+                f"they take the body's level"
+            )
+
+
+@dataclass
+class LowGroup:
+    """Low ground joined across the seams: its (tile_id, region) members, whether
+    it holds the sea anywhere, and the edges where it reaches a tile edge with
+    no neighbor in the run."""
+
+    members: list[tuple[int, int]]
+    coastal: bool
+    open_edges: list[tuple[int, str]] = field(default_factory=list)
+
+    @property
+    def tile_ids(self) -> list[int]:
+        return sorted({tile_id for tile_id, _ in self.members})
+
+
+@dataclass
+class LowGround:
+    """The low-ground regions at the tile edges of a run, joined across the seams.
+
+    *by_tile* gives, for every tile, the regions at its edges found connected
+    to the sea and the ones found not to be.
+    """
+
+    groups: list[LowGroup]
+    by_tile: dict[int, tuple[set[int], set[int]]]
+
+    def is_coastal(self, tile_id: int, region: int) -> bool:
+        coastal, _inland = self.by_tile.get(tile_id, (set(), set()))
+        return region in coastal
+
+
+def _covers(seams: list[Seam]) -> dict[tuple[int, str], list[tuple[int, int]]]:
+    """The index intervals of every edge that the neighbors across its seams span."""
+    covers: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
+    for seam in seams:
+        if seam.a_cover:
+            covers[(seam.a, seam.a_side)].append(seam.a_cover)
+        if seam.b_cover:
+            covers[(seam.b, seam.b_side)].append(seam.b_cover)
+    return covers
+
+
+def _frame(edge: EdgeRecord) -> tuple[float, float, float, int]:
+    return edge.across, edge.along0, edge.step, edge.length
+
+
+def low_ground(tiles: list[TileAnalysis], seams: list[Seam]) -> LowGround:
+    """Join the low-ground regions at the tile edges across the seams and find the sea.
+
+    Two regions are one when a post of one faces a post of the other across a
+    seam (the same post for overlapping tiles, the adjacent post for abutting
+    ones); a joined region is connected to the sea when any member holds an
+    ocean post (:attr:`TileAnalysis.ocean_regions`).  Pass 2 applies the
+    coastal rule to the regions found coastal and the plain shift to the
+    rest; a region that reaches an edge with no neighbor in the run and no
+    sea anywhere in the run is reported, like a water body touching the run
+    boundary.
+    """
+    by_id = {t.tile_id: t for t in tiles}
+    sets = DisjointSet()
+    edge_regions: dict[int, set[int]] = defaultdict(set)
+    for tile in tiles:
+        if tile.error is not None:
+            continue
+        for edge in tile.edges.values():
+            if edge.low is None:
+                continue
+            for region in np.unique(edge.low).tolist():
+                if region > 0:
+                    sets.add((tile.tile_id, region))
+                    edge_regions[tile.tile_id].add(region)
+    covers = _covers(seams)
+    for seam in seams:
+        a, b = by_id[seam.a], by_id[seam.b]
+        ea, eb = a.edges[seam.a_side], b.edges[seam.b_side]
+        if ea.low is None or eb.low is None:
+            continue
+        ia, ib = coincident_posts(_frame(ea), _frame(eb))
+        la, lb = ea.low[ia], eb.low[ib]
+        both = (la > 0) & (lb > 0)
+        for ra, rb in set(zip(la[both].tolist(), lb[both].tolist())):
+            sets.union((seam.a, ra), (seam.b, rb))
+    groups: list[LowGroup] = []
+    coastal_members: set[tuple[int, int]] = set()
+    for members in sets.groups().values():
+        coastal = any(region in by_id[tile_id].ocean_regions for tile_id, region in members)
+        group = LowGroup(members, coastal)
+        for tile_id, region in members:
+            for side, edge in by_id[tile_id].edges.items():
+                if edge.low is None:
+                    continue
+                positions = np.flatnonzero(edge.low == region)
+                if positions.size and not _all_covered(positions, covers.get((tile_id, side), [])):
+                    group.open_edges.append((tile_id, side))
+        if coastal:
+            coastal_members.update(members)
+        groups.append(group)
+    by_tile = {}
+    for tile_id, regions in edge_regions.items():
+        coastal_here = {region for region in regions if (tile_id, region) in coastal_members}
+        by_tile[tile_id] = (coastal_here, regions - coastal_here)
+    return LowGround(groups, by_tile)
+
+
+def _body_level(stats: list[PatchStats], coastal: bool) -> float:
+    return min(s.level(coastal) for s in stats)
+
+
+def _apply_table(body: WaterBody, table: WaterLevelTable, spacing: float, stats: list[PatchStats]) -> None:
     matches = []
+    coastal_rows = False
     for crossing in body.crossings:
         for row in table.lookup(crossing.side, crossing.line, body.height_cm):
             if crossing.overlaps(row.start, row.end, EDGE_TOLERANCE_FRACTION * spacing):
                 matches.append(row.level)
+                coastal_rows = coastal_rows or row.coastal
     if not matches:
         return
+    if coastal_rows and not body.coastal:
+        # The exporting run saw the sea this run does not: the body's own
+        # minimum is the plain one, and the table's coastal level would be
+        # dropped as stale against it.
+        body.coastal = True
+        body.level = _body_level(stats, True)
+        body.notes.append("the water-level table marks it as low ground connected to the sea; leveled as such")
     table_level = min(matches)
     if max(matches) - table_level > 1e-9:
         body.notes.append(
@@ -571,11 +789,14 @@ def merge_patches(
     least *min_containment* of its boundary, summed over all its parts, lies
     above it; the decision is made for the whole body so that the two sides of
     a seam agree.  The level of a water body is the minimum over its members
-    (and over a matching table row, which can lower it but never raise it).
+    (and over a matching table row, which can lower it but never raise it); a
+    body in low ground connected to the sea (:func:`low_ground`) takes the
+    minimum under the coastal rule, as pass 2 computes it there.
     Returns the levels every output tile needs in pass 2, and the bodies sorted
     largest first.
     """
     by_id = {t.tile_id: t for t in tiles}
+    low = low_ground(tiles, seams)
     sets = DisjointSet()
     for tile in tiles:
         if tile.error is None:
@@ -613,13 +834,17 @@ def merge_patches(
     bodies: list[WaterBody] = []
     for members in sets.groups().values():
         stats = [by_id[tile_id].patches[label] for tile_id, label in members]
+        coastal = any(
+            s.region > 0 and low.is_coastal(tile_id, s.region) for (tile_id, _label), s in zip(members, stats)
+        )
         body = WaterBody(
             height_cm=stats[0].height_cm,
-            level=min(s.min_value for s in stats),
+            level=_body_level(stats, coastal),
             posts=sum(s.count for s in stats),
             members=members,
             above=sum(s.above for s in stats),
             below=sum(s.below for s in stats),
+            coastal=coastal,
         )
         containment = body.containment
         body.water = bool(math.isnan(containment) or containment >= min_containment)
@@ -636,7 +861,7 @@ def merge_patches(
                     body.open_edges.append((tile_id, side))
         if table is not None and body.water:
             spacing = min(by_id[tile_id].dx for tile_id, _ in members)
-            _apply_table(body, table, spacing)
+            _apply_table(body, table, spacing, stats)
         bodies.append(body)
     # A seam whose two sides differ in height is noted under the water body
     # it concerns: side a's, or side b's when a's is not water. Between two
@@ -661,6 +886,23 @@ def merge_patches(
                 else:
                     levels[tile_id].not_water.add(label)
                 levels[tile_id].expected_counts[label] = by_id[tile_id].patches[label].count
+    for tile_id, (coastal_regions, inland_regions) in low.by_tile.items():
+        if tile_id in levels:
+            levels[tile_id].coastal = set(coastal_regions)
+            levels[tile_id].inland = set(inland_regions)
+    # A body the table marks as coastal lies in a region the exporting run saw
+    # connected to the sea: pass 2 treats that region as coastal too, or the
+    # body's own values would stay plain and undercut its level.
+    for body in bodies:
+        if not (body.water and body.coastal):
+            continue
+        for tile_id, label in body.members:
+            region = by_id[tile_id].patches[label].region
+            if region > 0 and tile_id in levels:
+                levels[tile_id].coastal.add(region)
+                levels[tile_id].inland.discard(region)
+    for seam in seams:
+        _adopt_slivers(seam, by_id, body_of, levels)
     return levels, bodies
 
 
@@ -805,6 +1047,38 @@ def format_tile_patches(tile: TileAnalysis, limit: int = 5) -> str:
     )
     more = f" and {len(ordered) - limit} more" if len(ordered) > limit else ""
     return f"{label}: {len(ordered)} edge-touching flat area(s): {listed}{more}."
+
+
+def format_low_ground_report(low: LowGround, tiles: list[TileAnalysis], limit: int = 100) -> list[str]:
+    """Lines on the low ground at the tile edges: how much of it reaches the sea, and the ground that
+    reaches an edge of the run without the sea, which keeps the plain shift."""
+    if not low.groups:
+        return []
+    by_id = {t.tile_id: t for t in tiles}
+    coastal = [g for g in low.groups if g.coastal]
+    spanning = sum(1 for g in coastal if len(g.tile_ids) > 1)
+    lines = [
+        f"Low ground connected to the sea: {len(coastal)} region(s) at the tile edges, {spanning} spanning more "
+        f"than one tile; kept at its height above the sea within the geoid correction."
+    ]
+    open_groups = [g for g in low.groups if not g.coastal and g.open_edges]
+    if open_groups:
+        edges: dict[int, list[str]] = defaultdict(list)
+        for group in open_groups:
+            for tile_id, side in group.open_edges:
+                if side not in edges[tile_id]:
+                    edges[tile_id].append(side)
+        parts = [
+            f"{by_id[i].name}:{','.join(s for s in SIDES if s in edges[i])}{_tile_mark(by_id[i])}"
+            for i in sorted(edges)
+        ]
+        more = f" and {len(parts) - limit} more" if len(parts) > limit else ""
+        lines.append(
+            f"Low ground reaching an edge of this run without the sea in the run keeps the plain shift "
+            f"({len(open_groups)} region(s)); give the neighbors as context if it is a coast: "
+            + "  ".join(parts[:limit]) + more + "."
+        )
+    return lines
 
 
 # ---------------------------------------------------------------------------

@@ -52,16 +52,22 @@ from egmtrans.dted.resample import (
 from egmtrans.dted.writer import DtedMetadataSource
 from egmtrans.file_utils import ELEVATION_DATA_TYPES, copy_as_writable, mask_output_name
 from egmtrans.flattening import (
+    DEFAULT_COAST_BAND,
     DEFAULT_CONTAINMENT,
+    CoastStats,
     RaisedSpots,
+    apply_coast,
     apply_levels,
     boundary_stats_centimeters,
+    coastal_regions,
     containment_stats_centimeters,
     create_flat_mask,
     drop_labels,
+    floor_coastal_land,
     has_fractional_heights,
     height_centimeters,
     label_centimeters,
+    level_edge_slivers,
     patch_centimeters,
     patch_levels,
     raise_low_spots,
@@ -77,7 +83,9 @@ from egmtrans.tiling import (
     edge_touching_labels,
     extract_edges,
     format_boundary_report,
+    format_low_ground_report,
     geometry_edges,
+    low_ground,
     single_tile_water_bodies,
 )
 
@@ -90,6 +98,11 @@ GEOID_NORTH = 90 * GEOID_NODES_PER_DEGREE
 # GDAL open options for a source raster: no sidecar may move the lattice or
 # change the void value, and pixel-is-point registration is honored.
 SOURCE_OPEN_CONFIG = {'GDAL_PAM_ENABLED': 'NO', 'GTIFF_POINT_GEO_IGNORE': 'NO'}
+
+# The largest difference between the EGM96 and EGM2008 geoids anywhere, in
+# meters, rounded up: no geoid correction exceeds it, so a tile whose lowest
+# post lies above this plus the coastal band holds no low ground.
+COAST_CEILING = 12.2
 
 
 def create_gdal_warp_array(
@@ -182,7 +195,8 @@ def create_interp_array(
     4. **Both WGS84** -- returns the input array unchanged.
 
     The delta is subtracted from the input elevations to produce the
-    transformed output.
+    transformed output, and returned with it (None when both datums are
+    WGS84) for the coastal rule.
 
     Args:
         input_array: Input elevation array.
@@ -195,7 +209,8 @@ def create_interp_array(
         output_dir: Directory for output files.
 
     Returns:
-        Transformed elevation array matching input dimensions.
+        The transformed elevation array matching the input dimensions, and
+        the delta that was subtracted.
     """
     src_array = None
     tgt_array = None
@@ -222,7 +237,7 @@ def create_interp_array(
     if delta_array is not None:
         warp_array = input_array - delta_array
 
-    return warp_array
+    return warp_array, delta_array
 
 
 def create_datum_array(
@@ -952,20 +967,22 @@ def geoid_on_cell(datum: str, cell: CellGeometry) -> np.ndarray:
 
 def compute_transformed(
     loaded: LoadedInput, src_datum: str, tgt_datum: str, algorithm: str, temp_dir: str, output_dir: str
-) -> np.ndarray:
-    """The heights in the target datum, before flattening.
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """The heights in the target datum, before flattening, and the correction
+    that was subtracted from the source heights (None when there is none).
 
     Returns the input array itself when the datums are the same, except for
     a conversion, whose heights are always a copy. A conversion takes its
-    correction from :func:`geoid_on_cell`.
+    correction from :func:`geoid_on_cell`; ``proj`` lets GDAL apply it, so
+    the correction is recovered from the heights.
     """
     logger = _state.get_logger()
     if src_datum == tgt_datum:
         if loaded.cell is not None:
             logger.info(f'Source and target datums are the same; cell {loaded.cell.cell_id} is resampled only.')
-            return loaded.array.copy()
+            return loaded.array.copy(), None
         logger.info('Updating GeoTIFF file with compound CRS and optimized compression...')
-        return loaded.array
+        return loaded.array, None
 
     logger.info(f'Starting vertical datum transformation from {src_datum} to {tgt_datum}...')
     if loaded.cell is not None:
@@ -978,14 +995,17 @@ def compute_transformed(
         else:
             delta = 0 - geoid_on_cell(src_datum, work)
         logger.info(f'Evaluated the geoid correction of cell {work.cell_id} on the arc-minute lattice.')
-        return loaded.array - delta
+        return loaded.array - delta, delta
     if algorithm == 'proj':
         src_srs_compound = create_compound_srs(loaded.src_srs, src_datum)
         tgt_srs = create_compound_srs(loaded.src_srs, tgt_datum)
-        return create_gdal_warp_array(
+        warp_array = create_gdal_warp_array(
             loaded.input_file, src_srs_compound, src_datum, tgt_srs, tgt_datum,
             temp_dir, loaded.base_name, loaded.data_type,
         )
+        with np.errstate(invalid='ignore'):
+            shift = np.asarray(loaded.array, dtype=np.float64) - warp_array
+        return warp_array, shift
     return create_interp_array(
         loaded.array, loaded.input_file, src_datum, tgt_datum, algorithm, temp_dir, output_dir,
     )
@@ -1004,6 +1024,7 @@ class FlattenResult:
     dropped: np.ndarray
     label_cm: np.ndarray
     raised: RaisedSpots = field(default_factory=RaisedSpots)
+    slivers: list[tuple[int, float, int, int]] = field(default_factory=list)  # (label, level, height_cm, posts)
 
     @property
     def dropped_posts(self) -> int:
@@ -1118,6 +1139,20 @@ def flatten_tile(
     levels[dropped] = np.nan
 
     warp_array = apply_levels(warp_array, labeled, levels, parallel=not arc_mode)
+    slivers: list[tuple[int, float, int, int]] = []
+    if tile_levels is not None and tile_levels.adopted:
+        # The slivers of the neighbors' water bodies at this tile's edges,
+        # too small for a label of their own: leveled with their bodies, and
+        # given labels so that the mask, the containment count and the
+        # low-spot search see them as water.
+        slivers = level_edge_slivers(warp_array, labeled, centimeters, tile_levels.adopted, first_label=levels.size)
+        if slivers:
+            extra = len(slivers)
+            levels = np.concatenate([levels, np.array([s[1] for s in slivers], dtype=levels.dtype)])
+            counts = np.concatenate([counts, np.array([s[3] for s in slivers], dtype=counts.dtype)])
+            label_cm = np.concatenate([label_cm, np.array([s[2] for s in slivers], dtype=label_cm.dtype)])
+            above = np.concatenate([above, np.zeros(extra, dtype=above.dtype)])
+            below = np.concatenate([below, np.zeros(extra, dtype=below.dtype)])
     # Voids in, voids out. A void has no centimeter value and so joins no
     # patch; restating it here keeps a regression in the labeling from writing
     # voids as sea level again.
@@ -1129,7 +1164,7 @@ def flatten_tile(
         if labels.source_cm is not None:
             accept = _source_grid_check(loaded, labels, label_cm, enclosed_limit)
         raised = raise_low_spots(warp_array, labeled, centimeters, label_cm, levels, enclosed_limit, accept=accept)
-    return warp_array, FlattenResult(levels, counts, above, below, dropped, label_cm, raised)
+    return warp_array, FlattenResult(levels, counts, above, below, dropped, label_cm, raised, slivers)
 
 
 def post_position(
@@ -1280,23 +1315,17 @@ def write_output(
     metadata['AREA_OR_POINT'] = 'Point'
     tgt_srs = create_compound_srs(loaded.src_srs, tgt_datum)
 
-    final_temp_file = os.path.join(temp_dir, f'{loaded.base_name}_final_temp.tif')
-    driver = gdal.GetDriverByName('GTiff')
-    final_ds = driver.Create(final_temp_file, loaded.cols, loaded.rows, 1, gdal.GDT_Float32)
+    # From memory to the COG: GDAL converts the float64 heights to Float32 as
+    # it did into the temporary GeoTIFF this replaced, and nothing but the
+    # output is written under the output folder.
+    final_ds = gdal.GetDriverByName('MEM').Create('', loaded.cols, loaded.rows, 1, gdal.GDT_Float32)
     final_ds.SetGeoTransform(loaded.geotransform)
     final_ds.SetProjection(tgt_srs.ExportToWkt(['FORMAT=WKT2_2019']))
     final_band = final_ds.GetRasterBand(1)
-    # NoData first. A new GeoTIFF skips blocks that equal the NoData value
-    # current at write time (0 when none is set) and fills them with the
-    # NoData value on close, so writing first turned every all-ocean row
-    # of 0 m into NaN once NoData became NaN.
     final_band.SetNoDataValue(np.nan)
     final_band.WriteArray(warp_array)
     final_ds.SetMetadata(metadata)
-    # A live band reference keeps the dataset open; close it before
-    # gdal.Translate reads the file.
     final_band = None
-    final_ds.Close()
 
     translate_options = gdal.TranslateOptions(
         format='COG',
@@ -1313,10 +1342,11 @@ def write_output(
     # leaves no partial GeoTIFF under the output name.
     scratch = _scratch_name(output_file)
     try:
-        cog_ds = gdal.Translate(scratch, final_temp_file, options=translate_options)
+        cog_ds = gdal.Translate(scratch, final_ds, options=translate_options)
         cog_ds.Close()
         os.replace(scratch, output_file)
     finally:
+        final_ds = None
         for leftover in (scratch, scratch + '.aux.xml'):
             if os.path.exists(leftover):
                 os.remove(leftover)
@@ -1376,32 +1406,93 @@ def analyze_tile(
     output_file: str | None,
     *,
     cell: CellGeometry | None = None,
+    coast_band: float = DEFAULT_COAST_BAND,
 ) -> TileAnalysis:
     """The first pass of a batch run over one tile.
 
     Labels the tile exactly as the transform will, records the labeled posts
-    along its edges, and, only when a flat patch touches an edge, runs the
-    transform to record that patch's height, lowest transformed value and post
-    count.  The arrays are dropped on return; the record is small. With
-    *cell*, the tile is the cell's level-2 grid made from the raster.
+    along its edges, and, when a flat patch touches an edge or the tile may
+    hold low ground connected to the sea, runs the transform to record each
+    edge patch's height, lowest transformed value and post count, and, where
+    the coastal rule can touch the tile (:func:`_coast_possible`), the
+    minimum under that rule and the low-ground regions along the edges.
+    The arrays are dropped on return; the record is small. With *cell*, the
+    tile is the cell's level-2 grid made from the raster.
     """
     loaded = load_input(input_file, temp_dir, cell=cell)
     tile = loaded.tile_analysis(tile_id, output_file)
     labels = label_tile(loaded, min_patch_size)
-    tile.edges = extract_edges(labels.labeled, loaded.geotransform)
-    if edge_touching_labels(tile.edges).size == 0:
+    tile.edges = extract_edges(labels.labeled, loaded.geotransform, loaded.centimeters)
+    no_patch = edge_touching_labels(tile.edges).size == 0
+    coast_possible = _coast_possible(loaded, src_datum, tgt_datum, coast_band)
+    if no_patch and not coast_possible:
         return tile
 
     # The full transform, through the same code as the second pass, so the
     # minimum recorded here is bit for bit the value that pass computes.
-    warp_array = compute_transformed(loaded, src_datum, tgt_datum, algorithm, temp_dir, temp_dir)
+    warp_array, shift = compute_transformed(loaded, src_datum, tgt_datum, algorithm, temp_dir, temp_dir)
+    regions = None
+    coastal_levels = None
+    if shift is not None and coast_possible:
+        # Where the rule cannot touch a post the regions would be empty and
+        # the coastal minimum the plain one: the merge reads both the same.
+        regions, tile.ocean_regions = coastal_regions(loaded.array, shift, labels.labeled, coast_band)
+        tile.edges = extract_edges(labels.labeled, loaded.geotransform, loaded.centimeters, regions)
+        if not no_patch:
+            # Every region as if coastal: the merge picks this minimum for the
+            # bodies it finds connected to the sea, the plain one for the rest.
+            weighted = warp_array.copy()
+            apply_coast(weighted, loaded.array, shift, labels.labeled, regions, None, coast_band)
+            coastal_levels, _ = patch_levels(weighted, labels.labeled)
+            del weighted
+    if no_patch:
+        return tile
     levels, counts = patch_levels(warp_array, labels.labeled)
     if labels.boundary is not None:
         above, below = labels.boundary
     else:
         above, below = boundary_stats_centimeters(loaded.centimeters, labels.labeled)
-    tile.patches = edge_patch_stats(loaded.array, tile.edges, levels, counts, above, below)
+    tile.patches = edge_patch_stats(
+        loaded.array, tile.edges, levels, counts, above, below, coastal_levels=coastal_levels, regions=regions,
+    )
     return tile
+
+
+def _coast_possible(loaded: LoadedInput, src_datum: str, tgt_datum: str, coast_band: float) -> bool:
+    """Whether the coastal rule can touch a tile: on, between the two geoids,
+    and a void or a post below the highest band top any correction can give.
+    Both passes label the low-ground regions of a tile only when this holds."""
+    if coast_band <= 0 or src_datum == tgt_datum or 'WGS84' in (src_datum, tgt_datum):
+        return False
+    finite = np.isfinite(loaded.array)
+    if not finite.all():
+        # A void passes low ground through (coastal_regions), so a tile with
+        # voids can bridge its neighbors to the sea whatever its heights, and
+        # an all-void tile holds one region that joins both of its seams.
+        return True
+    return bool(loaded.array.min() < COAST_CEILING + max(coast_band, 2 * COAST_CEILING))
+
+
+def coast_lines(coast: CoastStats, coast_band: float) -> list[str]:
+    """The log lines on what the coastal rule did to a tile."""
+    if coast.posts == 0:
+        return ['Coastal containment: no low ground connected to the sea in this tile.']
+    moved = []
+    if coast.lowered > 0:
+        moved.append(f'lowered the shore by up to {coast.lowered:.2f} m')
+    if coast.raised > 0:
+        moved.append(f'raised the shore by up to {coast.raised:.2f} m')
+    effect = 'would have ' + ' and '.join(moved) if moved else 'is zero there'
+    lines = [
+        f'Coastal containment: {coast.posts:,} post(s) of low ground connected to the sea; {coast.kept:,} at or '
+        f'below the geoid correction kept their height above the sea and {coast.blended:,} were blended over the '
+        f'{coast_band:g} m above it; the plain shift {effect}.'
+    ]
+    if coast.floored:
+        lines.append(
+            f'Wrote 1 m at {coast.floored:,} coastal land post(s) that rounded to 0 (MIL-PRF-89020B 3.5.3.2.1).'
+        )
+    return lines
 
 
 def transform_vertical_datum(
@@ -1420,6 +1511,7 @@ def transform_vertical_datum(
     dted_metadata: DtedMetadataSource | None = None,
     cell: CellGeometry | None = None,
     mask_file: str | None = None,
+    coast_band: float = DEFAULT_COAST_BAND,
 ) -> None:
     """Transform the vertical datum of a GeoTIFF or DTED elevation model, or
     convert a GeoTIFF cell to DTED.
@@ -1430,13 +1522,17 @@ def transform_vertical_datum(
        onto the cell's level-2 grid instead.
     2. Performs the vertical datum shift (via interpolation or GDAL Warp; on
        the arc-minute lattice for a cell).
-    3. Optionally detects ocean and flat patches, keeps as water bodies those
-       with at least *min_containment* of their boundary above them, sets the
-       ocean to 0 and each water body to its lowest transformed value (or the
-       level of the body across the tiles of a batch run), raises enclosed
-       low spots beside water in float data, and logs the water bodies that
-       touch the tile edge and how the shore posts stand relative to the
-       water. A cell is flattened even when the datums are the same.
+    3. Optionally detects ocean and flat patches, keeps the low ground
+       connected to the sea at its height above the sea within the geoid
+       correction (:func:`~egmtrans.flattening.apply_coast`), keeps as water
+       bodies the patches with at least *min_containment* of their boundary
+       above them, sets the ocean to 0 and each water body to its lowest
+       transformed value (or the level of the body across the tiles of a
+       batch run), raises enclosed low spots beside water in float data,
+       writes 1 m at coastal land that would round to 0 in DTED, and logs
+       the water bodies that touch the tile edge and how the shore posts
+       stand relative to the water. A cell is flattened even when the datums
+       are the same.
     4. Saves the result: Cloud Optimized GeoTIFF (COG) with DEFLATE compression
        and compound CRS for GeoTIFF inputs, an updated DTED file with the
        new vertical datum code written to the header, or a DTED cell written
@@ -1465,6 +1561,9 @@ def transform_vertical_datum(
             lattice; None for a transform.
         mask_file: Where to write the flat mask; by default the name
             :func:`~egmtrans.file_utils.mask_output_name` gives.
+        coast_band: The band, in meters, over which the datum shift blends
+            in above the coastal strip that keeps its height above the sea;
+            0 turns the coastal rule off.
 
     Raises:
         ValueError: If the input data type is unsupported or CRS is missing.
@@ -1484,7 +1583,7 @@ def transform_vertical_datum(
         loaded = load_input(input_file, temp_dir, cell=cell)
         if tile_levels is not None and tile_levels.array_crc is not None and tile_levels.array_crc != loaded.array_crc:
             raise RuntimeError('The input changed between the two passes of the run')
-        warp_array = compute_transformed(loaded, src_datum, tgt_datum, algorithm, temp_dir, output_dir)
+        warp_array, shift = compute_transformed(loaded, src_datum, tgt_datum, algorithm, temp_dir, output_dir)
 
         labeled = None
         converting = loaded.cell is not None
@@ -1501,6 +1600,25 @@ def transform_vertical_datum(
             labeled = labels.labeled
             logger.info(f'Mapped ocean and flat areas of at least {min_patch_size} posts.')
 
+            # The coast, before the water levels: a water body in low ground
+            # connected to the sea takes its level from the weighted values,
+            # the minimum pass 1 recorded for it. The regions are labeled only
+            # where the rule can touch a post, the test pass 1 applies: on a
+            # tile without a void whose lowest post stands above every band
+            # top they would hold nothing but the ocean, and the ocean is
+            # never rewritten, so the bytes are the same either way.
+            regions = None
+            ocean_regions: set[int] = set()
+            coastal_set: set[int] = set()
+            coast = CoastStats()
+            coasting = coast_band > 0 and shift is not None
+            if coasting and _coast_possible(loaded, src_datum, tgt_datum, coast_band):
+                regions, ocean_regions = coastal_regions(loaded.array, shift, labeled, coast_band)
+                coastal_set = set(ocean_regions)
+                if tile_levels is not None:
+                    coastal_set |= tile_levels.coastal
+                coast = apply_coast(warp_array, loaded.array, shift, labeled, regions, coastal_set, coast_band)
+
             warp_array, flat = flatten_tile(
                 warp_array, loaded, labels, tile_levels, arc_mode, min_containment, enclosed_limit=enclosed_limit
             )
@@ -1511,16 +1629,32 @@ def transform_vertical_datum(
                 )
             logger.info('Flattened ocean and set water bodies to their lowest transformed level.')
             log_raised_spots(loaded, flat.raised, enclosed_limit)
+            if flat.slivers:
+                logger.info(
+                    f'Leveled {sum(s[3] for s in flat.slivers):,} post(s) of {len(flat.slivers)} sliver(s) at the '
+                    f'tile edges with the water bodies the neighboring tiles continue them with.'
+                )
+            if coasting:
+                if loaded.whole_meters and regions is not None:
+                    # After the water decision, so the land is final; before
+                    # the write, so every DTED level inherits it.
+                    coast.floored = floor_coastal_land(warp_array, labeled, regions, coastal_set, loaded.centimeters)
+                for line in coast_lines(coast, coast_band):
+                    logger.info(line)
 
             if tile_levels is None:
                 tile = loaded.tile_analysis(0, output_file)
-                tile.edges = extract_edges(labeled, loaded.geotransform)
+                tile.edges = extract_edges(labeled, loaded.geotransform, None, regions)
+                tile.ocean_regions = ocean_regions
                 tile.patches = edge_patch_stats(
                     loaded.array, tile.edges, flat.levels, flat.counts, flat.above, flat.below
                 )
                 bodies = single_tile_water_bodies(tile, min_containment)
                 if bodies:
                     for line in format_boundary_report(bodies, [tile]):
+                        logger.info(line)
+                if coasting:
+                    for line in format_low_ground_report(low_ground([tile], []), [tile]):
                         logger.info(line)
             log_containment(loaded, warp_array, labeled, flat.levels, flat.label_cm)
 

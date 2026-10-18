@@ -528,6 +528,7 @@ class TestKernels:
 
     def test_only_the_spline_kernels_take_fast_math(self):
         from egmtrans import flattening, interpolation
+        from egmtrans.dted import resample
         from egmtrans.numba_utils import FASTMATH_FLAGS, NUMBA_AVAILABLE
 
         if not NUMBA_AVAILABLE:
@@ -537,15 +538,18 @@ class TestKernels:
             flattening._patch_levels, flattening._apply_levels_parallel, flattening._apply_levels_sequential,
             flattening._round_half_away_scalar, flattening._enclosed_low_regions,
             interpolation._bilinear_interpolate_numba,
+            resample._regrid_row, resample._regrid_parallel, resample._regrid_sequential,
+            resample._carry_row, resample._carry_parallel, resample._carry_sequential,
         ]
         for kernel in strict:
             assert not kernel.targetoptions.get('fastmath'), kernel.py_func.__name__
         for kernel in (interpolation.compute_rbf_weights, interpolation.interpolate_chunk):
             assert kernel.targetoptions['fastmath'] == set(FASTMATH_FLAGS)
-        # Numba's parallel mode has crashed ArcGIS Pro: only the level writer has
-        # a parallel variant, and ArcGIS runs the sequential one.
+        # Numba's parallel mode has crashed ArcGIS Pro: only the level writer and
+        # the two lattice resamplers have a parallel variant, and ArcGIS runs the
+        # sequential ones.
         parallel = [k.py_func.__name__ for k in strict if k.targetoptions.get('parallel')]
-        assert parallel == ['_apply_levels_parallel']
+        assert parallel == ['_apply_levels_parallel', '_regrid_parallel', '_carry_parallel']
 
     def test_compiled_kernels_equal_plain_python(self):
         """A host without Numba runs the same functions uncompiled and must label alike."""
@@ -658,3 +662,183 @@ class TestProcessPatches:
         parallel = apply_levels(data.copy(), labels, levels, parallel=True)
         sequential = apply_levels(data.copy(), labels, levels, parallel=False)
         np.testing.assert_array_equal(parallel, sequential)
+
+
+class TestLevelEdgeSlivers:
+    """Pass 2: the slivers of the neighbors' water bodies at the tile edges take their bodies' levels."""
+
+    def _case(self):
+        from egmtrans.flattening import level_edge_slivers
+        cm = np.arange(36, dtype=np.int32).reshape(6, 6) * 7 + 100000  # no two neighbors alike
+        cm[1:4, 0] = 150000
+        cm[2, 1] = 150000  # a 4-post sliver at the west edge
+        labeled = np.zeros((6, 6), dtype=np.int32)
+        labeled[5, :] = 2
+        output = cm / 100.0
+        output[1:4, 0] = [1499.7, 1499.6, 1499.8]
+        output[2, 1] = 1499.9
+        return level_edge_slivers, cm, labeled, output
+
+    def test_sliver_takes_the_bodys_level_and_a_new_label(self):
+        level_edge_slivers, cm, labeled, output = self._case()
+        done = level_edge_slivers(output, labeled, cm, [("W", 1, 1499.4, 150000), ("W", 2, 1499.4, 150000)])
+        assert done == [(3, 1499.4, 150000, 4)]
+        assert np.all(output[1:4, 0] == 1499.4) and output[2, 1] == 1499.4
+        assert np.all(labeled[1:4, 0] == 3) and labeled[2, 1] == 3
+        assert output[0, 0] == cm[0, 0] / 100.0 and labeled[0, 0] == 0
+
+    def test_the_sliver_takes_the_bodys_level_even_below_its_own(self):
+        # Its own minimum lies millimeters under the body's level when the sliver is
+        # on the rising side of the correction; the shared posts must still agree.
+        level_edge_slivers, cm, labeled, output = self._case()
+        output[1:4, 0] = [1499.0, 1499.2, 1499.1]
+        done = level_edge_slivers(output, labeled, cm, [("W", 1, 1499.4, 150000)])
+        assert done == [(3, 1499.4, 150000, 4)] and np.all(output[1:4, 0] == 1499.4)
+
+    def test_labels_start_after_the_per_label_arrays(self):
+        # The highest label was dropped as terrain, but the arrays pass 2 appends the
+        # sliver to are still sized for it: the sliver must not reuse its number.
+        level_edge_slivers, cm, labeled, output = self._case()
+        labeled[5, :] = 0
+        done = level_edge_slivers(output, labeled, cm, [("W", 1, 1499.4, 150000)], first_label=3)
+        assert done == [(3, 1499.4, 150000, 4)] and np.all(labeled[1:4, 0] == 3)
+
+    def test_a_tile_without_ocean_or_patch_never_uses_the_ocean_label(self):
+        level_edge_slivers, cm, labeled, output = self._case()
+        labeled[:] = 0
+        done = level_edge_slivers(output, labeled, cm, [("W", 1, 1499.4, 150000)])
+        assert done == [(2, 1499.4, 150000, 4)] and labeled[1, 0] == 2
+
+    def test_labeled_or_other_height_posts_are_skipped(self):
+        level_edge_slivers, cm, labeled, output = self._case()
+        labeled[1, 0] = 2
+        done = level_edge_slivers(output, labeled, cm, [("W", 1, 1499.4, 150000), ("W", 4, 1499.4, 150000)])
+        assert done == [] and output[1, 0] == 1499.7 and labeled[4, 0] == 0
+
+
+class TestCoast:
+    """The coastal rule: regions connected to the sea, the strip and the band, both directions, the floor."""
+
+    @staticmethod
+    def _coast(rows=6, cols=12):
+        """Ocean in the two west columns, land rising eastward, a 30 m ridge at column 8 and a 1 m basin behind it."""
+        h = np.tile(np.linspace(0.2, 20.0, cols), (rows, 1))
+        h[:, :2] = 0.0
+        h[:, 8] = 30.0
+        h[:, 9:] = 1.0 + 0.01 * np.arange(3)
+        labeled = np.zeros(h.shape, dtype=np.int32)
+        labeled[:, :2] = 1
+        return h, labeled
+
+    def test_regions_reach_the_sea_through_low_ground_but_not_over_a_ridge(self):
+        from egmtrans.flattening import coastal_regions
+
+        h, labeled = self._coast()
+        regions, ocean = coastal_regions(h, np.full(h.shape, 2.5), labeled, 10.0)
+        sea = int(regions[0, 0])
+        assert sea > 0 and ocean == {sea}
+        np.testing.assert_array_equal(regions[0, :8] == sea, h[0, :8] < 12.5)
+        assert regions[0, 8] == 0
+        basin = int(regions[0, 9])
+        assert basin > 0 and basin != sea and np.all(regions[:, 9:] == basin)
+
+    def test_voids_pass_and_a_flat_patch_is_taken_whole(self):
+        from egmtrans.flattening import coastal_regions
+
+        h, labeled = self._coast()
+        h[:, 3] = np.nan                  # a void column between the sea and the plain
+        labeled[2:5, 5:7] = 2             # a lake across columns 5 and 6
+        h[2:5, 5:7] = 12.2
+        h[0:2, 6] = 12.2                  # plain posts at the lake's height
+        shift = np.full(h.shape, 2.5)
+        shift[:, 6] = 2.0                 # the band top is 12.0 in column 6: not low on its own
+        regions, _ocean = coastal_regions(h, shift, labeled, 10.0)
+        sea = int(regions[0, 0])
+        assert regions[0, 4] == sea, "the plain beyond the void joins the sea"
+        assert np.all(regions[2:5, 5:7] == sea), "the whole patch is low when any of its posts is"
+        assert np.all(regions[0:2, 6] == 0), "a plain post at 12.2 m under a 12 m band top is not low"
+
+    def test_regions_are_the_same_from_either_side(self):
+        from egmtrans.flattening import apply_coast, coastal_regions
+
+        h, labeled = self._coast()
+        shift = np.full(h.shape, 2.5)
+        down, _ = coastal_regions(h, shift, labeled, 10.0)
+        warp = h - shift
+        apply_coast(warp, h, shift, labeled, down, None, 10.0)
+        up, _ = coastal_regions(warp, -shift, labeled, 10.0)
+        np.testing.assert_array_equal(up > 0, down > 0)
+
+    def test_strip_band_and_plain_shift_where_the_land_is_lowered(self):
+        from egmtrans.flattening import apply_coast
+
+        h = np.array([[0.0, 0.5, 2.5, 7.5, 12.5, 20.0]])
+        labeled = np.array([[1, 0, 0, 0, 0, 0]], dtype=np.int32)
+        shift = np.full(h.shape, 2.5)
+        warp = h - shift
+        stats = apply_coast(warp, h, shift, labeled, np.ones(h.shape, dtype=np.int32), {1}, 10.0)
+        assert warp[0].tolist() == pytest.approx([-2.5, 0.5, 2.5, 6.25, 10.0, 17.5])
+        assert (stats.posts, stats.kept, stats.blended) == (5, 2, 1)
+        assert stats.lowered == 2.5 and stats.raised == 0.0 and stats.active
+
+    def test_the_rising_direction_is_the_inverse(self):
+        from egmtrans.flattening import apply_coast
+
+        h = np.array([[0.5, 2.5, 7.5, 12.5, 20.0]])
+        labeled = np.zeros(h.shape, dtype=np.int32)
+        regions = np.ones(h.shape, dtype=np.int32)
+        shift = np.full(h.shape, 2.5)
+        low = h - shift
+        apply_coast(low, h, shift, labeled, regions, {1}, 10.0)
+        back = low + shift
+        stats = apply_coast(back, low, -shift, labeled, regions, {1}, 10.0)
+        np.testing.assert_allclose(back, h, rtol=0, atol=1e-12)
+        assert stats.raised == 2.5 and stats.lowered == 0.0 and stats.kept == 2 and stats.blended == 1
+        # The band of the rising direction is [a, B) in the source heights, stretched by B / (B - a).
+        assert low[0, 2] == 6.25 and 6.25 + 2.5 * (6.25 - 2.5) / 7.5 == 7.5
+
+    def test_the_band_widens_to_twice_the_correction(self):
+        from egmtrans.flattening import apply_coast
+
+        h = np.array([[8.0, 16.0, 24.0, 30.0]])
+        labeled = np.zeros(h.shape, dtype=np.int32)
+        shift = np.full(h.shape, 8.0)
+        warp = h - shift
+        apply_coast(warp, h, shift, labeled, np.ones(h.shape, dtype=np.int32), {1}, 10.0)
+        assert warp[0].tolist() == pytest.approx([8.0, 12.0, 16.0, 22.0]), "a slope of one half across a 16 m band"
+
+    def test_negative_land_is_kept_and_a_zero_shift_changes_nothing(self):
+        from egmtrans.flattening import apply_coast
+
+        h = np.array([[-0.3, 0.4, 5.0]])
+        labeled = np.zeros(h.shape, dtype=np.int32)
+        regions = np.ones(h.shape, dtype=np.int32)
+        warp = h - 1.0
+        stats = apply_coast(warp, h, np.full(h.shape, 1.0), labeled, regions, {1}, 10.0)
+        assert warp[0, :2].tolist() == [-0.3, 0.4] and stats.kept == 2
+        warp = h.copy()
+        stats = apply_coast(warp, h, np.zeros(h.shape), labeled, regions, {1}, 10.0)
+        assert warp[0].tolist() == h[0].tolist() and not stats.active and stats.posts == 3
+
+    def test_only_the_chosen_regions_and_never_the_ocean(self):
+        from egmtrans.flattening import apply_coast
+
+        h = np.array([[0.0, 1.0, 1.0]])
+        labeled = np.array([[1, 0, 0]], dtype=np.int32)
+        regions = np.array([[1, 1, 2]], dtype=np.int32)
+        shift = np.full(h.shape, 2.0)
+        warp = h - shift
+        stats = apply_coast(warp, h, shift, labeled, regions, {1}, 10.0)
+        assert warp[0].tolist() == [-2.0, 1.0, -1.0] and stats.posts == 1
+        warp = h - shift
+        assert apply_coast(warp, h, shift, labeled, regions, set(), 10.0).posts == 0 and warp[0, 1] == -1.0
+
+    def test_the_floor_writes_one_meter_at_coastal_land_that_rounds_to_zero(self):
+        from egmtrans.flattening import floor_coastal_land, height_centimeters
+
+        source = np.array([[0.0, 0.2, 0.49, 0.5, 1.2, 0.3, 0.3]])
+        output = source.copy()
+        labeled = np.array([[1, 0, 0, 0, 0, 2, 0]], dtype=np.int32)   # a lake at 0.3 m; land at 0.3 m inland
+        regions = np.array([[1, 1, 1, 1, 1, 1, 2]], dtype=np.int32)
+        count = floor_coastal_land(output, labeled, regions, {1}, height_centimeters(source))
+        assert count == 2 and output[0].tolist() == [0.0, 1.0, 1.0, 0.5, 1.2, 0.3, 0.3]

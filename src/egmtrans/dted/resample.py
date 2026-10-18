@@ -10,7 +10,10 @@ double precision, with every product and sum exact for Float32 data, so the
 result is the correctly rounded value of the exact rational and the same on
 every host. The same function takes a geoid grid up to the DTED posts.
 
-Nothing here uses a float reduction, Numba or GDAL: elementwise numpy only.
+Nothing here uses a float reduction or GDAL. The numpy versions are the
+reference and the path on a host without Numba; the compiled kernels add
+the same four terms in the same order from a zero accumulator, so both give
+the same bits.
 """
 
 from __future__ import annotations
@@ -20,8 +23,10 @@ from fractions import Fraction
 
 import numpy as np
 
+from egmtrans import _state
 from egmtrans.dted.header import CellGeometry
 from egmtrans.dted.schema import LEVELS
+from egmtrans.numba_utils import get_numba_decorator, jit_enabled, prange
 
 # How far a post may sit off the whole-degree lattice, as a share of the
 # post spacing, before the raster is refused.
@@ -201,19 +206,13 @@ def _blocks(rows: int, cols: int, block_posts: int = 4_000_000):
         yield start, min(start + step, rows)
 
 
-def regrid_bilinear(window: np.ndarray, rows: int, cols: int, *, block_posts: int = 4_000_000) -> np.ndarray:
-    """Bilinear values of *window* at *rows* x *cols* posts spanning the same extent.
+def _run_parallel(parallel: bool | None) -> bool:
+    """Whether the parallel kernel runs: as asked, or outside ArcGIS Pro mode."""
+    return (not _state.get_arc_mode()) if parallel is None else bool(parallel)
 
-    The posts of *window* and of the result share the four corners. Each
-    result post is the weighted mean of its two to four source neighbors
-    with whole-number weights, void (NaN) neighbors dropped; it is NaN when no
-    valid neighbor carries weight. Float64 out. *block_posts* sets the size
-    of the row blocks the work is done in; it cannot change the result.
-    """
-    source = np.asarray(window)
-    if source.ndim != 2:
-        raise ResampleError('the source window must be 2-D')
-    source = source.astype(np.float64, copy=False)
+
+def _regrid_numpy(source: np.ndarray, rows: int, cols: int, block_posts: int) -> np.ndarray:
+    """The reference resampler: elementwise numpy on the float64 *source*, in row blocks."""
     x = AxisMap.between(source.shape[1], cols)
     y = AxisMap.between(source.shape[0], rows)
     wx_lo, wx_hi = x.weights
@@ -239,16 +238,83 @@ def regrid_bilinear(window: np.ndarray, rows: int, cols: int, *, block_posts: in
     return out
 
 
-def carry_labels(labels: np.ndarray, rows: int, cols: int, valid: np.ndarray | None = None) -> np.ndarray:
-    """Labels of the *rows* x *cols* posts that *labels* (a source window) resamples to.
+@get_numba_decorator()
+def _regrid_row(source, ylo, yhi, wylo, wyhi, x_lo, x_hi, wx_lo, wx_hi, out_row):
+    # The numpy arithmetic post by post: the four corners in the same order,
+    # from a zero accumulator, a term of 0.0 for a void or a zero weight, so
+    # the bits are the reference's.
+    for j in range(out_row.shape[0]):
+        xlo = x_lo[j]
+        xhi = x_hi[j]
+        num = 0.0
+        den = 0
+        w = wylo * wx_lo[j]
+        v = source[ylo, xlo]
+        ok = (w > 0) and not np.isnan(v)
+        num += w * (v if ok else 0.0)
+        den += w if ok else 0
+        w = wylo * wx_hi[j]
+        v = source[ylo, xhi]
+        ok = (w > 0) and not np.isnan(v)
+        num += w * (v if ok else 0.0)
+        den += w if ok else 0
+        w = wyhi * wx_lo[j]
+        v = source[yhi, xlo]
+        ok = (w > 0) and not np.isnan(v)
+        num += w * (v if ok else 0.0)
+        den += w if ok else 0
+        w = wyhi * wx_hi[j]
+        v = source[yhi, xhi]
+        ok = (w > 0) and not np.isnan(v)
+        num += w * (v if ok else 0.0)
+        den += w if ok else 0
+        out_row[j] = num / den if den > 0 else np.nan
 
-    A post takes label L when every valid source post that contributes to it
-    with nonzero weight has label L; otherwise 0. *valid* marks the source
-    posts that hold a height (all of them when None).
+
+@get_numba_decorator(parallel=True)
+def _regrid_parallel(source, y_lo, y_hi, wy_lo, wy_hi, x_lo, x_hi, wx_lo, wx_hi, out):
+    for i in prange(out.shape[0]):
+        _regrid_row(source, y_lo[i], y_hi[i], wy_lo[i], wy_hi[i], x_lo, x_hi, wx_lo, wx_hi, out[i])
+
+
+@get_numba_decorator()
+def _regrid_sequential(source, y_lo, y_hi, wy_lo, wy_hi, x_lo, x_hi, wx_lo, wx_hi, out):
+    for i in range(out.shape[0]):
+        _regrid_row(source, y_lo[i], y_hi[i], wy_lo[i], wy_hi[i], x_lo, x_hi, wx_lo, wx_hi, out[i])
+
+
+def regrid_bilinear(
+    window: np.ndarray, rows: int, cols: int, *, block_posts: int = 4_000_000, parallel: bool | None = None
+) -> np.ndarray:
+    """Bilinear values of *window* at *rows* x *cols* posts spanning the same extent.
+
+    The posts of *window* and of the result share the four corners. Each
+    result post is the weighted mean of its two to four source neighbors
+    with whole-number weights, void (NaN) neighbors dropped; it is NaN when no
+    valid neighbor carries weight. Float64 out. The work runs as a compiled
+    kernel where Numba is installed (*parallel* None follows ArcGIS Pro mode,
+    where the parallel kernel is not used) and as the numpy reference
+    otherwise, with the same bits; *block_posts* sets the row blocks of the
+    numpy version and cannot change the result.
     """
-    source = np.asarray(labels)
-    if valid is None:
-        valid = np.ones(source.shape, dtype=bool)
+    source = np.asarray(window)
+    if source.ndim != 2:
+        raise ResampleError('the source window must be 2-D')
+    source = np.ascontiguousarray(source, dtype=np.float64)
+    if not jit_enabled():
+        return _regrid_numpy(source, rows, cols, block_posts)
+    x = AxisMap.between(source.shape[1], cols)
+    y = AxisMap.between(source.shape[0], rows)
+    wx_lo, wx_hi = x.weights
+    wy_lo, wy_hi = y.weights
+    out = np.empty((rows, cols), dtype=np.float64)
+    kernel = _regrid_parallel if _run_parallel(parallel) else _regrid_sequential
+    kernel(source, y.lower, y.upper, wy_lo, wy_hi, x.lower, x.upper, wx_lo, wx_hi, out)
+    return out
+
+
+def _carry_numpy(source: np.ndarray, valid: np.ndarray, rows: int, cols: int) -> np.ndarray:
+    """The reference label carrier: elementwise numpy, in row blocks."""
     x = AxisMap.between(source.shape[1], cols)
     y = AxisMap.between(source.shape[0], rows)
     x_lo, x_hi = x.lower, x.upper
@@ -274,9 +340,77 @@ def carry_labels(labels: np.ndarray, rows: int, cols: int, valid: np.ndarray | N
     return out
 
 
+@get_numba_decorator()
+def _carry_row(source, valid, ylo, yhi, yh, x_lo, x_hi, x_has_hi, out_row):
+    # The numpy rule post by post: the first considered contributor is chosen,
+    # and every considered one must agree with it.
+    for j in range(out_row.shape[0]):
+        xlo = x_lo[j]
+        xhi = x_hi[j]
+        xh = x_has_hi[j]
+        chosen = -1
+        agree = True
+        v = source[ylo, xlo]
+        consider = valid[ylo, xlo]
+        if consider and chosen < 0:
+            chosen = v
+        agree = agree and ((not consider) or v == chosen)
+        v = source[ylo, xhi]
+        consider = xh and valid[ylo, xhi]
+        if consider and chosen < 0:
+            chosen = v
+        agree = agree and ((not consider) or v == chosen)
+        v = source[yhi, xlo]
+        consider = yh and valid[yhi, xlo]
+        if consider and chosen < 0:
+            chosen = v
+        agree = agree and ((not consider) or v == chosen)
+        v = source[yhi, xhi]
+        consider = (yh and xh) and valid[yhi, xhi]
+        if consider and chosen < 0:
+            chosen = v
+        agree = agree and ((not consider) or v == chosen)
+        out_row[j] = chosen if (agree and chosen > 0) else 0
+
+
+@get_numba_decorator(parallel=True)
+def _carry_parallel(source, valid, y_lo, y_hi, y_has_hi, x_lo, x_hi, x_has_hi, out):
+    for i in prange(out.shape[0]):
+        _carry_row(source, valid, y_lo[i], y_hi[i], y_has_hi[i], x_lo, x_hi, x_has_hi, out[i])
+
+
+@get_numba_decorator()
+def _carry_sequential(source, valid, y_lo, y_hi, y_has_hi, x_lo, x_hi, x_has_hi, out):
+    for i in range(out.shape[0]):
+        _carry_row(source, valid, y_lo[i], y_hi[i], y_has_hi[i], x_lo, x_hi, x_has_hi, out[i])
+
+
+def carry_labels(
+    labels: np.ndarray, rows: int, cols: int, valid: np.ndarray | None = None, *, parallel: bool | None = None
+) -> np.ndarray:
+    """Labels of the *rows* x *cols* posts that *labels* (a source window) resamples to.
+
+    A post takes label L when every valid source post that contributes to it
+    with nonzero weight has label L; otherwise 0. *valid* marks the source
+    posts that hold a height (all of them when None). Compiled where Numba is
+    installed (*parallel* as for :func:`regrid_bilinear`), the numpy reference
+    otherwise.
+    """
+    source = np.ascontiguousarray(labels, dtype=np.int32)
+    valid = np.ones(source.shape, dtype=bool) if valid is None else np.ascontiguousarray(valid, dtype=bool)
+    if not jit_enabled():
+        return _carry_numpy(source, valid, rows, cols)
+    x = AxisMap.between(source.shape[1], cols)
+    y = AxisMap.between(source.shape[0], rows)
+    out = np.zeros((rows, cols), dtype=np.int32)
+    kernel = _carry_parallel if _run_parallel(parallel) else _carry_sequential
+    kernel(source, valid, y.lower, y.upper, y.numerator > 0, x.lower, x.upper, x.numerator > 0, out)
+    return out
+
+
 def thin(array: np.ndarray, level: int) -> np.ndarray:
     """A level-2 cell grid thinned to *level*: every third post for level 1,
-    every thirtieth for level 0 (a copy, so the caller may drop the grid)."""
+    every thirtieth for level 0 (a copy below level 2; the grid itself at level 2)."""
     if level not in LEVELS:
         raise ValueError(f'DTED level must be 0, 1 or 2, not {level}')
     step = THIN_STEP[level]

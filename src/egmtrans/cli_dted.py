@@ -63,6 +63,15 @@ def _stderr_logger() -> logging.Logger:
     return logger
 
 
+def _no_abbreviations(parser: argparse.ArgumentParser) -> None:
+    """Options are written out, on this parser and on every subcommand of it."""
+    parser.allow_abbrev = False
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                _no_abbreviations(sub)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='egmtrans', description='DTED header tools.')
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -171,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     dmed.add_argument('--out', metavar='PATH', help='Write the DMED to this file instead of <FOLDER>/DMED')
     dmed.add_argument('--check', action='store_true',
                       help='Do not write: compare the existing DMED with what the cells give')
+    _no_abbreviations(parser)
     return parser
 
 

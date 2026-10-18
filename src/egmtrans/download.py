@@ -58,15 +58,45 @@ def _default_datums_dir() -> str:
     return os.path.join(project_root, "datums")
 
 
-def verify_checksum(file_path: str, expected_sha256: str) -> bool:
-    """Return True if *file_path* exists and its SHA-256 matches *expected_sha256*."""
-    if not os.path.isfile(file_path):
-        return False
+# The SHA-256 of every file hashed in this process, by absolute path, with the
+# size and modification time it was computed for: a grid is read once however
+# many callers check it (ensure_grids at the start of a run, the transform
+# before the first cell), and read again when the file changed.
+_digests: dict[str, tuple[tuple[int, int], str]] = {}
+
+
+def _stamp(path: str) -> tuple[int, int]:
+    info = os.stat(path)
+    return info.st_size, info.st_mtime_ns
+
+
+def _digest(path: str) -> str:
     sha = hashlib.sha256()
-    with open(file_path, "rb") as f:
+    with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(_CHUNK_SIZE), b""):
             sha.update(chunk)
-    return sha.hexdigest() == expected_sha256
+    return sha.hexdigest()
+
+
+def file_digest(file_path: str) -> str:
+    """The SHA-256 of *file_path*, computed once per process for the file's size and modification time."""
+    path = os.path.abspath(file_path)
+    stamp = _stamp(path)
+    known = _digests.get(path)
+    if known is None or known[0] != stamp:
+        known = (stamp, _digest(path))
+        _digests[path] = known
+    return known[1]
+
+
+def verify_checksum(file_path: str, expected_sha256: str) -> bool:
+    """Return True if *file_path* exists and its SHA-256 matches *expected_sha256*.
+
+    The file is hashed once per process (see :func:`file_digest`).
+    """
+    if not os.path.isfile(file_path):
+        return False
+    return file_digest(file_path) == expected_sha256
 
 
 def download_file(
@@ -124,6 +154,7 @@ def download_file(
             )
 
         os.replace(tmp_path, dest_path)
+        _digests[os.path.abspath(dest_path)] = (_stamp(dest_path), sha.hexdigest())
     except TimeoutError as e:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)

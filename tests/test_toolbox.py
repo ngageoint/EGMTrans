@@ -175,8 +175,8 @@ def test_parameter_names_types_and_defaults(monkeypatch):
     assert [p.name for p in params] == [
         'input', 'output', 'output_format', 'source_datum', 'target_datum', 'algorithm', 'min_patch_size',
         'flatten', 'create_mask', 'save_log', 'skip_existing', 'context_folder', 'water_levels', 'containment',
-        'abs_horiz_accuracy', 'dted_index', 'dted_profile', 'dted_naming', 'dted_naming_template',
-        'dted_overrides', 'dted_summary', 'output_layer',
+        'coast', 'coast_band', 'abs_horiz_accuracy', 'dted_index', 'dted_profile', 'dted_naming',
+        'dted_naming_template', 'dted_overrides', 'dted_summary', 'output_layer',
     ]
     p = _by_name(params)
     assert p['output_format'].filter.list == ['DTED2', 'DTED1', 'DTED0', 'GeoTIFF']
@@ -196,7 +196,7 @@ def test_parameter_names_types_and_defaults(monkeypatch):
         assert p[name].category == 'DTED output', name
     for name in ('input', 'output', 'output_format', 'source_datum', 'target_datum', 'algorithm', 'min_patch_size',
                  'flatten', 'create_mask', 'save_log', 'skip_existing', 'context_folder', 'water_levels',
-                 'containment'):
+                 'containment', 'coast', 'coast_band'):
         assert p[name].category is None, name
     assert set(toolbox.NAMING_LABELS.values()) <= set(toolbox.EGMTrans.DTED_NAMING_PRESETS)
     assert [tool_class.__name__ for tool_class in toolbox.Toolbox().tools] == [
@@ -621,6 +621,31 @@ def test_execute_writes_the_standard_tree_and_adds_no_layer(monkeypatch, tmp_dir
     assert any('Build DMED' in text for text in texts)
 
 
+def test_the_self_test_tool_runs_in_arcgis_mode(monkeypatch):
+    """The self-test tool sets ArcGIS mode like the transform tool, so the
+    sequential kernels run inside ArcGIS Pro."""
+    from egmtrans import _state
+    from egmtrans.dted import selftest
+
+    toolbox, _fake = _load_toolbox(monkeypatch)
+    seen = {}
+
+    class Result:
+        ok = True
+        items = []
+
+    def fake_run(folder=None, *, keep=False):
+        seen['arc_mode'] = _state.get_arc_mode()
+        return Result()
+
+    monkeypatch.setattr(selftest, 'run_selftest', fake_run)
+    monkeypatch.setattr('egmtrans.config.verify_grids', lambda *args: None)
+    tool = toolbox.DtedSelfTest()
+    assert _state.get_arc_mode() is False
+    tool.execute(tool.getParameterInfo(), _Messages())
+    assert seen['arc_mode'] is True
+
+
 def test_the_version_on_disk_is_read_as_text(monkeypatch):
     import egmtrans
 
@@ -985,3 +1010,60 @@ def test_index_validate_tool(monkeypatch, tmp_dir):
     fake.messages.clear()
     tool.execute(params, _Messages())
     assert fake.messages[0][0] == 'error' and 'not found' in fake.messages[0][1].lower()
+
+
+def test_coastal_parameters_follow_the_checkbox_and_fall_back_to_the_default(monkeypatch, tmp_dir):
+    toolbox, _fake = _load_toolbox(monkeypatch)
+    tool = toolbox.Tool()
+    params = tool.getParameterInfo()
+    p = _by_name(params)
+    assert p['coast'].datatype == 'GPBoolean' and p['coast'].value is True
+    assert p['coast_band'].datatype == 'GPDouble' and p['coast_band'].value == 10.0
+    p['input'].value = os.path.join(tmp_dir, 'tiles')
+    p['output'].value = os.path.join(tmp_dir, 'out')
+    p['output_format'].value = 'GeoTIFF'
+    p['source_datum'].value = 'EGM2008'
+    _validate(tool, params)
+    assert p['coast'].enabled and p['coast_band'].enabled
+    p['coast'].value = False
+    _validate(tool, params)
+    assert p['coast'].enabled and not p['coast_band'].enabled
+    p['coast'].value = True
+    p['coast_band'].value = None
+    _validate(tool, params)
+    assert p['coast_band'].value == 10.0 and any('set to 10' in text for text in _warnings(p['coast_band']))
+    p['coast_band'].value = -1.0
+    _validate(tool, params)
+    assert any('0 or more' in text for text in _errors(p['coast_band']))
+    p['flatten'].value = False
+    _validate(tool, params)
+    assert not p['coast'].enabled and not p['coast_band'].enabled
+
+
+def test_execute_passes_the_coastal_band(monkeypatch, tmp_dir):
+    toolbox, fake = _load_toolbox(monkeypatch)
+    calls = []
+
+    def fake_run_batch(*args, **kwargs):
+        calls.append(kwargs)
+        return BatchResult(exit_code=0, files_processed=1)
+
+    monkeypatch.setattr(toolbox.EGMTrans, 'run_batch', fake_run_batch)
+    monkeypatch.setattr('egmtrans.download.ensure_grids', lambda **kwargs: [])
+    tiles = os.path.join(tmp_dir, 'tiles')
+    os.makedirs(tiles)
+    tool, params, p = _prepare_tool(
+        toolbox, tmp_dir, input_path=tiles, output_path=os.path.join(tmp_dir, 'out'), output_format='DTED2',
+        source='EGM2008',
+    )
+    tool.execute(params, _Messages())
+    assert calls[-1]['coast_band'] == 10.0
+    p['coast_band'].value = 4.0
+    tool.execute(params, _Messages())
+    assert calls[-1]['coast_band'] == 4.0
+    p['coast'].value = False
+    fake.messages.clear()
+    tool.execute(params, _Messages())
+    assert calls[-1]['coast_band'] == 0.0
+    texts = [text for _kind, text in fake.messages]
+    assert 'Coastal Containment: False' in texts and 'Coastal Band (m): 0' in texts

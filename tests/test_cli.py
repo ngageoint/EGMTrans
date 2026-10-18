@@ -1,4 +1,4 @@
-"""Tests for egmtrans.cli — argument handling, path dispatch, and exit codes."""
+"""Tests for egmtrans.cli: argument handling, path dispatch, and exit codes."""
 
 import argparse
 import os
@@ -606,3 +606,99 @@ def test_the_numba_message_names_the_fix(monkeypatch, log_lines):
     message = next(line for line in log_lines if 'Numba is not available' in line)
     assert 'cloned ArcGIS Pro environment' in message and 'restart ArcGIS Pro' in message
     assert 'the results are the same' in message
+
+
+class TestOptionNames:
+    """Every transform option has a hyphenated long name; the underscore spellings still parse but are not shown."""
+
+    LONG = ("--source-datum", "--target-datum", "--create-mask", "--min-patch-size", "--log-file",
+            "--abs-horiz-accuracy")
+
+    def test_hyphenated_long_names_parse(self):
+        from egmtrans.cli import build_parser
+
+        args = build_parser().parse_args([
+            "--input", "in", "--output", "out", "--source-datum", "EGM2008", "--target-datum", "EGM96",
+            "--create-mask", "--min-patch-size", "9", "--log-file", "False", "--abs-horiz-accuracy", "12",
+        ])
+        assert (args.input, args.output, args.source_datum, args.target_datum) == ("in", "out", "EGM2008", "EGM96")
+        assert args.create_mask is True and args.min_patch_size == 9
+        assert args.log_file is False and args.abs_horiz_accuracy == 12
+
+    def test_underscore_spellings_still_parse(self):
+        from egmtrans.cli import build_parser
+
+        args = build_parser().parse_args([
+            "-i", "in", "-o", "out", "--source_datum", "EGM2008", "--target_datum", "EGM96",
+            "--create_mask", "--min_patch_size", "9", "--log_file", "False", "--abs_horiz_accuracy", "12",
+        ])
+        assert (args.source_datum, args.target_datum) == ("EGM2008", "EGM96")
+        assert (args.create_mask, args.min_patch_size, args.log_file, args.abs_horiz_accuracy) == (True, 9, False, 12)
+
+    def test_help_shows_the_hyphenated_names_only(self):
+        from egmtrans.cli import build_parser
+
+        text = build_parser().format_help()
+        for name in self.LONG:
+            assert name in text
+        for old in ("--source_datum", "--target_datum", "--create_mask", "--min_patch_size", "--log_file",
+                    "--abs_horiz_accuracy"):
+            assert old not in text
+
+    def test_abbreviations_are_rejected(self, capsys):
+        from egmtrans.cli import build_parser
+
+        with pytest.raises(SystemExit) as excinfo:
+            build_parser().parse_args(["-i", "in", "-o", "out", "--source", "EGM2008", "-t", "EGM96"])
+        assert excinfo.value.code == 2
+        assert "--source" in capsys.readouterr().err
+
+    def test_dted_tools_reject_abbreviations(self, capsys):
+        from egmtrans.cli_dted import build_parser
+
+        with pytest.raises(SystemExit) as excinfo:
+            build_parser().parse_args(["dted-header", "x.dt2", "--check"])
+        assert excinfo.value.code == 2
+
+
+class TestCoastBandOption:
+    def test_negative_is_a_usage_error(self, tmp_dir, stub_pipeline, monkeypatch):
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        assert _run(
+            monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
+            "-s", "EGM2008", "-t", "EGM96", "-b", "-1",
+        ) == 2
+        assert stub_pipeline == []
+
+    def test_reaches_process_file_and_run_batch(self, tmp_dir, monkeypatch):
+        seen = {}
+
+        def fake_process_file(*args, **kwargs):
+            seen.update(kwargs)
+            return True
+
+        def fake_run_batch(*args, **kwargs):
+            seen.update(kwargs)
+            return batch.BatchResult(exit_code=0, files_processed=1)
+
+        monkeypatch.setattr(cli, "ensure_grids", lambda **kw: [])
+        monkeypatch.setattr(cli, "process_file", fake_process_file)
+        monkeypatch.setattr(cli, "run_batch", fake_run_batch)
+        src = os.path.join(tmp_dir, "in.dt2")
+        with open(src, "wb"):
+            pass
+        assert _run(
+            monkeypatch, "-i", src, "-o", os.path.join(tmp_dir, "out.dt2"),
+            "-s", "EGM2008", "-t", "EGM96", "-b", "5",
+        ) == 0
+        assert seen.get("coast_band") == 5.0
+        seen.clear()
+        folder = os.path.join(tmp_dir, "tiles")
+        os.makedirs(folder)
+        assert _run(
+            monkeypatch, "-i", folder, "-o", os.path.join(tmp_dir, "out"),
+            "-s", "EGM2008", "-t", "EGM96", "--coast-band", "0",
+        ) == 0
+        assert seen.get("coast_band") == 0.0
