@@ -5,7 +5,7 @@
 # EGMTrans
 
 <p align="left">
-  <img src="https://img.shields.io/badge/version-1.11.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.12.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
